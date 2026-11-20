@@ -1,32 +1,33 @@
-import type { FastifyInstance } from "fastify";
+import fp from "fastify-plugin";
+import type { FastifyPluginAsync } from "fastify";
 import config from "../config/index.js";
-import { createHash } from "node:crypto";
 
-export default async function rateLimit(fastify: FastifyInstance) {
+const rateLimit: FastifyPluginAsync = async (fastify) => {
+  if (!config.ratelimit.enabled) {
+    return;
+  }
+
   const limit = config.ratelimit.requestPerMinute;
   const windowSeconds = 60;
 
   fastify.addHook("onRequest", async (request, reply) => {
-    if (!config.ratelimit.enabled) {
+    // Only rate-limit authenticated requests — unauthenticated ones
+    // are already rejected by the auth middleware before this runs.
+    const apiKeyRecord = request.apiKey;
+    if (!apiKeyRecord) {
       return;
     }
 
-    const apiKey = request.headers["x-api-key"];
-
-    if (typeof apiKey !== "string" || !apiKey) {
-      return;
-    }
-
-    const keyHash = createHash("sha256").update(apiKey).digest("hex");
-
-    const key = `ratelimit:${keyHash}`;
-
+    const key = `ratelimit:key:${apiKeyRecord.keyHash}`;
     const requests = await fastify.redis.increment(key, windowSeconds);
+    const remaining = Math.max(0, limit - requests);
 
     reply.header("X-RateLimit-Limit", limit);
-    reply.header("X-RateLimit-Remaining", Math.max(0, limit - requests));
+    reply.header("X-RateLimit-Remaining", remaining);
 
     if (requests > limit) {
+      reply.header("Retry-After", windowSeconds);
+
       return reply.code(429).send({
         success: false,
         error: {
@@ -36,4 +37,9 @@ export default async function rateLimit(fastify: FastifyInstance) {
       });
     }
   });
-}
+};
+
+export default fp(rateLimit, {
+  name: "rate-limit",
+  dependencies: ["redis", "auth"],
+});

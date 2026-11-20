@@ -1,18 +1,26 @@
 import fp from "fastify-plugin";
 import type { FastifyPluginAsync } from "fastify";
-
 import { mkdir, readFile, writeFile, rename, unlink } from "node:fs/promises";
-
 import { randomUUID } from "node:crypto";
 import { resolve, dirname } from "node:path";
+
+export interface ApiKeyRecord {
+  id: string;
+  keyHash: string;
+  keyPrefix: string;
+  database: string;
+  environment: "LIVE" | "TEST";
+  status: "active" | "revoked";
+  createdAt: string;
+  revokedAt?: string;
+  lastUsedAt?: string;
+}
 
 export interface DataStore {
   admin?: {
     hash: string;
   };
-
-  apiKeys?: Record<string, string>;
-
+  apiKeys?: Record<string, ApiKeyRecord>;
   [key: string]: unknown;
 }
 
@@ -20,12 +28,20 @@ export class JsonDB {
   readonly filePath: string;
   readonly dirPath: string;
 
-  private writeQueue: Promise<void> = Promise.resolve();
+  // File-level update queues to serialize concurrent writes across instances
+  private static fileQueues = new Map<string, Promise<void>>();
 
   constructor(customPath?: string) {
     this.filePath = customPath ?? resolve(process.cwd(), "data", "data.json");
-
     this.dirPath = dirname(this.filePath);
+  }
+
+  private getQueue(): Promise<void> {
+    return JsonDB.fileQueues.get(this.filePath) ?? Promise.resolve();
+  }
+
+  private setQueue(p: Promise<void>): void {
+    JsonDB.fileQueues.set(this.filePath, p);
   }
 
   async ensureExists(initialData: DataStore = {}): Promise<void> {
@@ -47,7 +63,6 @@ export class JsonDB {
         mode: 0o600,
       });
     } catch (error) {
-      // Another process may have created the file.
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
         throw error;
       }
@@ -106,16 +121,15 @@ export class JsonDB {
   ): Promise<T> {
     let result!: T;
 
-    const operation = this.writeQueue.then(async () => {
+    const currentQueue = this.getQueue();
+    const operation = currentQueue.then(async () => {
       const current = await this.read<T>();
       const updated = await updater(current);
-
       await this.write(updated);
       result = updated;
     });
 
-    this.writeQueue = operation.catch(() => {});
-
+    this.setQueue(operation.catch(() => {}));
     await operation;
 
     return result;

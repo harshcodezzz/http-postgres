@@ -18,6 +18,10 @@ redis:
 ratelimit:
   enabled: true
   requestPerMinute: 1000
+  requestPerMinutePerIp: 1000
+  whitelistedIPs:
+    - "[IP_ADDRESS]"
+    - "[IP_ADDRESS]"
 
 analytics:
   enabled: true

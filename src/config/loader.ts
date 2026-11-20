@@ -35,6 +35,8 @@ const configSchema = z
       .object({
         enabled: z.boolean().default(true),
         requestPerMinute: z.number().int().positive().default(1000),
+        requestPerMinutePerIp: z.number().int().positive().default(1000),
+        whitelistedIPs: z.array(z.string()).default([]),
       })
       .prefault({}),
 
