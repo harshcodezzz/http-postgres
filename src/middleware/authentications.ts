@@ -36,31 +36,16 @@ const authPlugin: FastifyPluginAsync = async (fastify) => {
     const urlPath = request.url.split("?")[0];
     const isAdminRoute = urlPath === "/admin" || urlPath.startsWith("/admin/");
 
-    if (admin) {
+    if (isAdminRoute) {
       if (typeof admin === "string") {
         const matches = await verifyAdminPassword(admin, fastify.jsondb);
 
         if (matches) {
-          if (isAdminRoute) {
-            request.admin = true;
-            return;
-          }
+          request.admin = true;
+          return;
         }
       }
 
-      if (isAdminRoute) {
-        return reply.code(401).send({
-          success: false,
-          error: {
-            code: "UNAUTHORIZED",
-            message: "error",
-          },
-        });
-      }
-    }
-
-    // Admin routes require valid admin authentication
-    if (isAdminRoute) {
       return reply.code(401).send({
         success: false,
         error: {
@@ -73,8 +58,8 @@ const authPlugin: FastifyPluginAsync = async (fastify) => {
     const rawApiKey =
       request.headers["x-api-key"] ?? request.headers.authorization;
     const apiKey =
-      typeof rawApiKey === "string" && rawApiKey.startsWith("Bearer ")
-        ? rawApiKey.slice(7).trim()
+      typeof rawApiKey === "string" && /^Bearer\s+/i.test(rawApiKey)
+        ? rawApiKey.replace(/^Bearer\s+/i, "").trim()
         : rawApiKey;
     const database =
       request.headers["x-database"] ?? request.headers["x-db-name"];

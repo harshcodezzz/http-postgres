@@ -70,7 +70,7 @@ export type GatewayConfig = z.infer<typeof configSchema>;
 function resolveEnv(value: unknown): unknown {
   if (typeof value === "string") {
     return value.replace(
-      /\$\{([A-Z_][A-Z0-9_]*)(?::-([^}]*))?\}/g,
+      /\$\{([a-zA-Z_][a-zA-Z0-9_]*)(?::-([^}]*))?\}/g,
       (_match, name: string, fallback?: string) => {
         const envValue = process.env[name];
 

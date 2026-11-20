@@ -109,7 +109,8 @@ export interface ApiKeyAuditLog {
 }
 
 export interface CreateApiKeyOptions {
-  databases: string[];
+  databases?: string[];
+  database?: string;
   environment?: ApiKeyEnvironment;
   db?: JsonDB;
   pgPool?: Pool;
@@ -189,7 +190,9 @@ export async function writeAuditLog(
 export async function createApiKey(
   options: CreateApiKeyOptions,
 ): Promise<CreateApiKeyResult> {
-  const { databases, environment = "LIVE" } = options;
+  const { environment = "LIVE" } = options;
+  const rawDatabases = options.databases ?? (options.database ? [options.database] : []);
+  const databases = [...new Set(rawDatabases)];
   const db = options.db ?? new JsonDB();
   const auditPath = options.auditLogPath ?? API_KEY_LOG_FILE;
 
@@ -410,7 +413,7 @@ export async function verifyApiKey(
   const lastRecorded = lastUsedThrottleMap.get(keyHash);
   const baseline =
     lastRecorded ??
-    (record.lastUsedAt ? new Date(record.lastUsedAt).getTime() : now);
+    (record.lastUsedAt ? new Date(record.lastUsedAt).getTime() : 0);
 
   if (lastRecorded === undefined) {
     lastUsedThrottleMap.set(keyHash, baseline);

@@ -75,6 +75,9 @@ export class JsonDB {
     const content = await readFile(this.filePath, "utf8");
 
     try {
+      if (!content.trim()) {
+        return {} as T;
+      }
       return JSON.parse(content) as T;
     } catch (error) {
       throw new Error(
