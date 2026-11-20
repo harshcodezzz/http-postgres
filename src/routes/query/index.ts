@@ -58,7 +58,7 @@ const queryRoutes: FastifyPluginAsync = async (fastify) => {
     }
     const options = parsed.data;
     const start = Date.now();
-    const execution = watchExecution(reply, 35_000);
+    const execution = watchExecution(reply, 35_000, fastify.queryPools.queryDispatched);
     let client: PoolClient;
     try {
       client = await execution.wait(fastify.queryPools.connect(database, databaseOid, queryScopes).then((connection) => {
@@ -84,10 +84,10 @@ const queryRoutes: FastifyPluginAsync = async (fastify) => {
         values: parameters ?? [],
         rowMode: options.arrayMode ? "array" : undefined,
       };
-      execution.check();
-      const operation = createResultBudget(execution).query(client, statement);
-      submitted = true;
-      const result: QueryResult | QueryResult[] = await execution.wait(operation);
+      const result: QueryResult | QueryResult[] = await execution.run(() => {
+        submitted = true;
+        return createResultBudget(execution).query(client, statement);
+      });
       const durationMs = Date.now() - start;
       if (Array.isArray(result)) {
         return {

@@ -53,6 +53,10 @@ const configSchema = z
       })
       .prefault({}),
 
+    transactions: z.object({
+      retentionDays: z.number().int().min(0).max(365_000).default(30),
+    }).prefault({}),
+
     analytics: z
       .object({
         enabled: z.boolean().default(true),

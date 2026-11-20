@@ -36,6 +36,8 @@ A query response or transaction batch can retain up to 50,000 result rows and ap
 
 The gateway saves the batch in PostgreSQL and returns `202 Accepted` with `transactionId`, `status: "pending"`, and a `Location` header. Poll `GET /transaction/:id` or `GET /transaction` with the `transaction-id` header using the same API key and database. The lookup returns `progress.completed` and `progress.total` while the batch runs. Accepted work continues if the submission request disconnects.
 
+Set an `Idempotency-Key` before the first submission if you might retry it. Use 1 to 128 letters, digits, or `._~-`. Within the same API key and database, repeating the key with the same normalized batch returns the original `202` receipt and transaction ID. Reusing the key for different SQL, parameters, or options returns `409 IDEMPOTENCY_KEY_CONFLICT`. The key remains reserved until the configured retention period has elapsed and the transaction record is gone.
+
 The first shutdown signal stops the server and lets accepted batches finish. A second signal forces an exit. Set the service manager's shutdown grace period to accommodate the 60-second execution deadline and transaction-store writes.
 
 | Status | Meaning |
@@ -46,7 +48,7 @@ The first shutdown signal stops the server and lets accepted batches finish. A s
 | `failed` | Execution did not reach a successful commit. |
 | `unknown` | The commit outcome could not be confirmed. Verify it before resubmitting. |
 
-Execution records survive gateway restarts. The gateway saves the results before sending `COMMIT` and retries a failed final status update. A crash or prolonged storage outage near commit can still leave the status uncertain. Interrupted batches are never replayed automatically. A record that stalls is reported as `failed` or `unknown` after its execution window. Delete a finished record with `DELETE /transaction/:id` or the header-based delete route. After a database rename, use its new name with the same, updated API key to look up or delete saved records. Deleting a record does not undo committed SQL.
+Execution records survive gateway restarts. The gateway stages the results before sending `COMMIT`. It publishes them only after PostgreSQL confirms the commit and the gateway saves the `committed` status. A crash or prolonged storage outage near commit can still leave the status uncertain. Interrupted batches are never replayed automatically. After the execution window, a stalled record is reported as `failed` or `unknown` with `finalized: false`. Only records with `finalized: true` can be deleted with `DELETE /transaction/:id` or the header-based delete route. After a database rename, use its new name with the same, updated API key to look up or delete saved records. Deleting a record does not undo committed SQL.
 
 ```json
 {

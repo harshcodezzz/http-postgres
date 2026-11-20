@@ -7,7 +7,9 @@ export class ExecutionStopped extends Error {
   }
 }
 
-export function watchExecution(reply: FastifyReply | undefined, deadlineMs: number) {
+export function watchExecution(
+  reply: FastifyReply | undefined, deadlineMs: number, queryDispatched: (client: PoolClient) => void,
+) {
   let client: PoolClient | undefined;
   let stopped: ExecutionStopped | undefined;
   let released = false;
@@ -40,11 +42,17 @@ export function watchExecution(reply: FastifyReply | undefined, deadlineMs: numb
     if (performance.now() >= deadline) timeOut();
     if (stopped) throw stopped;
   }
+  function wait<T>(operation: Promise<T>): Promise<T> {
+    return Promise.race([operation, interruption.then((error) => { throw error; })]);
+  }
   return {
     stop,
     check,
-    wait<T>(operation: Promise<T>): Promise<T> {
-      return Promise.race([operation, interruption.then((error) => { throw error; })]);
+    wait,
+    run<T>(operation: () => Promise<T>): Promise<T> {
+      check();
+      if (client) queryDispatched(client);
+      return wait(operation());
     },
     get stopped() { return stopped; },
     attach(connection: PoolClient) {

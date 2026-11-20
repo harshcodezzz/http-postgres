@@ -15,6 +15,8 @@ interface BackendSession {
   oid: string;
   startedAt: string | null;
   applicationName: string;
+  serverStartedAt: string;
+  idle: boolean;
 }
 
 export function createQueryPools(adminDb: Pool, adminRoles: string[], log: FastifyBaseLogger) {
@@ -24,6 +26,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
   const backends = new WeakMap<PoolClient, BackendSession>();
   const closingBackends = new Set<BackendSession>();
   let closeCheck: NodeJS.Timeout | undefined;
+  let closeCheckFailed = false;
   let closed = false;
 
   function scheduleCloseCheck(waitMs: number) {
@@ -32,16 +35,31 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
       let nextDelay = 100;
       try {
         const sessions = [...closingBackends];
-        const { rows } = await adminDb.query<BackendSession & { state: string | null }>(`
-          SELECT pid, datid::pg_catalog.text AS oid, state,
-                 EXTRACT(EPOCH FROM backend_start)::pg_catalog.text AS "startedAt",
-                 application_name AS "applicationName"
-          FROM pg_catalog.pg_stat_activity
-          WHERE pid = ANY($1::pg_catalog.int4[])
+        const { rows } = await adminDb.query<{
+          serverStartedAt: string;
+          pid: number | null;
+          oid: string | null;
+          startedAt: string | null;
+          state: string | null;
+          applicationName: string | null;
+        }>(`
+          SELECT EXTRACT(EPOCH FROM pg_catalog.pg_postmaster_start_time())::pg_catalog.text AS "serverStartedAt",
+                 activity.pid, activity.datid::pg_catalog.text AS oid, activity.state,
+                 EXTRACT(EPOCH FROM activity.backend_start)::pg_catalog.text AS "startedAt",
+                 activity.application_name AS "applicationName"
+          FROM (SELECT 1) AS server LEFT JOIN pg_catalog.pg_stat_activity AS activity
+            ON activity.pid = ANY($1::pg_catalog.int4[])
         `, [sessions.map(({ pid }) => pid)]);
         if (closed) return;
+        const observedServer = rows[0]?.serverStartedAt;
+        if (!observedServer) throw new Error("PostgreSQL did not identify the monitoring server");
         const byPid = new Map(rows.map((row) => [row.pid, row]));
+        let serverMismatch = false;
         for (const session of sessions) {
+          if (session.serverStartedAt !== observedServer) {
+            serverMismatch = true;
+            continue;
+          }
           const current = byPid.get(session.pid);
           const original = current?.oid === session.oid &&
             (current.startedAt === null || current.startedAt === session.startedAt);
@@ -49,8 +67,11 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
           const reset = current?.state === "idle" && current.applicationName !== session.applicationName;
           if ((!original || reset) && closingBackends.delete(session)) queryConnections--;
         }
+        if (serverMismatch) throw new Error("PostgreSQL backend checks reached a different server");
+        closeCheckFailed = false;
       } catch (err) {
-        if (!closed) log.warn({ err }, "Could not verify that closed query backends finished");
+        if (!closed && !closeCheckFailed) log.warn({ err }, "Could not verify that closed query backends finished");
+        closeCheckFailed = true;
         nextDelay = 1_000;
       } finally {
         closeCheck = undefined;
@@ -125,9 +146,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
       pool.on("remove", (client: PoolClient) => {
         if (!reservedClients.delete(client)) return;
         const session = backends.get(client);
-        // pg only sets readyForQuery after the backend finishes the execution cycle.
-        const ready = (client as PoolClient & { readyForQuery?: boolean }).readyForQuery === true;
-        if (session && !closed && (!ready || client.getTransactionStatus() !== "I")) {
+        if (session && !closed && !session.idle) {
           closingBackends.add(session);
           scheduleCloseCheck(0);
         } else {
@@ -187,27 +206,31 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
       if (target.oid !== oid) {
         throw new DatabaseError("The API key scope no longer matches this database", "DATABASE_SCOPE_CHANGED");
       }
-      const { rows: [session] } = await client.query<BackendSession>(`
+      const { rows: [identity] } = await client.query<Omit<BackendSession, "idle">>(`
         SELECT pid, datid::pg_catalog.text AS oid,
                EXTRACT(EPOCH FROM backend_start)::pg_catalog.text AS "startedAt",
+               EXTRACT(EPOCH FROM pg_catalog.pg_postmaster_start_time())::pg_catalog.text AS "serverStartedAt",
                pg_catalog.set_config('application_name', $1, false) AS "applicationName",
                pg_catalog.set_config('statement_timeout', $2, false)
         FROM pg_catalog.pg_stat_activity
         WHERE pid OPERATOR(pg_catalog.=) pg_catalog.pg_backend_pid()
       `, [`http-postgres-${randomUUID()}`, String(statementTimeoutMillis)]);
-      if (!session || session.oid !== oid) {
+      if (!identity || identity.oid !== oid) {
         throw new DatabaseError("Could not identify the query backend", "QUERY_DATABASE_UNAVAILABLE");
       }
       // Database OIDs are local to a cluster. Confirm this live session from the admin connection.
-      const { rows: [identity] } = await adminDb.query<{ verified: boolean }>(`
-        SELECT EXISTS (
+      const { rows: [observer] } = await adminDb.query<{ verified: boolean }>(`
+        SELECT EXTRACT(EPOCH FROM pg_catalog.pg_postmaster_start_time())::pg_catalog.text = $4 AND EXISTS (
           SELECT 1 FROM pg_catalog.pg_stat_activity
           WHERE pid = $1 AND datid = $2::pg_catalog.oid AND application_name = $3
         ) AS verified
-      `, [session.pid, session.oid, session.applicationName]);
-      if (!identity?.verified) {
+      `, [identity.pid, identity.oid, identity.applicationName, identity.serverStartedAt]);
+      if (!observer?.verified) {
         throw new DatabaseError("The query backend is not on the administrative PostgreSQL server", "QUERY_DATABASE_UNAVAILABLE");
       }
+      const session = { ...identity, idle: client.getTransactionStatus() === "I" };
+      // ReadyForQuery includes the backend's transaction status after each execution cycle.
+      client.connection.on("readyForQuery", () => { session.idle = client.getTransactionStatus() === "I"; });
       backends.set(client, session);
       checkMaintenance();
       return client;
@@ -215,6 +238,11 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
       client.release(true);
       throw error;
     }
+  }
+
+  function queryDispatched(client: PoolClient) {
+    const session = backends.get(client);
+    if (session) session.idle = false;
   }
 
   async function close() {
@@ -228,7 +256,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
     }
   }
 
-  return { connect, withMaintenance, close };
+  return { connect, queryDispatched, withMaintenance, close };
 }
 
 export type QueryPools = ReturnType<typeof createQueryPools>;

@@ -35,8 +35,11 @@ The table lists loader defaults. Explicit values in [gateway.yaml](../gateway.ya
 | `ratelimit.requestPerMinute` | `1000` | Requests per authenticated API key in a 60-second window. |
 | `ratelimit.requestPerMinutePerIp` | `1000` | Requests per IP in a 60-second window. Applies before authentication. |
 | `ratelimit.whitelistedIPs` | `[]` | Exact client IP strings exempt from the per-IP limit. Replace the example placeholders in the supplied file with real addresses or `[]`. |
+| `transactions.retentionDays` | `30` | Days to keep finalized execution records and reserve completed idempotency keys. Set to `0` to disable automatic cleanup. |
 | `analytics.enabled` | `true` | Accepted by the configuration loader. Analytics collection is unimplemented. |
 | `analytics.directory` | `./data/analytics` | Configured path for analytics. |
+
+When Redis rate limiting is enabled, the Redis user needs permission to run `EVAL`, `INCR`, `TTL`, and `EXPIRE` on the rate-limit keys.
 
 For a loopback-only development instance without Redis, set these fields in the existing YAML file.
 
@@ -52,7 +55,7 @@ redis:
 
 Configure a dedicated PostgreSQL login for each default connection or privilege profile. Give the login `CONNECT` on its database and the schema and object privileges needed by the queries. The gateway checks that the login is separate from the administrative roles, has no elevated role memberships, and lacks `CONNECT` on other connectable databases. PostgreSQL grants `CONNECT` to `PUBLIC` by default. On a shared cluster, grant access explicitly to the roles that need each database before revoking the public grant. Keep cross-database connections, foreign servers, and privileged routines out of the query login's grants. [PostgreSQL privileges](https://www.postgresql.org/docs/current/ddl-priv.html)
 
-Use a direct PostgreSQL connection or a session-mode proxy that resets each backend session on client disconnect. The admin and query URLs must point to the same PostgreSQL server. The gateway verifies each query session through the administrative connection's `pg_stat_activity` view. If a session-mode proxy retains its backend connections, grant the administrative role `pg_read_all_stats` so the gateway can recognize when those sessions have reset after an interruption. Provide the full URL for each database, including its database name. Store credentials in environment variables and reference them from YAML.
+Use a direct PostgreSQL connection or a session-mode proxy that resets each backend session on client disconnect. The admin and query URLs must point to the same PostgreSQL server. The gateway verifies each query session through the administrative connection's `pg_stat_activity` view. If a session-mode proxy retains its backend connections, grant the administrative role `pg_read_all_stats` so the gateway can recognize when those sessions have reset after an interruption. An interrupted backend keeps its capacity slot if the administrative connection cannot verify its state or reaches a different PostgreSQL server. After switching to a replacement server, restart the gateway to reset capacity for the new server. Provide the full URL for each database, including its database name. Store credentials in environment variables and reference them from YAML.
 
 ```yaml
 database:
@@ -94,11 +97,12 @@ The update refreshes the PostgreSQL identity bindings and preserves the key's re
 | Path | Contents |
 | --- | --- |
 | `data/data.json` | Local JsonDB file with the admin password hash and API key records. Keep this file to retain credentials across restarts. |
+| `data/data.json.lock` | SQLite lock file used to serialize JsonDB writers. The operating system releases the lock on process exit. |
 | `logs/gateway.*.log` | Gateway logs, rotated daily or at the configured `20m` size threshold. |
 | `logs/current.log` | Symlink to the active gateway log. |
 | `logs/api-keys.log` | Active API key audit events. Rotates at 5 MiB. |
 | `logs/api-keys.log.1` | Previous audit log generation. |
 
-Fastify's request completion logs print `responseTime` in milliseconds as a JSON string with three decimal places. Processes sharing JsonDB must use the same data path on a filesystem that supports atomic directory creation and rename. Writers wait up to five seconds for the adjacent `data.json.lock` directory. If a process dies while holding the lock, remove the lock directory only after confirming all gateway processes using the file have stopped. Use a separate audit-log directory per process. Transaction queues are held in process memory and have no runtime file.
+Fastify's request completion logs print `responseTime` in milliseconds as a JSON string with three decimal places. Processes sharing JsonDB must use the same data path on a filesystem that supports SQLite locking and atomic rename. Writers wait up to five seconds for the lock. Keep the regular lock file in place while the gateway is running. When upgrading from the directory-based lock, stop older gateway processes that share the file. If an earlier crash left an empty `data.json.lock` directory, remove that directory before starting the upgrade. Use a separate audit-log directory per process. Transaction queues are held in process memory and have no runtime file.
 
-Accepted `/transaction/execute` batches, including SQL, parameters, progress, and outcomes, are stored in `http_postgres_gateway.transactions` in the administrative database. The administrative role must own the storage schema. A DBA can provision it for that role with `CREATE SCHEMA http_postgres_gateway AUTHORIZATION gateway_admin`. If the schema is missing, the gateway needs database-level `CREATE` to provision it. Keep the schema private to the administrative role. Records are retained until explicitly deleted. New inputs and outcomes are stored as base64-encoded JSON strings in the existing JSONB columns. The gateway reads both formats. Deferred transaction queues remain process-local.
+Accepted `/transaction/execute` batches, including SQL, parameters, progress, and outcomes, are stored in `http_postgres_gateway.transactions` in the administrative database. The administrative role must own the storage schema and its tables. A DBA can provision the schema with `CREATE SCHEMA http_postgres_gateway AUTHORIZATION gateway_admin`. If the schema is missing, the gateway needs database-level `CREATE` to provision it. Keep the schema private to the administrative role. Finalized records are pruned after the configured retention period. Unfinished records remain available for investigation. Idempotency keys are pruned after the retention period has elapsed and the corresponding execution record is gone. Inputs and outcomes use base64-encoded JSON strings in JSONB columns, with older JSONB objects still readable. Deferred transaction queues remain process-local.

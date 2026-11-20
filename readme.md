@@ -4,7 +4,7 @@ Run PostgreSQL queries over HTTP with database-scoped API keys. The gateway supp
 
 ## Run locally
 
-Use Node.js 22 or later, npm, and a running PostgreSQL server. The supplied configuration also expects a running Redis server. For local development without Redis, set `redis.enabled` to `false` in `gateway.yaml`.
+Use Node.js 22.13+ on the 22.x line or Node.js 23.4+, with npm and a running PostgreSQL server. The supplied configuration also expects a running Redis server. For local development without Redis, set `redis.enabled` to `false` in `gateway.yaml`.
 
 ```sh
 npm ci

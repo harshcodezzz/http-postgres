@@ -1,9 +1,10 @@
 import fp from "fastify-plugin";
 import type { FastifyPluginAsync } from "fastify";
-import { mkdir, readFile, writeFile, rename, unlink, rmdir } from "node:fs/promises";
+import { lstat, mkdir, readFile, writeFile, rename, unlink } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { resolve, dirname } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { DatabaseScopes } from "../config/query-privileges.js";
 
 export interface ApiKeyRecord {
@@ -41,12 +42,23 @@ export class JsonDB {
     await mkdir(this.dirPath, { recursive: true });
     const lockPath = `${this.filePath}.lock`;
     const deadline = performance.now() + 5_000;
-    while (true) {
+    let lock: DatabaseSync | undefined;
+    while (!lock) {
       try {
-        await mkdir(lockPath, { mode: 0o700 });
-        break;
+        lock = new DatabaseSync(lockPath);
+        lock.exec("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE");
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        lock?.close();
+        lock = undefined;
+        const code = (error as { errcode?: number })?.errcode;
+        // SQLITE_BUSY and SQLITE_LOCKED are normal while another writer holds the lock.
+        if (code === undefined || ((code & 255) !== 5 && (code & 255) !== 6)) {
+          const existing = await lstat(lockPath).catch((cause: NodeJS.ErrnoException) => {
+            if (cause.code !== "ENOENT") throw cause;
+          });
+          // An older gateway uses a directory at this path. Let that writer release it first.
+          if (!existing?.isDirectory() && (existing || code !== 14)) throw error;
+        }
         if (performance.now() >= deadline) throw new Error(`Timed out acquiring JsonDB lock at ${lockPath}`);
         await delay(25);
       }
@@ -54,7 +66,8 @@ export class JsonDB {
     try {
       return await operation();
     } finally {
-      await rmdir(lockPath);
+      // Closing the SQLite connection rolls back the lock transaction. The OS also releases it on exit.
+      lock.close();
     }
   }
 
@@ -77,7 +90,10 @@ export class JsonDB {
 
   async read<T = DataStore>(): Promise<T> {
     await this.ensureExists();
+    return this.readExisting<T>();
+  }
 
+  private async readExisting<T>(): Promise<T> {
     const content = await readFile(this.filePath, "utf8");
 
     try {
@@ -132,7 +148,7 @@ export class JsonDB {
   ): Promise<T> {
     await this.ensureExists();
     return this.withLock(async () => {
-      const current = await this.read<T>();
+      const current = await this.readExisting<T>();
       const updated = await updater(current);
       await this.replace(updated);
       return updated;

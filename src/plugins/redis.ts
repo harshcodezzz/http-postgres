@@ -104,17 +104,15 @@ class RedisStore implements KeyValueStore {
   }
 
   async increment(key: string, ttlSeconds?: number): Promise<number> {
-    const count = await this.client.incr(key);
-    if (ttlSeconds !== undefined) {
-      if (count === 1) {
-        await this.client.expire(key, ttlSeconds);
-      } else {
-        const ttl = await this.client.ttl(key);
-        if (ttl === -1) {
-          await this.client.expire(key, ttlSeconds);
-        }
-      }
-    }
+    if (ttlSeconds === undefined) return this.client.incr(key);
+    const count = await this.client.eval(`
+      local count = redis.call("INCR", KEYS[1])
+      if count == 1 or redis.call("TTL", KEYS[1]) == -1 then
+        redis.call("EXPIRE", KEYS[1], ARGV[1])
+      end
+      return count
+    `, 1, key, ttlSeconds);
+    if (typeof count !== "number") throw new Error("Redis returned an invalid rate-limit count");
     return count;
   }
 
