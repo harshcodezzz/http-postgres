@@ -28,8 +28,9 @@ The table lists loader defaults. Explicit values in [gateway.yaml](../gateway.ya
 | `database.queryUrls` | `{}` | Maps database names to the default query login URLs used by keys that list database names only. |
 | `database.queryProfiles` | `{}` | Maps database names to PostgreSQL logins for explicit API-key privilege sets. |
 | `database.pool.min` | `2` | Minimum size of the administrative pool, zero or greater. |
+| `database.pool.queryMin` | `1` | Number of connections the gateway prewarms and tries to keep open per configured query login or profile. Set to `0` to open them on demand. The minimum cannot exceed the per-pool maximum and prewarming shares the global budget. |
 | `database.pool.max` | `20` | Maximum size of the administrative pool and of each query pool. A database has a separate pool for its default login and each configured privilege profile. The minimum cannot exceed the maximum. |
-| `database.pool.maxGlobalQueries` | `40` | Process-wide budget across all databases and profiles. Includes opening connections and interrupted backends that may still be active. Excludes the administrative pool. A full per-profile pool rejects new requests before they consume global slots. |
+| `database.pool.maxGlobalQueries` | `40` | Process-wide budget across all databases and profiles. Includes opening, idle, busy, and unverified closing query connections. Excludes the administrative pool. Reusing an idle session consumes its existing slot. The gateway can reclaim idle capacity from another profile when opening a connection. |
 | `redis.enabled` | `true` | Connect to Redis on startup. Set to `false` to use an in-memory store local to the gateway process. |
 | `redis.mode` | `external` | Accepts `external` or `managed`. Both currently connect to the configured Redis URL when enabled. |
 | `redis.url` | Required when enabled | Redis connection string. |
@@ -87,7 +88,7 @@ When renaming a served database, configure the destination name and connection U
 
 ### Recover query connection capacity
 
-Poll authenticated `GET /admin/health` on each gateway process. Its `services.queryConnections` object reports reserved and available slots, slots awaiting verification, the age of the oldest one, and PostgreSQL monitoring status. `rejectionsAtLimit` counts process-wide capacity rejections since startup. `rejectionsAtPoolLimit` counts rejections when a database or profile exhausts its own pool. The gateway logs the start and recovery of a monitoring failure. Compare both counters with `oldestUnverifiedMs` to tell load saturation from stuck backend verification.
+Poll authenticated `GET /admin/health` on each gateway process. Its `services.queryConnections` object reports reserved, idle, and available slots, slots awaiting verification, the age of the oldest one, and PostgreSQL monitoring status. `available` counts slots for opening new connections. `rejectionsAtLimit` counts process-wide capacity rejections since startup. `rejectionsAtPoolLimit` counts rejections when a database or profile exhausts its own pool. The gateway logs the start and recovery of a monitoring failure. Compare both counters with `oldestUnverifiedMs` to tell load saturation from stuck backend verification.
 
 Restore the administrative connection and its ability to inspect sessions on the PostgreSQL server that owns the interrupted backends. For `server_mismatch`, check that the admin and query URLs or proxies still target the same server. The gateway retries verification and releases slots as it confirms that sessions exited or reset. If the gateway must move to a replacement server, drain traffic and confirm that its old PostgreSQL sessions have ended or that the old server is offline before restarting the gateway against the replacement.
 

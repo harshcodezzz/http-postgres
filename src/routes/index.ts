@@ -7,6 +7,7 @@ import { createQueryPools } from "../utils/query-pool.js";
 export async function registerRoutes(app: FastifyInstance) {
   const queryPools = createQueryPools(app.db, app.databaseAdminRoles, app.log);
   app.decorate("queryPools", queryPools);
+  app.addHook("onReady", async () => { await queryPools.warm(); });
   app.addHook("onClose", () => queryPools.close());
 
   // Public health check route

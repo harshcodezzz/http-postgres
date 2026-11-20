@@ -58,10 +58,10 @@ const queryRoutes: FastifyPluginAsync = async (fastify) => {
     }
     const options = parsed.data;
     const start = Date.now();
-    const execution = watchExecution(reply, 35_000, fastify.queryPools.queryDispatched);
+    const execution = watchExecution(reply, 35_000, fastify.queryPools);
     let client: PoolClient;
     try {
-      client = await execution.wait(fastify.queryPools.connect(database, databaseOid, queryScopes).then((connection) => {
+      client = await execution.wait(fastify.queryPools.connect(database, databaseOid, queryScopes, request.apiKey?.id).then((connection) => {
         execution.attach(connection);
         return connection;
       }));

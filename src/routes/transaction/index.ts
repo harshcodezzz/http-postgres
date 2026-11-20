@@ -212,7 +212,7 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
     const respond = (status: number, payload: object) => ({ status, payload });
     const failure = (status: number, code: string, message: string) =>
       respond(status, { success: false, error: { code, message } });
-    const execution = watchExecution(reply, 60_000, fastify.queryPools.queryDispatched);
+    const execution = watchExecution(reply, 60_000, fastify.queryPools);
     let storeFailed = false;
     async function saveProgress(operation: Promise<void>) {
       try {
@@ -228,7 +228,7 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
     let commitSent = false;
     let queryId: string | undefined;
     try {
-      const acquired = await execution.wait(fastify.queryPools.connect(transaction.database, transaction.databaseOid, scopes).then((connection) => {
+      const acquired = await execution.wait(fastify.queryPools.connect(transaction.database, transaction.databaseOid, scopes, transaction.owner).then((connection) => {
         execution.attach(connection);
         return connection;
       }));
@@ -321,7 +321,7 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
       fastify.log.error({ err: error }, "Failed to start transaction");
       return failure(503, "TRANSACTION_UNAVAILABLE", "Could not start the PostgreSQL transaction");
     } finally {
-      // Discard session-level changes made by queued SQL.
+      // Reset session-level changes made by queued SQL before releasing the lease.
       execution.close();
       transaction.expiresAt = Date.now() + retentionMs;
     }

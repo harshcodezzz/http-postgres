@@ -1,5 +1,6 @@
 import type { FastifyReply } from "fastify";
 import { Query, types, type CustomTypesConfig, type PoolClient, type QueryConfig, type QueryResult } from "pg";
+import type { QueryPools } from "../../utils/query-pool.js";
 
 export class ExecutionStopped extends Error {
   constructor(readonly status: number, readonly code: string, message: string) {
@@ -8,7 +9,7 @@ export class ExecutionStopped extends Error {
 }
 
 export function watchExecution(
-  reply: FastifyReply | undefined, deadlineMs: number, queryDispatched: (client: PoolClient) => void,
+  reply: FastifyReply | undefined, deadlineMs: number, pools: Pick<QueryPools, "queryDispatched" | "release">,
 ) {
   let client: PoolClient | undefined;
   let stopped: ExecutionStopped | undefined;
@@ -19,7 +20,7 @@ export function watchExecution(
   function release() {
     if (!client || released) return;
     released = true;
-    client.release(true);
+    pools.release(client, stopped !== undefined);
   }
   function stop(error: ExecutionStopped) {
     if (stopped) return;
@@ -51,7 +52,7 @@ export function watchExecution(
     wait,
     run<T>(operation: () => Promise<T>): Promise<T> {
       check();
-      if (client) queryDispatched(client);
+      if (client) pools.queryDispatched(client);
       return wait(operation());
     },
     get stopped() { return stopped; },

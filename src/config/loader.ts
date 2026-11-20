@@ -32,6 +32,7 @@ const configSchema = z
       pool: z
         .object({
           min: z.number().int().min(0).default(2),
+          queryMin: z.number().int().min(0).default(1),
           max: z.number().int().positive().default(20),
           maxGlobalQueries: z.number().int().positive().default(40),
         })
@@ -70,6 +71,13 @@ const configSchema = z
         code: "custom",
         path: ["database", "pool", "min"],
         message: "Pool minimum cannot exceed pool maximum",
+      });
+    }
+    if (config.database.pool.queryMin > config.database.pool.max) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["database", "pool", "queryMin"],
+        message: "Query pool minimum cannot exceed pool maximum",
       });
     }
 
