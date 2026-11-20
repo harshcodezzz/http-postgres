@@ -14,6 +14,7 @@ database:
         url: "${BENCHMARK_DATABASE_URL:-postgresql://http_postgres_benchmark_crud@127.0.0.1:5432/postgres}"
   pool:
     min: 2
+    queryMin: 2
     max: 50
     maxGlobalQueries: 100
 

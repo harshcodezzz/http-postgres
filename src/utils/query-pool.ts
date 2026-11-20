@@ -6,6 +6,8 @@ import { scopeKey, type QueryPrivilege } from "../config/query-privileges.js";
 import { DatabaseError, getPostgresDatabaseOid } from "./pg-database.js";
 
 const connectionTimeoutMillis = 5_000;
+const checkoutTimeoutMillis = 400;
+const growthIntervalMillis = 50;
 const statementTimeoutMillis = 30_000;
 const queryTimeoutMillis = 35_000;
 let queryConnections = 0;
@@ -20,8 +22,26 @@ interface BackendSession {
   ownerId?: string;
 }
 
+interface CheckoutWaiter {
+  verify(client: PoolClient): Promise<BackendSession>;
+  serve(client: PoolClient, verified?: BackendSession): Promise<void>;
+  retry(): void;
+  fail(error: unknown): void;
+}
+
+interface ManagedPool {
+  pool: Pool;
+  waiters: Set<CheckoutWaiter>;
+  nextOpeningAt: number;
+  opening: boolean;
+  reclaiming: boolean;
+  scheduled: boolean;
+  retired: boolean;
+  growthTimer?: NodeJS.Timeout;
+}
+
 export function createQueryPools(adminDb: Pool, adminRoles: string[], log: FastifyBaseLogger) {
-  const pools = new Map<string, Map<string, Pool>>();
+  const pools = new Map<string, Map<string, ManagedPool>>();
   const maintenance = new Set<string>();
   const reservedClients = new WeakSet<Client>();
   const backends = new WeakMap<PoolClient, BackendSession>();
@@ -35,15 +55,12 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
   let lastSuccessfulCheckAt: string | null = null;
   let rejectionsAtLimit = 0;
   let rejectionsAtPoolLimit = 0;
+  let checkoutTimeouts = 0;
+  let pendingCheckouts = 0;
   let warmTimer: NodeJS.Timeout | undefined;
   let warming: Promise<void> | undefined;
   let closing = false;
   let closed = false;
-
-  function connectionLimit() {
-    rejectionsAtLimit++;
-    return new DatabaseError("The gateway query connection budget is exhausted", "QUERY_CONNECTION_LIMIT");
-  }
 
   // pg-pool calls connect only when it opens a physical connection. Returning an
   // existing connection to a borrower does not take another global slot.
@@ -60,7 +77,9 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
     }
 
     private async open() {
-      if (queryConnections >= config.database.pool.maxGlobalQueries) throw connectionLimit();
+      if (queryConnections >= config.database.pool.maxGlobalQueries) {
+        throw new DatabaseError("The gateway query connection budget is exhausted", "QUERY_CONNECTION_LIMIT");
+      }
       queryConnections++;
       try {
         const client = await super.connect();
@@ -68,6 +87,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
         return client;
       } catch (error) {
         queryConnections--;
+        wakePools();
         throw error;
       }
     }
@@ -81,7 +101,9 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
       reserved: queryConnections,
       available: Math.max(0, limit - queryConnections),
       idle: [...pools.values()].flatMap((group) => [...group.values()])
-        .reduce((count, pool) => count + pool.idleCount, 0),
+        .reduce((count, state) => count + state.pool.idleCount, 0),
+      pendingCheckouts,
+      checkoutTimeouts,
       awaitingVerification: closingBackends.size,
       oldestUnverifiedMs: oldest === undefined ? null : Math.floor(performance.now() - oldest),
       rejectionsAtLimit,
@@ -130,7 +152,10 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
             (current.startedAt === null || current.startedAt === session.startedAt);
           // A session-mode proxy may keep the backend after it resets the client session.
           const reset = current?.state === "idle" && current.applicationName !== session.applicationName;
-          if ((!original || reset) && closingBackends.delete(session)) queryConnections--;
+          if ((!original || reset) && closingBackends.delete(session)) {
+            queryConnections--;
+            wakePools();
+          }
         }
         if (serverMismatch) throw new Error("PostgreSQL backend checks reached a different server");
         const recovered = monitoringFailure !== null;
@@ -159,7 +184,14 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
     const databasePools = pools.get(database);
     if (databasePools) {
       pools.delete(database);
-      await Promise.all([...databasePools.values()].map((pool) => pool.end()));
+      await Promise.all([...databasePools.values()].map((state) => {
+        state.retired = true;
+        clearTimeout(state.growthTimer);
+        for (const waiter of state.waiters) {
+          waiter.fail(new DatabaseError("Database maintenance is in progress", "DATABASE_IN_USE"));
+        }
+        return state.pool.end();
+      }));
     }
   }
 
@@ -192,12 +224,18 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
     });
   }
 
-  async function reclaimIdleConnection(requested: Pool) {
+  async function reclaimIdleConnection(requested: Pool | undefined) {
     for (const group of pools.values()) {
-      for (const pool of group.values()) {
-        if (pool === requested || pool.idleCount <= pool.waitingCount) continue;
+      for (const state of group.values()) {
+        const { pool } = state;
+        if (pool === requested || state.retired || state.waiters.size ||
+            pool.totalCount <= config.database.pool.queryMin || pool.idleCount <= pool.waitingCount) continue;
         const client = await pool.connect().catch(() => undefined);
         if (client) {
+          if (state.retired || state.waiters.size || pool.totalCount <= config.database.pool.queryMin) {
+            client.release();
+            continue;
+          }
           await removeClient(pool, client);
           return true;
         }
@@ -206,23 +244,167 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
     return false;
   }
 
-  async function checkout(pool: Pool, ownerId: string | undefined) {
-    const { max, maxGlobalQueries } = config.database.pool;
-    for (let attempt = 0; attempt <= max; attempt++) {
-      const hasIdle = pool.idleCount > pool.waitingCount;
-      if (!hasIdle && pool.totalCount >= max) break;
-      if (!hasIdle && queryConnections >= maxGlobalQueries) {
-        if (ownerId === undefined || !await reclaimIdleConnection(pool)) throw connectionLimit();
+  function wakePools() {
+    for (const group of pools.values()) for (const state of group.values()) wake(state);
+  }
+
+  async function grow(state: ManagedPool, waiter: CheckoutWaiter) {
+    let client: PoolClient | undefined;
+    let session: BackendSession;
+    try {
+      client = await state.pool.connect();
+      session = await waiter.verify(client);
+    } catch (error) {
+      client?.release(true);
+      if (state.waiters.has(waiter) && !(error instanceof DatabaseError && error.code === "QUERY_CONNECTION_LIMIT")) {
+        waiter.fail(error);
       }
-      const client = await pool.connect();
-      const priorOwner = backends.get(client)?.ownerId;
-      if (!priorOwner || ownerId === undefined || priorOwner === ownerId) return client;
-      // PostgreSQL extensions can hold backend-local state beyond DISCARD ALL.
-      // A connection used by one API key only returns to that same key.
-      await removeClient(pool, client);
+      return;
     }
-    rejectionsAtPoolLimit++;
-    throw new DatabaseError("The database query pool is busy", "QUERY_POOL_BUSY");
+    // Waiters can use an existing session while the new connection is opening.
+    if (state.waiters.delete(waiter)) await waiter.serve(client, session);
+    else client.release();
+  }
+
+  function wake(state: ManagedPool) {
+    if (closing || state.retired || state.scheduled || !state.waiters.size) return;
+    state.scheduled = true;
+    queueMicrotask(() => {
+      state.scheduled = false;
+      if (closing || state.retired) return;
+      const { pool, waiters } = state;
+      function lend(waiter: CheckoutWaiter) {
+        waiters.delete(waiter);
+        return pool.connect().then((client) => waiter.serve(client), (error) => {
+          if (error instanceof DatabaseError && error.code === "QUERY_CONNECTION_LIMIT") waiter.retry();
+          else waiter.fail(error);
+        });
+      }
+      for (const waiter of waiters) {
+        if (pool.idleCount <= pool.waitingCount) break;
+        void lend(waiter);
+      }
+      const next = waiters.values().next().value;
+      if (!next || state.opening || pool.totalCount >= config.database.pool.max) return;
+      const wait = state.nextOpeningAt - performance.now();
+      if (wait > 0) {
+        state.growthTimer ??= setTimeout(() => {
+          state.growthTimer = undefined;
+          wake(state);
+        }, Math.ceil(wait)).unref();
+        return;
+      }
+      if (queryConnections >= config.database.pool.maxGlobalQueries) {
+        if (!state.reclaiming) {
+          state.reclaiming = true;
+          void reclaimIdleConnection(pool).then((reclaimed) => {
+            state.reclaiming = false;
+            if (reclaimed) wake(state);
+          }, (err) => {
+            state.reclaiming = false;
+            log.warn({ err }, "Could not reclaim an idle PostgreSQL query connection");
+          });
+        }
+        return;
+      }
+      state.opening = true;
+      state.nextOpeningAt = performance.now() + growthIntervalMillis;
+      void grow(state, next).finally(() => {
+        state.opening = false;
+        wake(state);
+      });
+    });
+  }
+
+  function checkout(
+    state: ManagedPool,
+    ownerId: string | undefined,
+    verify: (client: PoolClient) => Promise<BackendSession>,
+    signal?: AbortSignal,
+  ): Promise<PoolClient> {
+    return new Promise((resolve, reject) => {
+      const deadline = performance.now() + checkoutTimeoutMillis;
+      let settled = false;
+      pendingCheckouts++;
+
+      function finish() {
+        settled = true;
+        pendingCheckouts--;
+        state.waiters.delete(waiter);
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", cancel);
+      }
+      function cancel() {
+        waiter.fail(signal?.reason);
+      }
+      function expire() {
+        if (settled) return;
+        checkoutTimeouts++;
+        let code = "QUERY_POOL_WAIT_TIMEOUT";
+        if (state.pool.totalCount >= config.database.pool.max) {
+          rejectionsAtPoolLimit++;
+          code = "QUERY_POOL_BUSY";
+        } else if (queryConnections >= config.database.pool.maxGlobalQueries) {
+          rejectionsAtLimit++;
+          code = "QUERY_CONNECTION_LIMIT";
+        }
+        waiter.fail(new DatabaseError("Timed out after 400 ms waiting for a PostgreSQL query connection", code));
+      }
+
+      const waiter: CheckoutWaiter = {
+        verify,
+        fail(error) {
+          if (settled) return;
+          finish();
+          reject(error);
+        },
+        retry() {
+          if (settled) return;
+          if (closing || state.retired) {
+            waiter.fail(new DatabaseError("Database maintenance is in progress", "DATABASE_IN_USE"));
+          } else if (performance.now() >= deadline) expire();
+          else {
+            state.waiters.add(waiter);
+            wake(state);
+          }
+        },
+        async serve(client, verified) {
+          if (performance.now() >= deadline) expire();
+          const previous = backends.get(client);
+          if (settled && previous) {
+            client.release();
+            return;
+          }
+          if (previous?.ownerId && previous.ownerId !== ownerId) {
+            // PostgreSQL extensions can hold backend-local state beyond DISCARD ALL.
+            client.release(true);
+            waiter.retry();
+            return;
+          }
+          let session: BackendSession;
+          try {
+            session = verified ?? await verify(client);
+          } catch (error) {
+            client.release(true);
+            waiter.fail(error);
+            return;
+          }
+          if (performance.now() >= deadline) expire();
+          if (settled) {
+            // A slow connection still becomes warm for later requests.
+            client.release();
+            return;
+          }
+          session.ownerId = ownerId;
+          finish();
+          resolve(client);
+        },
+      };
+      const timer = setTimeout(expire, checkoutTimeoutMillis).unref();
+      signal?.addEventListener("abort", cancel, { once: true });
+      if (signal?.aborted) cancel();
+      else waiter.retry();
+    });
   }
 
   async function observeServer(session: Omit<BackendSession, "idle">, opening: boolean) {
@@ -244,6 +426,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
     oid: string,
     scopes: readonly QueryPrivilege[] | null = null,
     ownerId?: string,
+    signal?: AbortSignal,
   ): Promise<PoolClient> {
     function checkMaintenance() {
       if (closing || maintenance.has(database)) {
@@ -266,9 +449,9 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
       pools.set(database, databasePools);
     }
     const poolKey = scopes ? scopeKey(scopes) : "";
-    let pool = databasePools.get(poolKey);
-    if (!pool) {
-      pool = new Pool({
+    let state = databasePools.get(poolKey);
+    if (!state) {
+      const pool = new Pool({
         connectionString,
         Client: BudgetedClient,
         pipeline: false,
@@ -279,9 +462,18 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
         connectionTimeoutMillis,
         query_timeout: queryTimeoutMillis,
       });
+      const managed: ManagedPool = {
+        pool, waiters: new Set(), nextOpeningAt: 0,
+        opening: false, reclaiming: false, scheduled: false, retired: false,
+      };
       const checkedOutError = (err: Error) => log.warn({ err, database }, "Checked-out query connection error");
       pool.on("acquire", (client: PoolClient) => client.on("error", checkedOutError));
-      pool.on("release", (_err: Error | undefined, client: PoolClient) => client.removeListener("error", checkedOutError));
+      pool.on("release", (_err: Error | undefined, client: PoolClient) => {
+        client.removeListener("error", checkedOutError);
+        if (pendingCheckouts && queryConnections >= config.database.pool.maxGlobalQueries &&
+            pool.totalCount > config.database.pool.queryMin) wakePools();
+        else wake(managed);
+      });
       pool.on("error", (err) => log.error({ err, database }, "Query connection pool error"));
       pool.on("remove", (client: PoolClient) => {
         if (!reservedClients.delete(client)) return;
@@ -291,14 +483,23 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
           scheduleCloseCheck(0);
         } else {
           queryConnections--;
+          wakePools();
+        }
+        if (warmTimer && !closing && !managed.retired && pool.totalCount < config.database.pool.queryMin) {
+          queueMicrotask(() => { void replenish(); });
         }
       });
-      databasePools.set(poolKey, pool);
+      state = managed;
+      databasePools.set(poolKey, state);
     }
 
-    const client = await checkout(pool, ownerId);
-    try {
+    const managed = state;
+    function checkPool() {
       checkMaintenance();
+      if (managed.retired) throw new DatabaseError("Database maintenance is in progress", "DATABASE_IN_USE");
+    }
+    async function verify(client: PoolClient): Promise<BackendSession> {
+      checkPool();
       const excludedRoles = scopes
         ? adminRoles.concat(config.database.queryProfiles[database]
             .filter((candidate) => candidate.scopes.some((scope) => !scopes.includes(scope)))
@@ -338,7 +539,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
         WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
       `, [excludedRoles, sessionName, String(statementTimeoutMillis)]),
       previous && observeServer(previous, false)]);
-      checkMaintenance();
+      checkPool();
       if (target?.name !== database || !target.safe || (profile && target.login !== profile.role)) {
         throw new DatabaseError("Query credentials are unavailable for this database", "QUERY_DATABASE_UNAVAILABLE");
       }
@@ -350,15 +551,21 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
             target.serverStartedAt !== previous.serverStartedAt) {
           throw new DatabaseError("The pooled query backend changed", "QUERY_DATABASE_UNAVAILABLE");
         }
-        if (ownerId !== undefined) previous.ownerId = ownerId;
-      } else {
-        await observeServer(target, true);
-        const session = { ...target, idle: client.getTransactionStatus() === "I", ownerId };
-        // ReadyForQuery distinguishes closed transactions from in-flight or open work.
-        client.connection.on("readyForQuery", () => { session.idle = client.getTransactionStatus() === "I"; });
-        backends.set(client, session);
+        return previous;
       }
-      checkMaintenance();
+      await observeServer(target, true);
+      const session = { ...target, idle: client.getTransactionStatus() === "I" };
+      // ReadyForQuery distinguishes closed transactions from in-flight or open work.
+      client.connection.on("readyForQuery", () => { session.idle = client.getTransactionStatus() === "I"; });
+      backends.set(client, session);
+      checkPool();
+      return session;
+    }
+
+    if (ownerId !== undefined || signal) return checkout(managed, ownerId, verify, signal);
+    const client = await managed.pool.connect();
+    try {
+      await verify(client);
       return client;
     } catch (error) {
       client.release(true);
@@ -402,13 +609,14 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
 
   async function warmPools() {
     for (const { database, scopes } of targets) {
-      if (closing || queryConnections >= config.database.pool.maxGlobalQueries) break;
+      if (closing) break;
       const key = scopes ? scopeKey(scopes) : "";
-      const pool = pools.get(database)?.get(key);
+      const pool = pools.get(database)?.get(key)?.pool;
       const count = pool?.totalCount ?? 0;
       if (count >= config.database.pool.queryMin || maintenance.has(database)) continue;
       const target = `${database}:${key}`;
       try {
+        if (queryConnections >= config.database.pool.maxGlobalQueries && !await reclaimIdleConnection(pool)) continue;
         const oid = await getPostgresDatabaseOid(database, adminDb);
         if (!oid) continue;
         const targetSize = Math.min(config.database.pool.queryMin,
@@ -430,13 +638,14 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
     }
   }
 
+  function replenish() {
+    if (!closing && !warming) warming = warmPools().finally(() => { warming = undefined; });
+    return warming;
+  }
+
   function warm() {
     if (closing || config.database.pool.queryMin === 0 || targets.length === 0) return;
-    function replenish() {
-      if (!closing && !warming) warming = warmPools().finally(() => { warming = undefined; });
-      return warming;
-    }
-    warmTimer ??= setInterval(replenish, 5_000).unref();
+    warmTimer ??= setInterval(replenish, 1_000).unref();
     return replenish();
   }
 

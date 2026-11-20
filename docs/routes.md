@@ -144,11 +144,12 @@ Errors generally use `{"success":false,"error":{"code":"…","message":"…"}}`.
 | `409 DATABASE_IN_USE` | The database is under gateway maintenance. |
 | `413 TRANSACTION_QUEUE_LIMIT_EXCEEDED` | The transaction exceeds its statement or byte limit. |
 | `429 TRANSACTION_LIMIT_EXCEEDED` | The process has reached its transaction storage limit. |
-| `503 QUERY_POOL_BUSY` | The selected database and profile pool is full. |
+| `503 QUERY_POOL_BUSY` | A checkout waited 400 ms and the selected database and profile pool was at capacity. |
 | `413 RESULT_LIMIT_EXCEEDED` | A transaction exceeded the result budget before commit. |
 | `504 EXECUTION_DEADLINE_EXCEEDED` | Execution exceeded its deadline before immediate SQL or a transaction commit was sent. |
 | `500 QUERY_OUTCOME_UNKNOWN` | Immediate SQL was sent and may have taken effect. Check the underlying reason in `error.cause` and verify any writes before retrying. |
-| `503 QUERY_CONNECTION_LIMIT` | The process-wide query connection budget is full. |
+| `503 QUERY_CONNECTION_LIMIT` | A checkout waited 400 ms and the process-wide query connection budget was full. |
+| `503 QUERY_POOL_WAIT_TIMEOUT` | No verified PostgreSQL session became available within the 400 ms checkout deadline. |
 | `503 QUERY_DATABASE_UNAVAILABLE` | The requested database's dedicated connection could not be opened or verified. |
 
 PostgreSQL errors during SQL execution include the SQLSTATE in `pgCode` and structured fields for severity, schema, table, column, constraint, data type, and position where available. The `detail` and `hint` fields are null by default because PostgreSQL can include data values or internal context. Trusted deployments can enable them with `database.exposeErrorDetails`.

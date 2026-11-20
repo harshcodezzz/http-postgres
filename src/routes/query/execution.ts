@@ -14,6 +14,7 @@ export function watchExecution(
   let client: PoolClient | undefined;
   let stopped: ExecutionStopped | undefined;
   let released = false;
+  const abort = new AbortController();
   let notifyStop!: (error: ExecutionStopped) => void;
   const interruption = new Promise<ExecutionStopped>((resolve) => { notifyStop = resolve; });
   const deadline = performance.now() + deadlineMs;
@@ -25,6 +26,7 @@ export function watchExecution(
   function stop(error: ExecutionStopped) {
     if (stopped) return;
     stopped = error;
+    abort.abort(error);
     notifyStop(error);
     release();
   }
@@ -47,6 +49,7 @@ export function watchExecution(
     return Promise.race([operation, interruption.then((error) => { throw error; })]);
   }
   return {
+    signal: abort.signal,
     stop,
     check,
     wait,

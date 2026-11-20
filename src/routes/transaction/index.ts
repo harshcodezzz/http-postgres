@@ -228,7 +228,10 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
     let commitSent = false;
     let queryId: string | undefined;
     try {
-      const acquired = await execution.wait(fastify.queryPools.connect(transaction.database, transaction.databaseOid, scopes, transaction.owner).then((connection) => {
+      execution.check();
+      const acquired = await execution.wait(fastify.queryPools.connect(
+        transaction.database, transaction.databaseOid, scopes, transaction.owner, execution.signal,
+      ).then((connection) => {
         execution.attach(connection);
         return connection;
       }));
