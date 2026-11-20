@@ -26,11 +26,23 @@ Pass `options.arrayMode: true` to receive positional rows. Duplicate column name
 
 By default, JSON and JSONB, dates, timestamps, intervals, and their PostgreSQL arrays are returned as PostgreSQL text so values retain their precision. Non-finite scalar floating-point values are returned as strings. Set `options.lossless: false` to use the driver's legacy conversions. Use strings for input numbers that exceed JSON's safe integer range.
 
-A query response or transaction batch can retain up to 50,000 result rows and approximately 8 MiB of result data and metadata. The gateway closes its PostgreSQL connection when a caller disconnects before commit, a result exceeds the limit, or the request deadline expires. Immediate queries have a 35-second request deadline. Transaction execution has one 60-second deadline across acquisition, all statements, and commit. If the gateway has already sent `COMMIT` and cannot confirm the outcome, verify whether it committed before retrying.
+A query response or transaction batch can retain up to 50,000 result rows and approximately 8 MiB of result data and metadata. For synchronous execution, the gateway closes its PostgreSQL connection when a caller disconnects before commit, a result exceeds the limit, or the request deadline expires. Immediate queries have a 35-second request deadline. Transaction execution has one 60-second deadline across acquisition, all statements, and commit. If the gateway has already sent `COMMIT` and cannot confirm the outcome, verify whether it committed before retrying.
 
 ## Single-request transactions
 
-`POST /transaction/execute` accepts 1 to 100 statements and runs them in order on a single PostgreSQL connection. A statement error rolls back the batch and returns the zero-based `queryIndex`. On success, `results` contains one entry per statement with its `queryIndex`. An unconfirmed commit returns `TRANSACTION_COMMIT_FAILED`. Verify the outcome before resubmitting the batch.
+`POST /transaction/execute` accepts 1 to 100 statements in an ordered JSON array. Each entry can be a SQL string or an object with `query` and optional `parameters`. An outer `BEGIN` and `COMMIT` pair is optional. The gateway manages the actual transaction boundary. Use an array so statements keep their order and repeated JSON keys cannot overwrite them.
+
+The gateway saves the batch in PostgreSQL and returns `202 Accepted` with `transactionId`, `status: "pending"`, and a `Location` header. Poll `GET /transaction/:id` or `GET /transaction` with the `transaction-id` header using the same API key and database. The lookup returns `progress.completed` and `progress.total` while the batch runs. Accepted work continues if the submission request disconnects.
+
+| Status | Meaning |
+| --- | --- |
+| `pending`, `running`, `committing` | The batch has been accepted and has yet to reach a final outcome. |
+| `committed` | All statements committed. Read `outcome.payload.results` for the results. |
+| `rejected` | The batch was rolled back. Read `outcome.payload.error` for the error and, when a statement failed, its zero-based `queryIndex` and PostgreSQL diagnostics. |
+| `failed` | Execution did not reach a successful commit. |
+| `unknown` | The commit outcome could not be confirmed. Verify it before resubmitting. |
+
+Execution records survive gateway restarts. Interrupted batches are never replayed automatically. A record that stalls is reported as `failed` or `unknown` after its execution window. Delete a finished record with `DELETE /transaction/:id` or the header-based delete route. Deleting a record does not undo committed SQL.
 
 ```json
 {

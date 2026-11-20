@@ -91,3 +91,5 @@ When renaming a served database, configure the destination name and connection U
 | `logs/api-keys.log.1` | Previous audit log generation. |
 
 Fastify's request completion logs print `responseTime` in milliseconds as a JSON string with three decimal places. Processes sharing JsonDB must use the same data path on a filesystem that supports atomic directory creation and rename. Writers wait up to five seconds for the adjacent `data.json.lock` directory. If a process dies while holding the lock, remove the lock directory only after confirming all gateway processes using the file have stopped. Use a separate audit-log directory per process. Transaction queues are held in process memory and have no runtime file.
+
+Accepted `/transaction/execute` batches, including SQL, parameters, progress, and outcomes, are stored in `http_postgres_gateway.transactions` in the administrative database. The administrative role must own the storage schema and have permission to create it for first use. Keep that schema private to the administrative role. Records are retained until explicitly deleted. Deferred transaction queues remain process-local.

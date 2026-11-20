@@ -7,7 +7,7 @@ export class ExecutionStopped extends Error {
   }
 }
 
-export function watchExecution(reply: FastifyReply, deadlineMs: number) {
+export function watchExecution(reply: FastifyReply | undefined, deadlineMs: number) {
   let client: PoolClient | undefined;
   let stopped: ExecutionStopped | undefined;
   let released = false;
@@ -26,17 +26,17 @@ export function watchExecution(reply: FastifyReply, deadlineMs: number) {
     release();
   }
   const disconnected = () => {
-    if (!reply.raw.writableFinished) {
+    if (reply && !reply.raw.writableFinished) {
       stop(new ExecutionStopped(499, "REQUEST_DISCONNECTED", "The HTTP caller disconnected"));
     }
   };
-  reply.raw.once("close", disconnected);
+  reply?.raw.once("close", disconnected);
   const timeOut = () => stop(new ExecutionStopped(
     504, "EXECUTION_DEADLINE_EXCEEDED", "The execution deadline was exceeded",
   ));
   const timer = setTimeout(timeOut, deadlineMs).unref();
   function check() {
-    if (reply.raw.destroyed) disconnected();
+    if (reply?.raw.destroyed) disconnected();
     if (performance.now() >= deadline) timeOut();
     if (stopped) throw stopped;
   }
@@ -54,7 +54,7 @@ export function watchExecution(reply: FastifyReply, deadlineMs: number) {
     },
     close() {
       clearTimeout(timer);
-      reply.raw.removeListener("close", disconnected);
+      reply?.raw.removeListener("close", disconnected);
       release();
     },
   };
