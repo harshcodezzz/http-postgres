@@ -6,36 +6,53 @@ if (mode !== "closed-loop" && mode !== "arrival") {
   throw new Error("Set B1_MODE to closed-loop or arrival.");
 }
 
-const virtualUsers = Number(__ENV.B1_VUS || 8);
+function positiveInteger(name, fallback) {
+  const value = Number(__ENV[name] || fallback);
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`Set ${name} to a positive integer.`);
+  }
+  return value;
+}
+
+const virtualUsers = positiveInteger("B1_VUS", 8);
 if (mode === "closed-loop" && (!Number.isSafeInteger(virtualUsers) || virtualUsers < 1)) {
   throw new Error("Set B1_VUS to a positive integer.");
+}
+
+const duration = __ENV.B1_DURATION || "60s";
+const p95TargetMs = positiveInteger("B1_P95_MS", 100);
+const arrivalStartRate = positiveInteger("B1_ARRIVAL_START_RATE", 25);
+const arrivalMaxRate = positiveInteger("B1_ARRIVAL_MAX_RATE", 200);
+const preAllocatedVUs = positiveInteger("B1_PRE_ALLOCATED_VUS", 32);
+const maxVUs = positiveInteger("B1_MAX_VUS", 128);
+if (maxVUs < preAllocatedVUs) {
+  throw new Error("B1_MAX_VUS must be at least B1_PRE_ALLOCATED_VUS.");
 }
 
 export const options = {
   scenarios: {
     benchmark: mode === "arrival" ? {
       executor: "ramping-arrival-rate",
-      startRate: 100,
+      startRate: arrivalStartRate,
       timeUnit: "1s",
-      preAllocatedVUs: 200,
-      maxVUs: 2000,
+      preAllocatedVUs,
+      maxVUs,
       stages: [
-        { target: 1000, duration: "30s" },
-        { target: 2500, duration: "30s" },
-        { target: 5000, duration: "30s" },
-        { target: 10000, duration: "30s" },
-        { target: 10000, duration: "60s" },
+        { target: Math.max(arrivalStartRate, Math.floor(arrivalMaxRate * 0.25)), duration: "30s" },
+        { target: Math.max(arrivalStartRate, Math.floor(arrivalMaxRate * 0.5)), duration: "30s" },
+        { target: arrivalMaxRate, duration: "30s" },
+        { target: arrivalMaxRate, duration },
         { target: 0, duration: "10s" },
       ],
     } : {
       executor: "constant-vus",
       vus: virtualUsers,
-      duration: "60s",
+      duration,
     },
   },
   thresholds: {
     "http_req_failed{phase:workload}": ["rate<0.01"],
-    "http_req_duration{phase:workload}": ["p(95)<100"],
+    "http_req_duration{phase:workload}": [`p(95)<${p95TargetMs}`],
     ...(mode === "arrival" && { dropped_iterations: ["count==0"] }),
     checks: ["rate>0.99"],
   },
