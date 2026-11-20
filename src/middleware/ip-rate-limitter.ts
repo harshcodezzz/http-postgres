@@ -11,6 +11,10 @@ const rateLimitIp: FastifyPluginAsync = async (fastify) => {
   const windowSeconds = 60;
 
   fastify.addHook("onRequest", async (request, reply) => {
+    if (!config.ratelimit.enabled) {
+      return;
+    }
+
     if (request.routeOptions.config.publicHealth) return;
     const ip = request.ip;
 
