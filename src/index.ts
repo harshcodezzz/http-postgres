@@ -1,12 +1,18 @@
-import Fastify from "fastify";
-import { registerPlugins } from "./plugins/index.js";
+import bootstrap from "./utils/bootstrap.js";
+import { buildApp } from "./app.js";
 
-export async function buildApp() {
-  const app = Fastify({
-    logger: true,
+async function start() {
+  await bootstrap();
+
+  const app = await buildApp();
+
+  await app.listen({
+    host: "0.0.0.0",
+    port: 8080,
   });
-
-  await registerPlugins(app);
-
-  return app;
 }
+
+start().catch((error) => {
+  console.error("Gateway startup failed:", error);
+  process.exit(1);
+});

@@ -7,6 +7,10 @@ export default async function rateLimit(fastify: FastifyInstance) {
   const windowSeconds = 60;
 
   fastify.addHook("onRequest", async (request, reply) => {
+    if (!config.ratelimit.enabled) {
+      return;
+    }
+
     const apiKey = request.headers["x-api-key"];
 
     if (typeof apiKey !== "string" || !apiKey) {
