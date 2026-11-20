@@ -15,6 +15,10 @@ redis:
   mode: external
   url: "${REDIS_URL:-redis://127.0.0.1:6379}"
 
+ratelimit:
+  enabled: true
+  requestPerMinute: 1000
+
 analytics:
   enabled: true
   directory: "./data/analytics"

@@ -31,6 +31,13 @@ const configSchema = z
       url: z.string().optional(),
     }),
 
+    ratelimit: z
+      .object({
+        enabled: z.boolean().default(true),
+        requestPerMinute: z.number().int().positive().default(1000),
+      })
+      .prefault({}),
+
     analytics: z
       .object({
         enabled: z.boolean().default(true),
