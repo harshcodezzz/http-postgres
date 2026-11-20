@@ -6,10 +6,11 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
 import Fastify from "fastify";
-import { Client } from "pg";
+import { Client, DatabaseError as PostgresError } from "pg";
 import config from "../src/config/index.js";
 import { JsonDB } from "../src/plugins/jsondb.js";
 import transactionRoutes from "../src/routes/transaction/index.js";
+import queryRoutes from "../src/routes/query/index.js";
 import { createQueryPools } from "../src/utils/query-pool.js";
 
 test("JsonDB read-modify-write serializes across Node processes", async () => {
@@ -107,6 +108,66 @@ test("different databases share the process connection budget and initialize a s
     delete queryUrls.budget_a;
     delete queryUrls.budget_b;
     await pools.close();
+    await app.close();
+  }
+});
+
+test("atomic batches pass native modes to PostgreSQL and roll back on a statement error", async () => {
+  const app = Fastify();
+  const calls: unknown[] = [];
+  let failSecond = true;
+  app.decorate("queryPools", {
+    connect: async () => ({
+      query: async (statement: string | { text: string }) => {
+        calls.push(statement);
+        if (typeof statement === "string") return { command: statement };
+        if (statement.text === "SELECT 2" && failSecond) {
+          throw Object.assign(new PostgresError("constraint rejected", 0, "error"), {
+            code: "23505", severity: "ERROR", constraint: "users_email_key", detail: "private value",
+          });
+        }
+        return { rows: [[1, 2]], fields: [{ name: "same" }, { name: "same" }] };
+      },
+      release() {},
+    }),
+  });
+  app.addHook("onRequest", async (request) => {
+    request.apiKey = { id: "fixture" } as typeof request.apiKey;
+    request.database = "fixture";
+    request.databaseOid = "1";
+  });
+  await app.register(transactionRoutes, { prefix: "/transaction" });
+  await app.register(queryRoutes, { prefix: "/query" });
+  try {
+    const execute = () => app.inject({
+      method: "POST", url: "/transaction/execute",
+      payload: {
+        queries: [{ query: "SELECT 1" }, { query: "SELECT 2" }],
+        options: { isolationLevel: "serializable", readOnly: true, deferrable: true, arrayMode: true },
+      },
+    });
+    const failure = await execute();
+    assert.equal(failure.statusCode, 400);
+    assert.equal(failure.json().error.queryIndex, 1);
+    assert.equal(failure.json().error.constraint, "users_email_key");
+    assert.equal(failure.json().error.detail, null);
+    assert.equal(calls[0], "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE");
+    assert.equal(calls.at(-1), "ROLLBACK");
+    assert.ok(!calls.includes("COMMIT"));
+
+    failSecond = false;
+    const success = await execute();
+    assert.equal(success.statusCode, 200);
+    assert.deepEqual(success.json().results[0].rows, [[1, 2]]);
+    assert.equal(calls.at(-1), "COMMIT");
+
+    const result = await app.inject({
+      method: "POST", url: "/query",
+      payload: { query: "SELECT 1 AS same, 2 AS same", options: { arrayMode: true, fullResults: false } },
+    });
+    assert.deepEqual(result.json().data, { rows: [[1, 2]] });
+    assert.equal((calls.at(-1) as { rowMode: string }).rowMode, "array");
+  } finally {
     await app.close();
   }
 });

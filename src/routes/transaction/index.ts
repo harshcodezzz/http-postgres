@@ -3,6 +3,7 @@ import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 import { DatabaseError as PostgresError, type PoolClient, type QueryConfig } from "pg";
 import { queryConnectionError, queryExecutionError } from "../../utils/query-pool.js";
 import { formatQueryResult } from "../query/index.js";
+import { beginStatement, transactionOptions, type TransactionOptions } from "../query/options.js";
 
 interface QueuedQuery {
   queryId: string;
@@ -20,6 +21,7 @@ interface Transaction {
   queries: Map<string, QueuedQuery>;
   bytes: number;
   expiresAt: number;
+  options: TransactionOptions;
 }
 
 interface TransactionBody {
@@ -27,6 +29,7 @@ interface TransactionBody {
   parameters?: unknown;
   params?: unknown;
   queryId?: unknown;
+  options?: unknown;
 }
 
 const transactionCommands = new Set([
@@ -39,6 +42,17 @@ const maxTransactionBytes = 256 * 1024;
 const maxStoredBytes = 16 * 1024 * 1024;
 const transactionOverhead = 1024;
 const queryOverhead = 512;
+
+function hasTransactionModes(options: TransactionOptions) {
+  return options.isolationLevel !== undefined || options.readOnly !== undefined || options.deferrable !== undefined;
+}
+
+function canQueue(sql: string, options: TransactionOptions) {
+  // Match a whole SQL identifier so transaction keywords cannot be disguised by a partial match.
+  const command = /^[a-z]+[a-z0-9_$]*/i.exec(sql.trim())?.[0].toUpperCase();
+  if (!command || transactionCommands.has(command)) return false;
+  return !hasTransactionModes(options) || (command !== "SET" && command !== "RESET");
+}
 
 function fail(reply: FastifyReply, status: number, code: string, message: string) {
   return reply.code(status).send({ success: false, error: { code, message } });
@@ -91,10 +105,12 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
     return transaction;
   }
 
-  function create(request: FastifyRequest, reply: FastifyReply) {
+  function create(request: FastifyRequest<{ Body: TransactionBody }>, reply: FastifyReply) {
     if (!request.apiKey || !request.databaseOid) {
       return fail(reply, 401, "UNAUTHORIZED", "A database-scoped API key is required");
     }
+    const options = transactionOptions.safeParse(request.body?.options === undefined ? {} : request.body.options);
+    if (!options.success) return fail(reply, 400, "INVALID_OPTIONS", "Invalid transaction options");
     if (transactions.size >= maxTransactions || storedBytes + transactionOverhead > maxStoredBytes) {
       cleanupExpired();
       if (transactions.size >= maxTransactions || storedBytes + transactionOverhead > maxStoredBytes) {
@@ -111,6 +127,7 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
       queries: new Map(),
       bytes: transactionOverhead,
       expiresAt: Date.now() + retentionMs,
+      options: options.data,
     });
     storedBytes += transactionOverhead;
     return reply.code(201).send({ success: true, transactionId });
@@ -120,6 +137,7 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
     transaction: Transaction,
     scopes: FastifyRequest["queryScopes"],
     reply: FastifyReply,
+    immediate = false,
   ) {
     transaction.status = "committing";
     let client: PoolClient | undefined;
@@ -127,18 +145,21 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
     let queryId: string | undefined;
     try {
       client = await fastify.queryPools.connect(transaction.database, transaction.databaseOid, scopes);
-      await client.query("BEGIN");
+      await client.query(beginStatement(transaction.options));
+      // Establish the snapshot before user SQL can try to change isolation or enable writes.
+      if (hasTransactionModes(transaction.options)) await client.query("SELECT 1");
       const results = [];
       for (const queued of transaction.queries.values()) {
         queryId = queued.queryId;
         // The extended protocol permits one SQL statement per queued query.
-        const statement: QueryConfig & { queryMode: "extended" } = {
+        const statement: QueryConfig & { queryMode: "extended"; rowMode?: "array" } = {
           text: queued.query,
           values: JSON.parse(queued.serializedParameters),
           queryMode: "extended",
+          rowMode: transaction.options.arrayMode ? "array" : undefined,
         };
         const result = await client.query(statement);
-        results.push({ queryId, ...formatQueryResult(result) });
+        results.push({ ...(immediate ? { queryIndex: results.length } : { queryId }), ...formatQueryResult(result, transaction.options.fullResults) });
       }
       queryId = undefined;
       commitSent = true;
@@ -149,7 +170,7 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
       }
       if (result.command !== "COMMIT") throw new Error("Unexpected PostgreSQL COMMIT result");
       transaction.status = "committed";
-      return { success: true, transactionId: transaction.transactionId, results };
+      return { success: true, ...(!immediate && { transactionId: transaction.transactionId }), results };
     } catch (error) {
       if (commitSent) {
         if (error instanceof PostgresError && error.severity === "ERROR" && error.code &&
@@ -158,9 +179,8 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
           return reply.code(400).send({
             success: false,
             error: {
+              ...queryExecutionError(error).error,
               code: "TRANSACTION_ROLLED_BACK",
-              message: error.message,
-              pgCode: error.code,
             },
           });
         }
@@ -183,7 +203,7 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
       }
       if (queryId) {
         const result = queryExecutionError(error);
-        return reply.code(result.status).send({ success: false, error: { ...result.error, queryId } });
+        return reply.code(result.status).send({ success: false, error: { ...result.error, ...(immediate ? { queryIndex: Number(queryId) } : { queryId }) } });
       }
       fastify.log.error({ err: error }, "Failed to start transaction");
       return fail(reply, 503, "TRANSACTION_UNAVAILABLE", "Could not start the PostgreSQL transaction");
@@ -193,6 +213,49 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
       transaction.expiresAt = Date.now() + retentionMs;
     }
   }
+
+  fastify.post<{ Body: { queries?: unknown; options?: unknown } }>("/execute", async (request, reply) => {
+    if (!request.apiKey || !request.databaseOid) {
+      return fail(reply, 401, "UNAUTHORIZED", "A database-scoped API key is required");
+    }
+    const { queries, options } = request.body ?? {};
+    const parsed = transactionOptions.safeParse(options === undefined ? {} : options);
+    if (!parsed.success) return fail(reply, 400, "INVALID_OPTIONS", "Invalid transaction options");
+    if (!Array.isArray(queries) || queries.length === 0 || queries.length > maxQueriesPerTransaction) {
+      return fail(reply, 400, "INVALID_QUERIES", "Provide between 1 and 100 queries");
+    }
+
+    const transaction: Transaction = {
+      transactionId: randomUUID(),
+      database: request.database,
+      databaseOid: request.databaseOid,
+      owner: request.apiKey.id,
+      status: "pending",
+      queries: new Map(),
+      bytes: transactionOverhead,
+      expiresAt: 0,
+      options: parsed.data,
+    };
+    for (const [index, statement] of queries.entries()) {
+      const sql = statement?.query;
+      const parameters = statement?.parameters !== undefined ? statement.parameters : statement?.params;
+      if (typeof sql !== "string" || !canQueue(sql, parsed.data)) {
+        return fail(reply, 400, "INVALID_QUERY", `Invalid transaction statement at index ${index}`);
+      }
+      if (parameters !== undefined && !Array.isArray(parameters)) {
+        return fail(reply, 400, "INVALID_PARAMETERS", `Query parameters at index ${index} must be an array`);
+      }
+      const serializedParameters = JSON.stringify(parameters ?? []);
+      const bytes = queryOverhead + 2 * (sql.length + serializedParameters.length);
+      transaction.bytes += bytes;
+      if (transaction.bytes > maxTransactionBytes) {
+        return fail(reply, 413, "TRANSACTION_QUEUE_LIMIT_EXCEEDED", "The transaction exceeds its size limit");
+      }
+      const queryId = String(index);
+      transaction.queries.set(queryId, { queryId, query: sql, serializedParameters, bytes });
+    }
+    return commit(transaction, request.queryScopes, reply, true);
+  });
 
   fastify.post("/", create);
   fastify.post("/create", create);
@@ -220,8 +283,7 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
       return commit(transaction, request.queryScopes, reply);
     }
 
-    const command = /^[A-Za-z]+/.exec(sql.trim())?.[0].toUpperCase();
-    if (!command || transactionCommands.has(command)) {
+    if (!canQueue(sql, transaction.options)) {
       return fail(reply, 400, "INVALID_QUERY", "Start with a SQL command other than transaction control");
     }
     const serializedParameters = JSON.stringify(parameters ?? []);

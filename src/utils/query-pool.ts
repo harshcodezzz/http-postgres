@@ -1,4 +1,4 @@
-import { Pool, type PoolClient } from "pg";
+import { DatabaseError as PostgresError, Pool, type PoolClient } from "pg";
 import type { FastifyBaseLogger } from "fastify";
 import config, { findQueryProfile } from "../config/index.js";
 import { scopeKey, type QueryPrivilege } from "../config/query-privileges.js";
@@ -172,6 +172,17 @@ export function queryExecutionError(error: unknown) {
       code: forbidden ? "INSUFFICIENT_PRIVILEGE" : "QUERY_EXECUTION_ERROR",
       message: error instanceof Error ? error.message : "Query failed",
       pgCode,
+      ...(error instanceof PostgresError && {
+        severity: error.severity ?? null,
+        detail: config.database.exposeErrorDetails ? error.detail ?? null : null,
+        hint: config.database.exposeErrorDetails ? error.hint ?? null : null,
+        schema: error.schema ?? null,
+        table: error.table ?? null,
+        column: error.column ?? null,
+        constraint: error.constraint ?? null,
+        dataType: error.dataType ?? null,
+        position: error.position ?? null,
+      }),
     },
   };
 }

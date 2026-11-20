@@ -22,6 +22,30 @@ Query and transaction routes also accept the raw key in `Authorization` and the 
 
 The gateway checks the database name, identity, and query login before running SQL. Session state lasts for the request. Connection acquisition waits up to 5 seconds, and the gateway initializes the session's PostgreSQL `statement_timeout` to 30 seconds. The client also has a 35-second query response timeout. PostgreSQL allows SQL clients to change the session setting.
 
+Pass `options.arrayMode: true` to receive positional rows. Duplicate column names are preserved and `fields` follows the same order as the row. Set `options.fullResults: false` to return just the rows for each statement while retaining the API response envelope. The default includes the result metadata.
+
+## Single-request transactions
+
+`POST /transaction/execute` accepts 1 to 100 statements and runs them in order on a single PostgreSQL connection. A statement error rolls back the batch and returns the zero-based `queryIndex`. On success, `results` contains one entry per statement with its `queryIndex`. An unconfirmed commit returns `TRANSACTION_COMMIT_FAILED`. Verify the outcome before resubmitting the batch.
+
+```json
+{
+  "queries": [
+    {"query": "INSERT INTO users(name) VALUES ($1)", "parameters": ["John"]},
+    {"query": "UPDATE stats SET users = users + 1"}
+  ],
+  "options": {
+    "isolationLevel": "serializable",
+    "readOnly": false,
+    "deferrable": false,
+    "arrayMode": true,
+    "fullResults": true
+  }
+}
+```
+
+The same `options` object is accepted when creating a queued transaction. Isolation values are `read uncommitted`, `read committed`, `repeatable read`, and `serializable`, case-insensitively. Boolean settings select PostgreSQL's native read-only or read-write and deferrable or not-deferrable modes. Omitted modes use PostgreSQL defaults. Each entry must contain one SQL statement. Transactions with explicitly selected modes reserve `SET` and `RESET` for the gateway. [PostgreSQL BEGIN](https://www.postgresql.org/docs/current/sql-begin.html)
+
 ## Queued transactions
 
 Use the same API key and database for every request in a transaction. Queues live in process memory and are lost on restart. Creating a transaction, adding or removing queries, and reading the queue require no PostgreSQL connection. A record expires 15 minutes after creation, the last queue edit, or the end of a commit attempt. Commits in progress are retained. Each queue can hold 100 statements and 256 KiB of estimated queue memory. Each process stores up to 1,000 transaction records and 16 MiB of estimated queue memory. The estimate includes string storage and fixed charges for each transaction, query, and lookup.
@@ -96,3 +120,5 @@ Errors generally use `{"success":false,"error":{"code":"…","message":"…"}}`.
 | `429 TRANSACTION_LIMIT_EXCEEDED` | The process has reached its transaction storage limit. |
 | `503 QUERY_CONNECTION_LIMIT` | The process-wide query connection budget is full. |
 | `503 QUERY_DATABASE_UNAVAILABLE` | The requested database's dedicated connection could not be opened or verified. |
+
+PostgreSQL errors during SQL execution include the SQLSTATE in `pgCode` and structured fields for severity, schema, table, column, constraint, data type, and position where available. The `detail` and `hint` fields are null by default because PostgreSQL can include data values or internal context. Trusted deployments can enable them with `database.exposeErrorDetails`.

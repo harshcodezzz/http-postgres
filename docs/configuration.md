@@ -22,6 +22,7 @@ The table lists loader defaults. Explicit values in [gateway.yaml](../gateway.ya
 | `server.host` | `0.0.0.0` | Listen address. Use `127.0.0.1` for loopback-only access. |
 | `server.port` | `8080` | Listen port from 1 to 65535. |
 | `database.url` | Required | Administrative PostgreSQL connection string. The gateway checks it at startup. |
+| `database.exposeErrorDetails` | `false` | Exposes PostgreSQL detail and hint text to authenticated query callers when enabled. |
 | `database.queryUrls` | `{}` | Maps database names to the default query login URLs used by keys that list database names only. |
 | `database.queryProfiles` | `{}` | Maps database names to PostgreSQL logins for explicit API-key privilege sets. |
 | `database.pool.min` | `2` | Minimum size of the administrative pool, zero or greater. |

@@ -1,15 +1,19 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
-import type { PoolClient, QueryResult } from "pg";
+import type { PoolClient, QueryConfig, QueryResult } from "pg";
 import { queryConnectionError, queryExecutionError } from "../../utils/query-pool.js";
+
+import { resultOptions } from "./options.js";
 
 interface QueryBody {
   query?: string;
   parameters?: unknown[];
   params?: unknown[];
+  options?: unknown;
 }
 
-export function formatQueryResult(result: QueryResult) {
+export function formatQueryResult(result: QueryResult, fullResults?: boolean) {
   const rows = result.rows ?? [];
+  if (fullResults === false) return { rows };
   return {
     command: result.command ?? "SELECT",
     rowCount: result.rowCount ?? rows.length,
@@ -47,6 +51,11 @@ const queryRoutes: FastifyPluginAsync = async (fastify) => {
       });
     }
 
+    const parsed = resultOptions.safeParse(body.options === undefined ? {} : body.options);
+    if (!parsed.success) {
+      return reply.code(400).send({ success: false, error: { code: "INVALID_OPTIONS", message: "Result options must contain boolean flags" } });
+    }
+    const options = parsed.data;
     const start = Date.now();
     let client: PoolClient;
     try {
@@ -58,18 +67,23 @@ const queryRoutes: FastifyPluginAsync = async (fastify) => {
     }
 
     try {
-      const result: QueryResult | QueryResult[] = await client.query(body.query, parameters ?? []);
+      const statement: QueryConfig & { rowMode?: "array" } = {
+        text: body.query,
+        values: parameters ?? [],
+        rowMode: options.arrayMode ? "array" : undefined,
+      };
+      const result: QueryResult | QueryResult[] = await client.query(statement);
       const durationMs = Date.now() - start;
       if (Array.isArray(result)) {
         return {
           success: true,
           database,
           durationMs,
-          results: result.map(formatQueryResult),
+          results: result.map((statement) => formatQueryResult(statement, options.fullResults)),
         };
       }
 
-      const data = formatQueryResult(result);
+      const data = formatQueryResult(result, options.fullResults);
       return { success: true, database, ...data, durationMs, data };
     } catch (err) {
       const { status, error } = queryExecutionError(err);

@@ -18,6 +18,7 @@ const configSchema = z
 
     database: z.object({
       url: z.string().min(1),
+      exposeErrorDetails: z.boolean().default(false),
       queryUrls: z
         .record(databaseName, z.string().min(1))
         .default({}),
