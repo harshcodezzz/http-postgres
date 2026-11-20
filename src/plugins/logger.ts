@@ -1,14 +1,11 @@
-import fp from "fastify-plugin";
-import type { FastifyPluginAsync } from "fastify";
+import { once } from "node:events";
 import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import pino from "pino";
 
-const logDirectory = resolve(process.cwd(), "logs");
-
-mkdirSync(logDirectory, { recursive: true });
-
-const loggerPlugin: FastifyPluginAsync = async (app) => {
+export function createGatewayLogger() {
+  const logDirectory = resolve(process.cwd(), "logs");
+  mkdirSync(logDirectory, { recursive: true });
   const transport = pino.transport({
     targets: [
       {
@@ -30,12 +27,21 @@ const loggerPlugin: FastifyPluginAsync = async (app) => {
         },
       },
     ],
-  });
+  }) as ReturnType<typeof pino.transport> & {
+    readonly ready: boolean;
+    readonly closed: boolean;
+    ref(): void;
+  };
 
   const logger = pino(
     {
       level: process.env.LOG_LEVEL ?? "info",
       timestamp: pino.stdTimeFunctions.isoTime,
+      serializers: {
+        responseTime(milliseconds: unknown) {
+          return typeof milliseconds === "number" ? milliseconds.toFixed(3) : milliseconds;
+        },
+      },
       redact: {
         paths: [
           "password",
@@ -57,20 +63,15 @@ const loggerPlugin: FastifyPluginAsync = async (app) => {
     transport,
   );
 
-  app.log = logger;
+  let closing: Promise<void> | undefined;
+  async function closeTransport() {
+    if (!transport.ready && !transport.closed) await once(transport, "ready");
+    if (transport.closed) return;
+    transport.ref();
+    const closed = once(transport, "close");
+    transport.end();
+    await closed;
+  }
 
-  app.addHook("onClose", async () => {
-    transport.flush();
-    await new Promise<void>((resolve, reject) => {
-      transport.end();
-      transport.on("close", resolve);
-      transport.on("error", reject);
-    });
-  });
-
-  logger.info("Logger initialized");
-};
-
-export default fp(loggerPlugin, {
-  name: "logger",
-});
+  return { logger, close: () => closing ??= closeTransport() };
+}

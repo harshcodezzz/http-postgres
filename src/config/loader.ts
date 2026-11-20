@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { config as loadEnv } from "dotenv";
 import YAML from "yaml";
 import { z } from "zod";
+import { databaseName, queryScopeList, scopeKey } from "./query-privileges.js";
 
 loadEnv({ quiet: true });
 
@@ -17,6 +18,16 @@ const configSchema = z
 
     database: z.object({
       url: z.string().min(1),
+      queryUrls: z
+        .record(databaseName, z.string().min(1))
+        .default({}),
+      queryProfiles: z
+        .record(databaseName, z.array(z.object({
+          scopes: queryScopeList,
+          role: z.string().min(1),
+          url: z.string().min(1),
+        })).min(1))
+        .default({}),
       pool: z
         .object({
           min: z.number().int().min(0).default(2),
@@ -54,6 +65,18 @@ const configSchema = z
         path: ["database", "pool", "min"],
         message: "Pool minimum cannot exceed pool maximum",
       });
+    }
+
+    for (const [database, profiles] of Object.entries(config.database.queryProfiles)) {
+      const scopeSets = new Set(profiles.map(({ scopes }) => scopeKey(scopes)));
+      const roles = new Set(profiles.map(({ role }) => role));
+      if (scopeSets.size !== profiles.length || roles.size !== profiles.length) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["database", "queryProfiles", database],
+          message: "Each query profile must have a distinct scope set and PostgreSQL role",
+        });
+      }
     }
 
     if (config.redis.enabled && !config.redis.url) {

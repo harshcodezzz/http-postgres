@@ -6,6 +6,8 @@ server:
 
 database:
   url: "${DATABASE_URL:-postgresql://postgres:postgres@127.0.0.1:5432/postgres}"
+  queryUrls: {}
+  queryProfiles: {}
   pool:
     min: 2
     max: 20

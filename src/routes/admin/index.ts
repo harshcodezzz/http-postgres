@@ -1,8 +1,8 @@
 import type { FastifyPluginAsync, FastifyInstance } from "fastify";
-import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import adminApiRoutes from "./admin-api.js";
 import adminDatabaseRoutes from "./admin-database.js";
+import { readAuditTail, readLogTail } from "../../utils/log-files.js";
 
 const AUDIT_LOG_FILE = resolve(process.cwd(), "logs", "api-keys.log");
 const GATEWAY_LOG_FILE = resolve(process.cwd(), "logs", "current.log");
@@ -62,26 +62,8 @@ async function checkHealth(fastify: FastifyInstance) {
 }
 
 async function readRecentLogs(type: "audit" | "system", limit: number) {
-  const logPath = type === "system" ? GATEWAY_LOG_FILE : AUDIT_LOG_FILE;
-
-  try {
-    const content = await readFile(logPath, "utf8");
-    const lines = content.trim().split("\n").filter(Boolean);
-    const recentLines = lines.slice(-limit);
-
-    return recentLines.map((line) => {
-      try {
-        return JSON.parse(line);
-      } catch {
-        return { message: line };
-      }
-    });
-  } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      return [];
-    }
-    throw err;
-  }
+  if (type === "system") return readLogTail(GATEWAY_LOG_FILE, limit);
+  return readAuditTail(AUDIT_LOG_FILE, limit);
 }
 
 const adminRoutes: FastifyPluginAsync = async (fastify) => {

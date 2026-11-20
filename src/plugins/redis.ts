@@ -20,6 +20,12 @@ class MemoryStore implements KeyValueStore {
       expiresAt: number | null;
     }
   >();
+  private readonly cleanupTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of this.store) {
+      if (entry.expiresAt !== null && now >= entry.expiresAt) this.store.delete(key);
+    }
+  }, 60_000).unref();
 
   async get(key: string): Promise<string | null> {
     const entry = this.store.get(key);
@@ -68,6 +74,7 @@ class MemoryStore implements KeyValueStore {
   }
 
   async close(): Promise<void> {
+    clearInterval(this.cleanupTimer);
     this.store.clear();
   }
 }

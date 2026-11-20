@@ -3,7 +3,6 @@ import type { FastifyPluginAsync } from "fastify";
 import {
   verifyApiKey,
   isValidDatabaseName,
-  type ApiKeyRecord,
 } from "../utils/api-key.js";
 import { verifyPassword, hashPassword } from "../utils/bootstrap.js";
 import type { DataStore, JsonDB } from "../plugins/jsondb.js";
@@ -20,24 +19,16 @@ export async function verifyAdminPassword(
   return verifyPassword(adminPassword, storedHash);
 }
 
-declare module "fastify" {
-  interface FastifyRequest {
-    apiKey: ApiKeyRecord | null;
-    admin: boolean;
-    database: string;
-  }
-}
-
 const authPlugin: FastifyPluginAsync = async (fastify) => {
   fastify.decorateRequest("apiKey", null);
   fastify.decorateRequest("admin", false);
   fastify.decorateRequest("database", "");
+  fastify.decorateRequest("databaseOid", "");
+  fastify.decorateRequest("queryScopes", null);
 
   fastify.addHook("onRequest", async (request, reply) => {
-    const urlPath = request.url.split("?")[0];
-    if (urlPath === "/health" && (request.method === "GET" || request.method === "HEAD")) {
-      return;
-    }
+    if (request.routeOptions.config.publicHealth) return;
+    const urlPath = request.routeOptions.url ?? request.url.split("?")[0];
 
     const admin = request.headers["x-admin"];
     const isAdminRoute = urlPath === "/admin" || urlPath.startsWith("/admin/");
@@ -98,18 +89,21 @@ const authPlugin: FastifyPluginAsync = async (fastify) => {
 
     const result = await verifyApiKey(database, apiKey, fastify.jsondb);
 
-    if (!result.valid || !result.record) {
+    if (!result.valid || !result.record || !result.databaseOid) {
+      const rebindRequired = result.error === "DATABASE_SCOPE_UNBOUND";
       return reply.code(401).send({
         success: false,
         error: {
-          code: "UNAUTHORIZED",
-          message: "error",
+          code: rebindRequired ? "API_KEY_SCOPE_REBIND_REQUIRED" : "UNAUTHORIZED",
+          message: rebindRequired ? "Ask an administrator to update this API key's database scope" : "error",
         },
       });
     }
 
     request.apiKey = result.record;
     request.database = database;
+    request.databaseOid = result.databaseOid;
+    request.queryScopes = result.scopes ?? null;
   });
 };
 

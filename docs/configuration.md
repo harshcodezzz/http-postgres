@@ -21,9 +21,11 @@ The table lists loader defaults. Explicit values in [gateway.yaml](../gateway.ya
 | `version` | Required | Positive integer. The supplied file uses `1`. |
 | `server.host` | `0.0.0.0` | Listen address. Use `127.0.0.1` for loopback-only access. |
 | `server.port` | `8080` | Listen port from 1 to 65535. |
-| `database.url` | Required | PostgreSQL connection string. The gateway checks that it can connect at startup. |
-| `database.pool.min` | `2` | Minimum pool size, zero or greater. |
-| `database.pool.max` | `20` | Maximum pool size, at least 1. The minimum cannot exceed the maximum. |
+| `database.url` | Required | Administrative PostgreSQL connection string. The gateway checks it at startup. |
+| `database.queryUrls` | `{}` | Maps database names to the default query login URLs used by keys that list database names only. |
+| `database.queryProfiles` | `{}` | Maps database names to PostgreSQL logins for explicit API-key privilege sets. |
+| `database.pool.min` | `2` | Minimum size of the administrative pool, zero or greater. |
+| `database.pool.max` | `20` | Maximum size of the administrative pool and of each query pool. A database has a separate pool for its default login and each configured privilege profile. The minimum cannot exceed the maximum. |
 | `redis.enabled` | `true` | Connect to Redis on startup. Set to `false` to use an in-memory store local to the gateway process. |
 | `redis.mode` | `external` | Accepts `external` or `managed`. Both currently connect to the configured Redis URL when enabled. |
 | `redis.url` | Required when enabled | Redis connection string. |
@@ -44,6 +46,38 @@ redis:
   enabled: false
 ```
 
+## Query database access
+
+Configure a dedicated PostgreSQL login for each default connection or privilege profile. Give the login `CONNECT` on its database and the schema and object privileges needed by the queries. The gateway checks that the login is separate from the administrative roles, has no elevated role memberships, and lacks `CONNECT` on other connectable databases. PostgreSQL grants `CONNECT` to `PUBLIC` by default. On a shared cluster, grant access explicitly to the roles that need each database before revoking the public grant. Keep cross-database connections, foreign servers, and privileged routines out of the query login's grants. [PostgreSQL privileges](https://www.postgresql.org/docs/current/ddl-priv.html)
+
+Use a direct PostgreSQL connection or a session-mode proxy that resets each backend session on client disconnect. The admin and query URLs must point to the same PostgreSQL cluster. Provide the full URL for each database, including its database name. Store credentials in environment variables and reference them from YAML.
+
+```yaml
+database:
+  url: "${DATABASE_URL}"
+  queryUrls:
+    gateway_demo: "${QUERY_DEMO_URL}"
+```
+
+For explicit API-key privileges, define each supported set in `queryProfiles`. The URL's PostgreSQL login must match `role`, and each profile on a database must have a distinct role and privilege set.
+
+```yaml
+database:
+  queryProfiles:
+    sales:
+      - scopes: [SELECT]
+        role: sales_reader
+        url: "${SALES_READER_URL}"
+    events:
+      - scopes: [SELECT, INSERT]
+        role: events_writer
+        url: "${EVENTS_WRITER_URL}"
+```
+
+Provision the PostgreSQL grants before using a profile. For example, grant `sales_reader` `CONNECT` on `sales`, `USAGE` on the needed schema, and `SELECT` on the intended tables. PostgreSQL also honors permissions inherited from other roles or granted to `PUBLIC`, plus permissions exposed through views and routines. Review those paths when provisioning a login. The profile selects the login, and its PostgreSQL grants determine access to individual objects. [PostgreSQL privileges](https://www.postgresql.org/docs/current/ddl-priv.html)
+
+When renaming a served database, configure the destination name and connection URLs and restart the gateway. Record IDs and secrets of older API keys can be preserved by resaving their verified database scopes through the admin API. See the [upgrade procedure](fixes.md#upgrade-procedure).
+
 ## Runtime files
 
 | Path | Contents |
@@ -51,6 +85,7 @@ redis:
 | `data/data.json` | Local JsonDB file with the admin password hash and API key records. Keep this file to retain credentials across restarts. |
 | `logs/gateway.*.log` | Gateway logs, rotated daily or at the configured `20m` size threshold. |
 | `logs/current.log` | Symlink to the active gateway log. |
-| `logs/api-keys.log` | API key audit events. |
+| `logs/api-keys.log` | Active API key audit events. Rotates at 5 MiB. |
+| `logs/api-keys.log.1` | Previous audit log generation. |
 
-Fastify's request completion logs print `responseTime` in milliseconds as a JSON string with three decimal places. Transaction queues are held in process memory and have no runtime file.
+Fastify's request completion logs print `responseTime` in milliseconds as a JSON string with three decimal places. Use one gateway process per JsonDB and audit-log directory. Transaction queues are held in process memory and have no runtime file.

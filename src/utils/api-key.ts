@@ -1,8 +1,14 @@
 import { randomBytes, createHash } from "node:crypto";
-import { appendFile, mkdir } from "node:fs/promises";
-import { resolve, dirname } from "node:path";
+import { resolve } from "node:path";
 import { Pool } from "pg";
-import config from "../config/index.js";
+import config, { findQueryProfile } from "../config/index.js";
+import {
+  databaseScopes as databaseScopesSchema,
+  queryScopeList,
+  type DatabaseScopes,
+  type QueryPrivilege,
+} from "../config/query-privileges.js";
+import { appendAuditLine } from "./log-files.js";
 import {
   JsonDB,
   type ApiKeyRecord,
@@ -11,6 +17,7 @@ import {
 import {
   isValidDatabaseName,
   checkDatabaseExists,
+  getPostgresDatabaseOid,
   listPostgresDatabases,
   getPostgresDatabaseDetails,
   createPostgresDatabase,
@@ -50,6 +57,7 @@ export type VerifyApiKeyError =
   | "KEY_NOT_FOUND"
   | "KEY_REVOKED"
   | "DATABASE_MISMATCH"
+  | "DATABASE_SCOPE_UNBOUND"
   | "ENVIRONMENT_MISMATCH";
 
 export class ApiKeyError extends Error {
@@ -64,8 +72,7 @@ export class ApiKeyError extends Error {
 
 const API_KEY_LOG_FILE = resolve(process.cwd(), "logs", "api-keys.log");
 
-// In-memory throttle for updating lastUsedAt: keyHash -> timestamp
-const lastUsedThrottleMap = new Map<string, number>();
+const pendingLastUsedWrites = new Set<string>();
 
 let sharedPgPool: Pool | null = null;
 
@@ -103,7 +110,7 @@ export interface ApiKeyAuditLog {
 }
 
 export interface CreateApiKeyOptions {
-  databases?: string[];
+  databases?: unknown;
   database?: string;
   environment?: ApiKeyEnvironment;
   db?: JsonDB;
@@ -119,6 +126,8 @@ export interface CreateApiKeyResult {
 export interface VerifyApiKeyResult {
   valid: boolean;
   record?: ApiKeyRecord;
+  databaseOid?: string;
+  scopes?: QueryPrivilege[];
   error?: VerifyApiKeyError;
 }
 
@@ -133,7 +142,7 @@ export interface DeleteApiKeyOptions {
 }
 
 export interface UpdateApiKeyScopeOptions {
-  databases: string[];
+  databases: unknown;
   db?: JsonDB;
   pgPool?: Pool;
   auditLogPath?: string;
@@ -169,12 +178,34 @@ export async function writeAuditLog(
   entry: ApiKeyAuditLog,
   logPath = API_KEY_LOG_FILE,
 ): Promise<void> {
-  try {
-    await mkdir(dirname(logPath), { recursive: true });
-    await appendFile(logPath, JSON.stringify(entry) + "\n", "utf8");
-  } catch {
-    // Audit logging failures must never break API key operations
+  const database = entry.database.length > 2_048 ? entry.database.slice(0, 2_048) + "…" : entry.database;
+  await appendAuditLine(logPath, JSON.stringify({ ...entry, database }) + "\n");
+}
+
+function parseDatabaseTargets(value: unknown): { names: unknown[]; scopes?: DatabaseScopes } {
+  if (Array.isArray(value) && value.length > 0) return { names: [...new Set(value)] };
+
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const names = Object.keys(value);
+    const result = databaseScopesSchema.safeParse(value);
+    if (names.length === 0 || !result.success || Object.keys(result.data).length !== names.length) {
+      throw new ApiKeyError(
+        "Provide a database-to-privileges map with a nonempty list of PostgreSQL privileges per database",
+        "INVALID_DATABASE_SCOPE",
+      );
+    }
+    for (const [database, scopes] of Object.entries(result.data)) {
+      if (!findQueryProfile(database, scopes)) {
+        throw new ApiKeyError(
+          `No query profile is configured for '${database}' with privileges ${scopes.join(", ")}`,
+          "UNCONFIGURED_DATABASE_SCOPE",
+        );
+      }
+    }
+    return { names, scopes: result.data };
   }
+
+  throw new ApiKeyError("At least one database is required", "INVALID_DATABASE_NAME");
 }
 
 /**
@@ -192,20 +223,12 @@ export async function createApiKey(
     );
   }
 
-  const rawDatabases =
-    options.databases ?? (options.database ? [options.database] : []);
-  const databases = [...new Set(rawDatabases)];
+  const targets = parseDatabaseTargets(options.databases ?? (options.database ? [options.database] : []));
   const db = options.db ?? new JsonDB();
   const auditPath = options.auditLogPath ?? API_KEY_LOG_FILE;
 
-  if (databases.length === 0) {
-    throw new ApiKeyError(
-      "At least one database is required",
-      "INVALID_DATABASE_NAME",
-    );
-  }
-
-  for (const database of databases) {
+  const bindings: [string, string][] = [];
+  for (const database of targets.names) {
     if (!isValidDatabaseName(database)) {
       await writeAuditLog(
         {
@@ -219,13 +242,13 @@ export async function createApiKey(
         auditPath,
       );
       throw new ApiKeyError(
-        `Invalid database name: '${database}'`,
+        typeof database === "string" ? `Invalid database name: '${database}'` : "Database names must be strings",
         "INVALID_DATABASE_NAME",
       );
     }
 
-    const dbExists = await checkDatabaseExists(database, options.pgPool);
-    if (!dbExists) {
+    const oid = await getPostgresDatabaseOid(database, options.pgPool);
+    if (!oid) {
       await writeAuditLog(
         {
           timestamp: new Date().toISOString(),
@@ -243,6 +266,7 @@ export async function createApiKey(
         "DATABASE_NOT_FOUND",
       );
     }
+    bindings.push([database, oid]);
   }
 
   const secret = randomBytes(24).toString("base64url");
@@ -255,13 +279,13 @@ export async function createApiKey(
     id,
     keyHash,
     keyPrefix,
-    databases,
+    databases: bindings.map(([database]) => database),
+    databaseOids: Object.fromEntries(bindings),
+    ...(targets.scopes && { databaseScopes: targets.scopes }),
     environment,
     status: "active",
     createdAt: new Date().toISOString(),
   };
-
-  lastUsedThrottleMap.set(keyHash, Date.now());
 
   await db.update((current) => {
     const existing = { ...(current.apiKeys ?? {}) };
@@ -278,7 +302,7 @@ export async function createApiKey(
     {
       timestamp: new Date().toISOString(),
       action: "CREATE",
-      database: databases.join(", "),
+      database: record.databases.join(", "),
       keyId: id,
       keyPrefix,
       environment,
@@ -410,37 +434,40 @@ export async function verifyApiKey(
     return { valid: false, record, error: "DATABASE_MISMATCH" };
   }
 
-  // Update lastUsedAt at most once per 60 seconds per key, without blocking request
+  const databaseOid = record.databaseOids && Object.hasOwn(record.databaseOids, databaseName)
+    ? record.databaseOids[databaseName]
+    : undefined;
+  if (!databaseOid) return { valid: false, error: "DATABASE_SCOPE_UNBOUND" };
+
+  let scopes: QueryPrivilege[] | undefined;
+  if (record.databaseScopes !== undefined) {
+    const map = record.databaseScopes;
+    const result = queryScopeList.safeParse(map && Object.hasOwn(map, databaseName) ? map[databaseName] : undefined);
+    if (!result.success) return { valid: false, error: "DATABASE_SCOPE_UNBOUND" };
+    scopes = result.data;
+  }
+
   const now = Date.now();
-  const lastRecorded = lastUsedThrottleMap.get(keyHash);
-  const baseline =
-    lastRecorded ??
-    (record.lastUsedAt ? new Date(record.lastUsedAt).getTime() : 0);
-
-  if (lastRecorded === undefined) {
-    lastUsedThrottleMap.set(keyHash, baseline);
+  const lastUsed = record.lastUsedAt ? Date.parse(record.lastUsedAt) : 0;
+  if ((!lastUsed || now - lastUsed >= 60_000) && !pendingLastUsedWrites.has(keyHash)) {
+    pendingLastUsedWrites.add(keyHash);
+    void db.update((current) => {
+      const currentRecord = current.apiKeys?.[keyHash];
+      const currentLastUsed = Date.parse(currentRecord?.lastUsedAt ?? "") || 0;
+      if (currentRecord?.status !== "active" || (currentLastUsed && now - currentLastUsed < 60_000)) {
+        return current;
+      }
+      return {
+        ...current,
+        apiKeys: {
+          ...current.apiKeys,
+          [keyHash]: { ...currentRecord, lastUsedAt: new Date(now).toISOString() },
+        },
+      };
+    }).catch(() => {}).finally(() => pendingLastUsedWrites.delete(keyHash));
   }
 
-  if (now - baseline >= 60_000) {
-    lastUsedThrottleMap.set(keyHash, now);
-    Promise.resolve().then(() => {
-      db.update((current) => {
-        const keys = { ...(current.apiKeys ?? {}) };
-        if (keys[keyHash] && keys[keyHash].status === "active") {
-          keys[keyHash] = {
-            ...keys[keyHash],
-            lastUsedAt: new Date(now).toISOString(),
-          };
-        }
-        return {
-          ...current,
-          apiKeys: keys,
-        };
-      }).catch(() => {});
-    });
-  }
-
-  return { valid: true, record };
+  return { valid: true, record, databaseOid, scopes };
 }
 
 /**
@@ -514,32 +541,27 @@ export async function updateApiKeyScope(
   apiKeyOrId: string,
   options: UpdateApiKeyScopeOptions,
 ): Promise<ApiKeyRecord> {
-  const { databases } = options;
+  const targets = parseDatabaseTargets(options.databases);
   const db = options.db ?? new JsonDB();
   const auditPath = options.auditLogPath ?? API_KEY_LOG_FILE;
 
-  if (!Array.isArray(databases) || databases.length === 0) {
-    throw new ApiKeyError(
-      "At least one database is required",
-      "INVALID_DATABASE_NAME",
-    );
-  }
-
-  for (const database of databases) {
+  const bindings: [string, string][] = [];
+  for (const database of targets.names) {
     if (!isValidDatabaseName(database)) {
       throw new ApiKeyError(
-        `Invalid database name: '${database}'`,
+        typeof database === "string" ? `Invalid database name: '${database}'` : "Database names must be strings",
         "INVALID_DATABASE_NAME",
       );
     }
 
-    const dbExists = await checkDatabaseExists(database, options.pgPool);
-    if (!dbExists) {
+    const oid = await getPostgresDatabaseOid(database, options.pgPool);
+    if (!oid) {
       throw new ApiKeyError(
         `Database '${database}' does not exist in PostgreSQL`,
         "DATABASE_NOT_FOUND",
       );
     }
+    bindings.push([database, oid]);
   }
 
   const parsed = parseApiKey(apiKeyOrId);
@@ -568,10 +590,15 @@ export async function updateApiKeyScope(
     if (apiKeys[targetHash].status !== "active") {
       return current;
     }
+    if (apiKeys[targetHash].databaseScopes !== undefined && !targets.scopes) {
+      throw new ApiKeyError("This key requires an explicit database-to-privileges map", "DATABASE_SCOPES_REQUIRED");
+    }
 
     apiKeys[targetHash] = {
       ...apiKeys[targetHash],
-      databases: [...new Set(databases)],
+      databases: bindings.map(([database]) => database),
+      databaseOids: Object.fromEntries(bindings),
+      ...(targets.scopes && { databaseScopes: targets.scopes }),
     };
     updatedRecord = apiKeys[targetHash];
 

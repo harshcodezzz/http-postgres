@@ -1,4 +1,4 @@
-import { Pool } from "pg";
+import { escapeLiteral, Pool, type PoolClient } from "pg";
 import config from "../config/index.js";
 import type { JsonDB } from "../plugins/jsondb.js";
 
@@ -15,6 +15,10 @@ export class DatabaseError extends Error {
 export const SYSTEM_DATABASES = new Set(["postgres", "template0", "template1"]);
 
 let defaultPgPool: Pool | null = null;
+
+function withoutDatabases<T>(entries: Record<string, T>, ...names: string[]): Record<string, T> {
+  return Object.fromEntries(Object.entries(entries).filter(([name]) => !names.includes(name)));
+}
 
 function getPgErrorCode(err: unknown): string | undefined {
   if (typeof err === "object" && err !== null && "code" in err) {
@@ -71,8 +75,24 @@ function isValidGucParameterName(param: string): boolean {
   return segments.every((segment) => /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(segment));
 }
 
-function escapeSqlLiteral(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`;
+async function inDatabaseTransaction(pool: Pool, operation: (client: PoolClient) => Promise<void>) {
+  const client = await pool.connect();
+  client.on("error", (error) => {
+    if (pool.listenerCount("error") > 0) pool.emit("error", error, client);
+  });
+  try {
+    await client.query("BEGIN");
+    await operation(client);
+    const result = await client.query("COMMIT");
+    if (result.command !== "COMMIT") {
+      throw new DatabaseError("PostgreSQL rolled back database maintenance", "DATABASE_MAINTENANCE_ROLLED_BACK");
+    }
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release(true);
+  }
 }
 
 export function getDatabasePool(): Pool {
@@ -114,18 +134,25 @@ export async function checkDatabaseExists(
   databaseName: string,
   pool?: Pool,
 ): Promise<boolean> {
+  return !!await getPostgresDatabaseOid(databaseName, pool);
+}
+
+export async function getPostgresDatabaseOid(
+  databaseName: string,
+  pool?: Pick<Pool, "query">,
+): Promise<string | undefined> {
   if (!isValidDatabaseName(databaseName)) {
-    return false;
+    return undefined;
   }
 
   const pg = pool ?? getDatabasePool();
 
   try {
-    const res = await pg.query(
-      "SELECT 1 FROM pg_database WHERE datname = $1 AND datistemplate = false",
+    const { rows } = await pg.query<{ oid: string }>(
+      "SELECT oid::text AS oid FROM pg_catalog.pg_database WHERE datname = $1 AND NOT datistemplate",
       [databaseName],
     );
-    return (res.rowCount ?? 0) > 0;
+    return rows[0]?.oid;
   } catch (err: unknown) {
     const mapped = toDatabaseError(
       err,
@@ -286,7 +313,7 @@ export async function createPostgresDatabase(
     );
   }
 
-  const withClauses: string[] = [];
+  const withClauses = ["ALLOW_CONNECTIONS = false"];
 
   if (owner) {
     if (!isValidDatabaseName(owner)) {
@@ -315,7 +342,7 @@ export async function createPostgresDatabase(
         "INVALID_DATABASE_NAME",
       );
     }
-    withClauses.push(`ENCODING = ${escapeSqlLiteral(encoding)}`);
+    withClauses.push(`ENCODING = ${escapeLiteral(encoding)}`);
   }
 
   if (lcCollate) {
@@ -325,7 +352,7 @@ export async function createPostgresDatabase(
         "INVALID_DATABASE_NAME",
       );
     }
-    withClauses.push(`LC_COLLATE = ${escapeSqlLiteral(lcCollate)}`);
+    withClauses.push(`LC_COLLATE = ${escapeLiteral(lcCollate)}`);
   }
 
   if (lcCtype) {
@@ -335,7 +362,7 @@ export async function createPostgresDatabase(
         "INVALID_DATABASE_NAME",
       );
     }
-    withClauses.push(`LC_CTYPE = ${escapeSqlLiteral(lcCtype)}`);
+    withClauses.push(`LC_CTYPE = ${escapeLiteral(lcCtype)}`);
   }
 
   if (tablespace) {
@@ -358,13 +385,10 @@ export async function createPostgresDatabase(
     withClauses.push(`CONNECTION LIMIT = ${connectionLimit}`);
   }
 
-  let sql = `CREATE DATABASE ${quoteIdentifier(name)}`;
-  if (withClauses.length > 0) {
-    sql += ` WITH ${withClauses.join(" ")}`;
-  }
+  const quotedDb = quoteIdentifier(name);
 
   try {
-    await pg.query(sql);
+    await pg.query(`CREATE DATABASE ${quotedDb} WITH ${withClauses.join(" ")}`);
   } catch (err) {
     const mapped = toDatabaseError(
       err,
@@ -372,6 +396,18 @@ export async function createPostgresDatabase(
     );
     if (mapped) throw mapped;
     throw err;
+  }
+
+  try {
+    await inDatabaseTransaction(pg, async (client) => {
+      await client.query(`REVOKE CONNECT ON DATABASE ${quotedDb} FROM PUBLIC`);
+      await client.query(`ALTER DATABASE ${quotedDb} WITH ALLOW_CONNECTIONS true`);
+    });
+  } catch {
+    throw new DatabaseError(
+      `Database '${name}' was created, but its connection privileges could not be configured`,
+      "PARTIAL_CREATE_ACCESS_SETUP_FAILED",
+    );
   }
 }
 
@@ -402,8 +438,8 @@ export async function alterPostgresDatabase(
 
   const pg = pool ?? getDatabasePool();
 
-  const exists = await checkDatabaseExists(databaseName, pg);
-  if (!exists) {
+  const databaseOid = await getPostgresDatabaseOid(databaseName, pg);
+  if (!databaseOid) {
     throw new DatabaseError(
       `Database '${databaseName}' does not exist`,
       "DATABASE_NOT_FOUND",
@@ -531,103 +567,87 @@ export async function alterPostgresDatabase(
     }
   }
 
-  let currentDbName = databaseName;
-  let renamed = false;
-
-  if (options.newName && options.newName !== currentDbName) {
-    const previousName = currentDbName;
-    const nextName = options.newName;
-
-    try {
-      await pg.query(
-        `ALTER DATABASE ${quoteIdentifier(previousName)} RENAME TO ${quoteIdentifier(nextName)}`,
-      );
-    } catch (err) {
-      const mapped = toDatabaseError(
-        err,
-        `Failed to rename database '${previousName}' to '${nextName}'`,
-      );
-      if (mapped) throw mapped;
-      throw err;
-    }
-
-    currentDbName = nextName;
-    renamed = true;
-
-    if (jsondb) {
-      try {
-        await jsondb.update((current) => {
-          const apiKeys = { ...(current.apiKeys ?? {}) };
-          let modified = false;
-          for (const [keyHash, record] of Object.entries(apiKeys)) {
-            if (record.databases.includes(previousName)) {
-              apiKeys[keyHash] = {
-                ...record,
-                databases: record.databases.map((d) =>
-                  d === previousName ? nextName : d,
-                ),
-              };
-              modified = true;
-            }
-          }
-          return modified ? { ...current, apiKeys } : current;
-        });
-      } catch (err) {
-        throw new DatabaseError(
-          `Database renamed from '${previousName}' to '${nextName}', but updating JsonDB API key references failed: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-          "PARTIAL_RENAME_METADATA_SYNC_FAILED",
-        );
-      }
-    }
-  }
-
+  const currentDbName = options.newName ?? databaseName;
+  const renamed = currentDbName !== databaseName;
   const quotedDb = quoteIdentifier(currentDbName);
 
   try {
-    if (options.owner) {
-      await pg.query(
-        `ALTER DATABASE ${quotedDb} OWNER TO ${quoteIdentifier(options.owner)}`,
-      );
-    }
-
-    if (options.allowConnections !== undefined) {
-      await pg.query(
-        `ALTER DATABASE ${quotedDb} WITH ALLOW_CONNECTIONS ${
-          options.allowConnections ? "true" : "false"
-        }`,
-      );
-    }
-
-    if (options.connectionLimit !== undefined) {
-      await pg.query(
-        `ALTER DATABASE ${quotedDb} WITH CONNECTION LIMIT ${options.connectionLimit}`,
-      );
-    }
-
-    if (options.settings) {
-      for (const [param, val] of Object.entries(options.settings)) {
-        const safeParam = quoteGucIdentifier(param);
-        await pg.query(
-          `ALTER DATABASE ${quotedDb} SET ${safeParam} TO ${escapeSqlLiteral(String(val))}`,
+    await inDatabaseTransaction(pg, async (client) => {
+      if (renamed) {
+        await client.query(
+          `ALTER DATABASE ${quoteIdentifier(databaseName)} RENAME TO ${quotedDb}`,
         );
       }
-    }
-
-    if (options.resetSettings) {
-      for (const param of options.resetSettings) {
-        const safeParam = quoteGucIdentifier(param);
-        await pg.query(`ALTER DATABASE ${quotedDb} RESET ${safeParam}`);
+      if (options.owner) {
+        await client.query(
+          `ALTER DATABASE ${quotedDb} OWNER TO ${quoteIdentifier(options.owner)}`,
+        );
       }
-    }
+      if (options.allowConnections !== undefined) {
+        await client.query(
+          `ALTER DATABASE ${quotedDb} WITH ALLOW_CONNECTIONS ${options.allowConnections}`,
+        );
+      }
+      if (options.connectionLimit !== undefined) {
+        await client.query(
+          `ALTER DATABASE ${quotedDb} WITH CONNECTION LIMIT ${options.connectionLimit}`,
+        );
+      }
+      for (const [param, value] of Object.entries(options.settings ?? {})) {
+        await client.query(
+          `ALTER DATABASE ${quotedDb} SET ${quoteGucIdentifier(param)} TO ${escapeLiteral(String(value))}`,
+        );
+      }
+      for (const param of options.resetSettings ?? []) {
+        await client.query(`ALTER DATABASE ${quotedDb} RESET ${quoteGucIdentifier(param)}`);
+      }
+      if (await getPostgresDatabaseOid(currentDbName, client) !== databaseOid) {
+        throw new DatabaseError("Database identity changed during maintenance", "DATABASE_IN_USE");
+      }
+    });
   } catch (err) {
     const mapped = toDatabaseError(
       err,
-      `Failed to apply configuration changes to database '${currentDbName}'`,
+      `Failed to apply database changes to '${databaseName}'`,
     );
     if (mapped) throw mapped;
     throw err;
+  }
+
+  if (renamed && jsondb) {
+    try {
+      await jsondb.update((current) => {
+        const apiKeys = { ...(current.apiKeys ?? {}) };
+        for (const [hash, record] of Object.entries(apiKeys)) {
+          if (!record.databases.includes(databaseName)) continue;
+          const bindings = record.databaseOids ?? {};
+          const boundOid = Object.hasOwn(bindings, databaseName) ? bindings[databaseName] : undefined;
+          if (boundOid && boundOid !== databaseOid) continue;
+          const nextBindings = withoutDatabases(bindings, databaseName);
+          const privilegeMap = record.databaseScopes;
+          const scopes = privilegeMap && Object.hasOwn(privilegeMap, databaseName)
+            ? privilegeMap[databaseName]
+            : undefined;
+          apiKeys[hash] = {
+            ...record,
+            databases: [...new Set(record.databases.map((name) => name === databaseName ? currentDbName : name))],
+            databaseOids: boundOid ? { ...nextBindings, [currentDbName]: boundOid } : nextBindings,
+            ...(privilegeMap && {
+              databaseScopes: {
+                ...withoutDatabases(privilegeMap, databaseName, currentDbName),
+                ...(scopes && { [currentDbName]: scopes }),
+              },
+            }),
+          };
+        }
+        return { ...current, apiKeys };
+      });
+    } catch {
+      throw new DatabaseError(
+        `Database renamed from '${databaseName}' to '${currentDbName}', but updating its API-key scopes failed`,
+        "PARTIAL_RENAME_METADATA_SYNC_FAILED",
+      );
+    }
   }
 
   return { database: currentDbName, renamed };
@@ -658,8 +678,8 @@ export async function deletePostgresDatabase(
 
   const pg = pool ?? getDatabasePool();
 
-  const exists = await checkDatabaseExists(databaseName, pg);
-  if (!exists) {
+  const databaseOid = await getPostgresDatabaseOid(databaseName, pg);
+  if (!databaseOid) {
     throw new DatabaseError(
       `Database '${databaseName}' does not exist`,
       "DATABASE_NOT_FOUND",
@@ -686,17 +706,21 @@ export async function deletePostgresDatabase(
     try {
       await jsondb.update((current) => {
         const apiKeys = { ...(current.apiKeys ?? {}) };
-        let modified = false;
         for (const [keyHash, record] of Object.entries(apiKeys)) {
-          if (record.databases.includes(databaseName)) {
-            apiKeys[keyHash] = {
-              ...record,
-              databases: record.databases.filter((d) => d !== databaseName),
-            };
-            modified = true;
-          }
+          if (!record.databases.includes(databaseName)) continue;
+          const bindings = record.databaseOids ?? {};
+          const boundOid = Object.hasOwn(bindings, databaseName) ? bindings[databaseName] : undefined;
+          if (boundOid && boundOid !== databaseOid) continue;
+          apiKeys[keyHash] = {
+            ...record,
+            databases: record.databases.filter((name) => name !== databaseName),
+            databaseOids: withoutDatabases(bindings, databaseName),
+            ...(record.databaseScopes && {
+              databaseScopes: withoutDatabases(record.databaseScopes, databaseName),
+            }),
+          };
         }
-        return modified ? { ...current, apiKeys } : current;
+        return { ...current, apiKeys };
       });
     } catch (err) {
       throw new DatabaseError(

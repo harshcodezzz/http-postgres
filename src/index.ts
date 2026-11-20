@@ -6,7 +6,7 @@ import { closeApiKeyPool } from "./utils/api-key.js";
 async function start() {
   const app = await buildApp();
 
-  await bootstrap();
+  await bootstrap(app.jsondb);
 
   let isShuttingDown = false;
 
@@ -17,19 +17,19 @@ async function start() {
     app.log.info(`Received ${signal}, starting graceful shutdown...`);
 
     const forceExitTimer = setTimeout(() => {
-      app.log.error("Graceful shutdown timed out, forcing exit");
+      console.error("Graceful shutdown timed out, forcing exit");
       process.exit(1);
     }, 10_000);
-    forceExitTimer.unref();
-
     try {
       await app.close();
       await closeApiKeyPool();
-      app.log.info("Server closed gracefully");
-      process.exit(0);
+      console.log("Server closed gracefully");
+      process.exitCode = 0;
     } catch (error) {
-      app.log.error({ err: error }, "Error occurred during graceful shutdown");
-      process.exit(1);
+      console.error("Error occurred during graceful shutdown", error);
+      process.exitCode = 1;
+    } finally {
+      clearTimeout(forceExitTimer);
     }
   };
 

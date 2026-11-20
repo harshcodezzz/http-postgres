@@ -7,7 +7,6 @@ import {
   deletePostgresDatabase,
   DatabaseError,
 } from "../../utils/pg-database.js";
-import { withQueryPoolMaintenance } from "../query/index.js";
 
 export interface CreateDatabaseBody {
   name?: string;
@@ -53,6 +52,7 @@ function mapDatabaseErrorStatus(code: string): number {
       return 400;
     case "PARTIAL_RENAME_METADATA_SYNC_FAILED":
     case "PARTIAL_DELETE_METADATA_SYNC_FAILED":
+    case "PARTIAL_CREATE_ACCESS_SETUP_FAILED":
       return 500;
     default:
       return 400;
@@ -321,7 +321,7 @@ const adminDatabaseRoutes: FastifyPluginAsync = async (fastify) => {
       );
 
       const result = newName && newName !== dbName
-        ? await withQueryPoolMaintenance(dbName, alter)
+        ? await fastify.queryPools.withMaintenance(dbName, alter)
         : await alter();
 
       const targetName = result.renamed ? result.database : dbName;
@@ -391,7 +391,7 @@ const adminDatabaseRoutes: FastifyPluginAsync = async (fastify) => {
     }
 
     try {
-      await withQueryPoolMaintenance(
+      await fastify.queryPools.withMaintenance(
         dbName,
         () => deletePostgresDatabase(dbName, fastify.db, isForce, fastify.jsondb),
         isForce,

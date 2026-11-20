@@ -6,6 +6,7 @@ import config from "../config/index.js";
 declare module "fastify" {
   interface FastifyInstance {
     db: Pool;
+    databaseAdminRoles: string[];
   }
 }
 
@@ -16,6 +17,7 @@ const databasePlugin: FastifyPluginAsync = async (app) => {
     max: config.database.pool.max,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 5_000,
+    query_timeout: 30_000,
   });
 
   pool.on("error", (error) => {
@@ -23,7 +25,10 @@ const databasePlugin: FastifyPluginAsync = async (app) => {
   });
 
   try {
-    await pool.query("SELECT 1");
+    const { rows: [roles] } = await pool.query<{ login: string; active: string }>(
+      "SELECT session_user AS login, current_user AS active",
+    );
+    app.decorate("databaseAdminRoles", [...new Set([roles.login, roles.active])]);
   } catch (error) {
     await pool.end();
 

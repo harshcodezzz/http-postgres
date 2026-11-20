@@ -39,27 +39,17 @@ const adminApiRoutes: FastifyPluginAsync = async (fastify) => {
 
   fastify.post<{
     Body: {
-      databases?: string[];
+      databases?: unknown;
       database?: string;
       environment?: ApiKeyEnvironment;
     };
   }>("/keys", async (request, reply) => {
     const { databases, database, environment = "LIVE" } = request.body ?? {};
 
-    const targetDbs = databases ?? (database ? [database] : []);
-    if (!Array.isArray(targetDbs) || targetDbs.length === 0) {
-      return reply.code(400).send({
-        success: false,
-        error: {
-          code: "INVALID_DATABASE_NAME",
-          message: "At least one database is required in 'databases' or 'database'",
-        },
-      });
-    }
-
     try {
       const result = await createApiKey({
-        databases: targetDbs,
+        databases,
+        database,
         environment,
         db: fastify.jsondb,
         pgPool: fastify.db,
@@ -84,20 +74,10 @@ const adminApiRoutes: FastifyPluginAsync = async (fastify) => {
   });
 
   const updateScopeHandler = async (
-    request: FastifyRequest<{ Params: { id: string }; Body: { databases?: string[] } }>,
+    request: FastifyRequest<{ Params: { id: string }; Body: { databases?: unknown } }>,
     reply: FastifyReply,
   ) => {
     const { databases } = request.body ?? {};
-
-    if (!Array.isArray(databases) || databases.length === 0) {
-      return reply.code(400).send({
-        success: false,
-        error: {
-          code: "INVALID_DATABASE_NAME",
-          message: "At least one database is required in 'databases'",
-        },
-      });
-    }
 
     try {
       const updated = await updateApiKeyScope(request.params.id, {
@@ -125,11 +105,11 @@ const adminApiRoutes: FastifyPluginAsync = async (fastify) => {
     }
   };
 
-  fastify.patch<{ Params: { id: string }; Body: { databases?: string[] } }>(
+  fastify.patch<{ Params: { id: string }; Body: { databases?: unknown } }>(
     "/keys/:id",
     updateScopeHandler,
   );
-  fastify.put<{ Params: { id: string }; Body: { databases?: string[] } }>(
+  fastify.put<{ Params: { id: string }; Body: { databases?: unknown } }>(
     "/keys/:id",
     updateScopeHandler,
   );

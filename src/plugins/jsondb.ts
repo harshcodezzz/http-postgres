@@ -3,12 +3,15 @@ import type { FastifyPluginAsync } from "fastify";
 import { mkdir, readFile, writeFile, rename, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { resolve, dirname } from "node:path";
+import type { DatabaseScopes } from "../config/query-privileges.js";
 
 export interface ApiKeyRecord {
   id: string;
   keyHash: string;
   keyPrefix: string;
   databases: string[];
+  databaseOids?: Record<string, string>;
+  databaseScopes?: DatabaseScopes;
   environment: "LIVE" | "TEST";
   status: "active" | "revoked";
   createdAt: string;
