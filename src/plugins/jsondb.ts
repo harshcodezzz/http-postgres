@@ -8,7 +8,7 @@ export interface ApiKeyRecord {
   id: string;
   keyHash: string;
   keyPrefix: string;
-  database: string;
+  databases: string[];
   environment: "LIVE" | "TEST";
   status: "active" | "revoked";
   createdAt: string;

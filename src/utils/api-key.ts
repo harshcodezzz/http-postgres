@@ -99,7 +99,7 @@ export async function checkDatabaseExists(
 
 export interface ApiKeyAuditLog {
   timestamp: string;
-  action: "CREATE" | "REVOKE" | "DELETE" | "VERIFY_FAILED";
+  action: "CREATE" | "REVOKE" | "DELETE" | "VERIFY_FAILED" | "UPDATE_SCOPE";
   database: string;
   keyPrefix?: string;
   keyId?: string;
@@ -109,7 +109,7 @@ export interface ApiKeyAuditLog {
 }
 
 export interface CreateApiKeyOptions {
-  database: string;
+  databases: string[];
   environment?: ApiKeyEnvironment;
   db?: JsonDB;
   pgPool?: Pool;
@@ -134,6 +134,13 @@ export interface VerifyApiKeyOptions {
 
 export interface DeleteApiKeyOptions {
   hardDelete?: boolean;
+  auditLogPath?: string;
+}
+
+export interface UpdateApiKeyScopeOptions {
+  databases: string[];
+  db?: JsonDB;
+  pgPool?: Pool;
   auditLogPath?: string;
 }
 
@@ -176,65 +183,61 @@ export async function writeAuditLog(
 }
 
 /**
- * Creates a new API key scoped to a specific database and persists it to JsonDB.
- * Validates that the database exists in PostgreSQL before creation.
+ * Creates a new API key scoped to one or more databases and persists it to JsonDB.
+ * Validates that all databases exist in PostgreSQL before creation.
  */
 export async function createApiKey(
-  databaseOrOptions: string | CreateApiKeyOptions,
-  environmentParam?: ApiKeyEnvironment,
-  customDb?: JsonDB,
-  customPgPool?: Pool,
+  options: CreateApiKeyOptions,
 ): Promise<CreateApiKeyResult> {
-  const options: CreateApiKeyOptions =
-    typeof databaseOrOptions === "string"
-      ? {
-          database: databaseOrOptions,
-          environment: environmentParam ?? "LIVE",
-          db: customDb,
-          pgPool: customPgPool,
-        }
-      : databaseOrOptions;
-
-  const { database, environment = "LIVE" } = options;
+  const { databases, environment = "LIVE" } = options;
   const db = options.db ?? new JsonDB();
   const auditPath = options.auditLogPath ?? API_KEY_LOG_FILE;
 
-  if (!isValidDatabaseName(database)) {
-    await writeAuditLog(
-      {
-        timestamp: new Date().toISOString(),
-        action: "CREATE",
-        database: typeof database === "string" ? database : "invalid",
-        environment,
-        success: false,
-        reason: "INVALID_DATABASE_NAME",
-      },
-      auditPath,
-    );
+  if (databases.length === 0) {
     throw new ApiKeyError(
-      `Invalid database name: '${database}'`,
+      "At least one database is required",
       "INVALID_DATABASE_NAME",
     );
   }
 
-  const dbExists = await checkDatabaseExists(database, options.pgPool);
-  if (!dbExists) {
-    await writeAuditLog(
-      {
-        timestamp: new Date().toISOString(),
-        action: "CREATE",
-        database,
-        environment,
-        success: false,
-        reason: "DATABASE_NOT_FOUND",
-      },
-      auditPath,
-    );
+  for (const database of databases) {
+    if (!isValidDatabaseName(database)) {
+      await writeAuditLog(
+        {
+          timestamp: new Date().toISOString(),
+          action: "CREATE",
+          database: typeof database === "string" ? database : "invalid",
+          environment,
+          success: false,
+          reason: "INVALID_DATABASE_NAME",
+        },
+        auditPath,
+      );
+      throw new ApiKeyError(
+        `Invalid database name: '${database}'`,
+        "INVALID_DATABASE_NAME",
+      );
+    }
 
-    throw new ApiKeyError(
-      `Database '${database}' does not exist in PostgreSQL`,
-      "DATABASE_NOT_FOUND",
-    );
+    const dbExists = await checkDatabaseExists(database, options.pgPool);
+    if (!dbExists) {
+      await writeAuditLog(
+        {
+          timestamp: new Date().toISOString(),
+          action: "CREATE",
+          database,
+          environment,
+          success: false,
+          reason: "DATABASE_NOT_FOUND",
+        },
+        auditPath,
+      );
+
+      throw new ApiKeyError(
+        `Database '${database}' does not exist in PostgreSQL`,
+        "DATABASE_NOT_FOUND",
+      );
+    }
   }
 
   const secret = randomBytes(24).toString("base64url");
@@ -247,7 +250,7 @@ export async function createApiKey(
     id,
     keyHash,
     keyPrefix,
-    database,
+    databases,
     environment,
     status: "active",
     createdAt: new Date().toISOString(),
@@ -270,7 +273,7 @@ export async function createApiKey(
     {
       timestamp: new Date().toISOString(),
       action: "CREATE",
-      database,
+      database: databases.join(", "),
       keyId: id,
       keyPrefix,
       environment,
@@ -284,6 +287,7 @@ export async function createApiKey(
 
 /**
  * Verifies an API key against a target database name.
+ * The key is valid if the target database is in the key's databases list.
  * Does not synchronously write to JSONDB on every request.
  * Does not append audit logs for successful verifications.
  */
@@ -384,7 +388,7 @@ export async function verifyApiKey(
     return { valid: false, record, error: "KEY_REVOKED" };
   }
 
-  if (record.database !== databaseName) {
+  if (!record.databases.includes(databaseName)) {
     await writeAuditLog(
       {
         timestamp: new Date().toISOString(),
@@ -482,7 +486,7 @@ export async function revokeApiKey(
       {
         timestamp: new Date().toISOString(),
         action: "REVOKE",
-        database: rec.database,
+        database: rec.databases.join(", "),
         keyId: rec.id,
         keyPrefix: rec.keyPrefix,
         environment: rec.environment,
@@ -493,6 +497,103 @@ export async function revokeApiKey(
   }
 
   return success;
+}
+
+/**
+ * Updates the database scope of an existing API key.
+ * Requires at least one database. Validates all databases exist in PostgreSQL.
+ */
+export async function updateApiKeyScope(
+  apiKeyOrId: string,
+  options: UpdateApiKeyScopeOptions,
+): Promise<ApiKeyRecord> {
+  const { databases } = options;
+  const db = options.db ?? new JsonDB();
+  const auditPath = options.auditLogPath ?? API_KEY_LOG_FILE;
+
+  if (!Array.isArray(databases) || databases.length === 0) {
+    throw new ApiKeyError(
+      "At least one database is required",
+      "INVALID_DATABASE_NAME",
+    );
+  }
+
+  for (const database of databases) {
+    if (!isValidDatabaseName(database)) {
+      throw new ApiKeyError(
+        `Invalid database name: '${database}'`,
+        "INVALID_DATABASE_NAME",
+      );
+    }
+
+    const dbExists = await checkDatabaseExists(database, options.pgPool);
+    if (!dbExists) {
+      throw new ApiKeyError(
+        `Database '${database}' does not exist in PostgreSQL`,
+        "DATABASE_NOT_FOUND",
+      );
+    }
+  }
+
+  const parsed = parseApiKey(apiKeyOrId);
+  const keyHash = parsed ? hashApiKeySecret(parsed.secret) : null;
+  let updatedRecord: ApiKeyRecord | null = null;
+
+  await db.update((current) => {
+    const apiKeys = { ...(current.apiKeys ?? {}) };
+    let targetHash: string | null = null;
+
+    if (keyHash && apiKeys[keyHash]) {
+      targetHash = keyHash;
+    } else {
+      const entry = Object.entries(apiKeys).find(([, r]) => r.id === apiKeyOrId);
+      if (entry) {
+        targetHash = entry[0];
+      }
+    }
+
+    if (!targetHash || !apiKeys[targetHash]) {
+      return current;
+    }
+
+    if (apiKeys[targetHash].status !== "active") {
+      return current;
+    }
+
+    apiKeys[targetHash] = {
+      ...apiKeys[targetHash],
+      databases: [...new Set(databases)],
+    };
+    updatedRecord = apiKeys[targetHash];
+
+    return {
+      ...current,
+      apiKeys,
+    };
+  });
+
+  if (!updatedRecord) {
+    throw new ApiKeyError(
+      "API key not found or is not active",
+      "KEY_NOT_FOUND",
+    );
+  }
+
+  const rec = updatedRecord as ApiKeyRecord;
+  await writeAuditLog(
+    {
+      timestamp: new Date().toISOString(),
+      action: "UPDATE_SCOPE",
+      database: rec.databases.join(", "),
+      keyId: rec.id,
+      keyPrefix: rec.keyPrefix,
+      environment: rec.environment,
+      success: true,
+    },
+    auditPath,
+  );
+
+  return rec;
 }
 
 /**
@@ -542,7 +643,7 @@ export async function deleteApiKey(
       {
         timestamp: new Date().toISOString(),
         action: "DELETE",
-        database: rec.database,
+        database: rec.databases.join(", "),
         keyId: rec.id,
         keyPrefix: rec.keyPrefix,
         environment: rec.environment,
