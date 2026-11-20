@@ -7,6 +7,7 @@ import {
   deletePostgresDatabase,
   DatabaseError,
 } from "../../utils/pg-database.js";
+import { evictQueryPool } from "../query/index.js";
 
 export interface CreateDatabaseBody {
   name?: string;
@@ -319,6 +320,10 @@ const adminDatabaseRoutes: FastifyPluginAsync = async (fastify) => {
         fastify.jsondb,
       );
 
+      if (result.renamed) {
+        await evictQueryPool(dbName);
+      }
+
       const targetName = result.renamed ? result.database : dbName;
 
       return {
@@ -387,6 +392,7 @@ const adminDatabaseRoutes: FastifyPluginAsync = async (fastify) => {
 
     try {
       await deletePostgresDatabase(dbName, fastify.db, isForce, fastify.jsondb);
+      await evictQueryPool(dbName);
       return {
         success: true,
         message: `Database '${dbName}' deleted successfully`,

@@ -24,12 +24,14 @@ declare module "fastify" {
   interface FastifyRequest {
     apiKey: ApiKeyRecord | null;
     admin: boolean;
+    database: string;
   }
 }
 
 const authPlugin: FastifyPluginAsync = async (fastify) => {
   fastify.decorateRequest("apiKey", null);
   fastify.decorateRequest("admin", false);
+  fastify.decorateRequest("database", "");
 
   fastify.addHook("onRequest", async (request, reply) => {
     const admin = request.headers["x-admin"];
@@ -103,6 +105,7 @@ const authPlugin: FastifyPluginAsync = async (fastify) => {
     }
 
     request.apiKey = result.record;
+    request.database = database;
   });
 };
 

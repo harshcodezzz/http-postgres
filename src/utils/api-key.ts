@@ -16,6 +16,7 @@ import {
   createPostgresDatabase,
   alterPostgresDatabase,
   deletePostgresDatabase,
+  closeDatabasePool,
   SYSTEM_DATABASES,
   DatabaseError,
   type CreatePostgresDatabaseOptions,
@@ -87,6 +88,7 @@ export async function closeApiKeyPool(): Promise<void> {
     sharedPgPool = null;
     await pool.end();
   }
+  await closeDatabasePool();
 }
 
 export interface ApiKeyAuditLog {
