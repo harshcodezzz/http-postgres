@@ -1,0 +1,20 @@
+version: 1
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+database:
+  url: "${DATABASE_URL:-postgresql://postgres:postgres@127.0.0.1:5432/postgres}"
+  pool:
+    min: 2
+    max: 20
+
+redis:
+  enabled: true
+  mode: external
+  url: "${REDIS_URL:-redis://127.0.0.1:6379}"
+
+analytics:
+  enabled: true
+  directory: "./data/analytics"

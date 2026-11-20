@@ -1,0 +1,31 @@
+{
+  "dependencies": {
+    "dotenv": "^18.0.10",
+    "fastify": "^5.12.8",
+    "fastify-plugin": "^6.0.1",
+    "ioredis": "^6.0.0",
+    "pg": "^8.23.1",
+    "pino-roll": "^4.0.0",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.7"
+  },
+  "name": "http-postgres",
+  "version": "1.0.0",
+  "description": "",
+  "main": "src/index.ts",
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
