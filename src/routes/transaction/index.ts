@@ -7,7 +7,7 @@ import { formatQueryResult } from "../query/index.js";
 interface QueuedQuery {
   queryId: string;
   query: string;
-  parameters: unknown[];
+  serializedParameters: string;
   bytes: number;
 }
 
@@ -37,6 +37,8 @@ const maxTransactions = 1_000;
 const maxQueriesPerTransaction = 100;
 const maxTransactionBytes = 256 * 1024;
 const maxStoredBytes = 16 * 1024 * 1024;
+const transactionOverhead = 1024;
+const queryOverhead = 512;
 
 function fail(reply: FastifyReply, status: number, code: string, message: string) {
   return reply.code(status).send({ success: false, error: { code, message } });
@@ -93,9 +95,9 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
     if (!request.apiKey || !request.databaseOid) {
       return fail(reply, 401, "UNAUTHORIZED", "A database-scoped API key is required");
     }
-    if (transactions.size >= maxTransactions) {
+    if (transactions.size >= maxTransactions || storedBytes + transactionOverhead > maxStoredBytes) {
       cleanupExpired();
-      if (transactions.size >= maxTransactions) {
+      if (transactions.size >= maxTransactions || storedBytes + transactionOverhead > maxStoredBytes) {
         return fail(reply, 429, "TRANSACTION_LIMIT_EXCEEDED", "Too many stored transactions");
       }
     }
@@ -107,9 +109,10 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
       owner: request.apiKey.id,
       status: "pending",
       queries: new Map(),
-      bytes: 0,
+      bytes: transactionOverhead,
       expiresAt: Date.now() + retentionMs,
     });
+    storedBytes += transactionOverhead;
     return reply.code(201).send({ success: true, transactionId });
   }
 
@@ -131,7 +134,7 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
         // The extended protocol permits one SQL statement per queued query.
         const statement: QueryConfig & { queryMode: "extended" } = {
           text: queued.query,
-          values: queued.parameters,
+          values: JSON.parse(queued.serializedParameters),
           queryMode: "extended",
         };
         const result = await client.query(statement);
@@ -140,16 +143,17 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
       queryId = undefined;
       commitSent = true;
       const result = await client.query("COMMIT");
-      if (result.command !== "COMMIT") {
+      if (result.command === "ROLLBACK") {
         transaction.status = "pending";
         return fail(reply, 400, "TRANSACTION_ROLLED_BACK", "PostgreSQL rolled back the transaction");
       }
+      if (result.command !== "COMMIT") throw new Error("Unexpected PostgreSQL COMMIT result");
       transaction.status = "committed";
       return { success: true, transactionId: transaction.transactionId, results };
     } catch (error) {
       if (commitSent) {
         if (error instanceof PostgresError && error.severity === "ERROR" && error.code &&
-          !error.code.startsWith("08") && error.code !== "40003") {
+          (error.code.startsWith("23") || error.code === "40001" || error.code === "40P01")) {
           transaction.status = "pending";
           return reply.code(400).send({
             success: false,
@@ -220,7 +224,8 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
     if (!command || transactionCommands.has(command)) {
       return fail(reply, 400, "INVALID_QUERY", "Start with a SQL command other than transaction control");
     }
-    const bytes = Buffer.byteLength(JSON.stringify([sql, parameters ?? []]));
+    const serializedParameters = JSON.stringify(parameters ?? []);
+    const bytes = queryOverhead + 2 * (sql.length + serializedParameters.length);
     if (transaction.queries.size >= maxQueriesPerTransaction || transaction.bytes + bytes > maxTransactionBytes) {
       return fail(reply, 413, "TRANSACTION_QUEUE_LIMIT_EXCEEDED", "The transaction queue exceeds its size limit");
     }
@@ -234,7 +239,7 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
       }
     }
     const queryId = randomUUID();
-    transaction.queries.set(queryId, { queryId, query: sql, parameters: parameters ?? [], bytes });
+    transaction.queries.set(queryId, { queryId, query: sql, serializedParameters, bytes });
     queryTransactions.set(queryId, transaction.transactionId);
     transaction.bytes += bytes;
     storedBytes += bytes;
@@ -282,7 +287,9 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
       transactionId: transaction.transactionId,
       database: transaction.database,
       status: transaction.status,
-      queries: [...transaction.queries.values()].map(({ queryId, query, parameters }) => ({ queryId, query, parameters })),
+      queries: [...transaction.queries.values()].map(({ queryId, query, serializedParameters }) => ({
+        queryId, query, parameters: JSON.parse(serializedParameters),
+      })),
     };
   });
 

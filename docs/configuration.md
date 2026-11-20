@@ -26,6 +26,7 @@ The table lists loader defaults. Explicit values in [gateway.yaml](../gateway.ya
 | `database.queryProfiles` | `{}` | Maps database names to PostgreSQL logins for explicit API-key privilege sets. |
 | `database.pool.min` | `2` | Minimum size of the administrative pool, zero or greater. |
 | `database.pool.max` | `20` | Maximum size of the administrative pool and of each query pool. A database has a separate pool for its default login and each configured privilege profile. The minimum cannot exceed the maximum. |
+| `database.pool.maxGlobalQueries` | `40` | Process-wide query connection budget across all databases and profiles. Includes pending checkouts and excludes the administrative pool. |
 | `redis.enabled` | `true` | Connect to Redis on startup. Set to `false` to use an in-memory store local to the gateway process. |
 | `redis.mode` | `external` | Accepts `external` or `managed`. Both currently connect to the configured Redis URL when enabled. |
 | `redis.url` | Required when enabled | Redis connection string. |
@@ -88,4 +89,4 @@ When renaming a served database, configure the destination name and connection U
 | `logs/api-keys.log` | Active API key audit events. Rotates at 5 MiB. |
 | `logs/api-keys.log.1` | Previous audit log generation. |
 
-Fastify's request completion logs print `responseTime` in milliseconds as a JSON string with three decimal places. Use one gateway process per JsonDB and audit-log directory. Transaction queues are held in process memory and have no runtime file.
+Fastify's request completion logs print `responseTime` in milliseconds as a JSON string with three decimal places. Processes sharing JsonDB must use the same data path on a filesystem that supports atomic directory creation and rename. Writers wait up to five seconds for the adjacent `data.json.lock` directory. If a process dies while holding the lock, remove the lock directory only after confirming all gateway processes using the file have stopped. Use a separate audit-log directory per process. Transaction queues are held in process memory and have no runtime file.

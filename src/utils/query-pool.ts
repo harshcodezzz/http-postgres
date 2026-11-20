@@ -5,11 +5,14 @@ import { scopeKey, type QueryPrivilege } from "../config/query-privileges.js";
 import { DatabaseError } from "./pg-database.js";
 
 const connectionTimeoutMillis = 5_000;
-const queryTimeoutMillis = 30_000;
+const statementTimeoutMillis = 30_000;
+const queryTimeoutMillis = 35_000;
+let queryConnections = 0;
 
 export function createQueryPools(adminRoles: string[], log: FastifyBaseLogger) {
   const pools = new Map<string, Map<string, Pool>>();
   const maintenance = new Set<string>();
+  const reservedClients = new WeakSet<PoolClient>();
 
   async function evict(database: string) {
     const databasePools = pools.get(database);
@@ -56,6 +59,9 @@ export function createQueryPools(adminRoles: string[], log: FastifyBaseLogger) {
     if (!connectionString) {
       throw new DatabaseError("Query credentials are unavailable for this database", "QUERY_DATABASE_UNAVAILABLE");
     }
+    if (queryConnections >= config.database.pool.maxGlobalQueries) {
+      throw new DatabaseError("The gateway query connection budget is exhausted", "QUERY_CONNECTION_LIMIT");
+    }
     let databasePools = pools.get(database);
     if (!databasePools) {
       databasePools = new Map();
@@ -71,10 +77,21 @@ export function createQueryPools(adminRoles: string[], log: FastifyBaseLogger) {
         query_timeout: queryTimeoutMillis,
       });
       pool.on("error", (err) => log.error({ err, database }, "Query connection pool error"));
+      pool.on("remove", (client: PoolClient) => {
+        if (reservedClients.delete(client)) queryConnections--;
+      });
       databasePools.set(poolKey, pool);
     }
 
-    const client = await pool.connect();
+    queryConnections++;
+    let client: PoolClient;
+    try {
+      client = await pool.connect();
+    } catch (error) {
+      queryConnections--;
+      throw error;
+    }
+    reservedClients.add(client);
     client.on("error", (err) => log.warn({ err, database }, "Checked-out query connection error"));
     try {
       checkMaintenance();
@@ -113,6 +130,8 @@ export function createQueryPools(adminRoles: string[], log: FastifyBaseLogger) {
       if (target.oid !== oid) {
         throw new DatabaseError("The API key scope no longer matches this database", "DATABASE_SCOPE_CHANGED");
       }
+      await client.query("SELECT pg_catalog.set_config('statement_timeout', $1, false)", [String(statementTimeoutMillis)]);
+      checkMaintenance();
       return client;
     } catch (error) {
       client.release(true);

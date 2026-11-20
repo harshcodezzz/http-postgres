@@ -20,11 +20,11 @@ Query and transaction routes also accept the raw key in `Authorization` and the 
 
 `query` is required. `parameters` is optional and accepts the alias `params`. A single-statement response includes `database`, `command`, `rowCount`, `rows`, `fields`, and `durationMs`. The `data` field repeats the result metadata and rows. When PostgreSQL returns multiple statement results, the response uses a `results` array ordered by statement.
 
-The gateway checks the database name, identity, and query login before running SQL. Session state lasts for the request. Connection acquisition waits up to 5 seconds, and the gateway gives each database query up to 30 seconds for a response.
+The gateway checks the database name, identity, and query login before running SQL. Session state lasts for the request. Connection acquisition waits up to 5 seconds, and the gateway initializes the session's PostgreSQL `statement_timeout` to 30 seconds. The client also has a 35-second query response timeout. PostgreSQL allows SQL clients to change the session setting.
 
 ## Queued transactions
 
-Use the same API key and database for every request in a transaction. Queues live in process memory and are lost on restart. Creating a transaction, adding or removing queries, and reading the queue require no PostgreSQL connection. A record expires 15 minutes after creation, the last queue edit, or the end of a commit attempt. Commits in progress are retained. Each queue can hold 100 statements and 256 KiB of SQL and parameters. Each process stores up to 1,000 transaction records and 16 MiB of queued SQL and parameters.
+Use the same API key and database for every request in a transaction. Queues live in process memory and are lost on restart. Creating a transaction, adding or removing queries, and reading the queue require no PostgreSQL connection. A record expires 15 minutes after creation, the last queue edit, or the end of a commit attempt. Commits in progress are retained. Each queue can hold 100 statements and 256 KiB of estimated queue memory. Each process stores up to 1,000 transaction records and 16 MiB of estimated queue memory. The estimate includes string storage and fixed charges for each transaction, query, and lookup.
 
 | Method and path | Input and response |
 | --- | --- |
@@ -94,4 +94,5 @@ Errors generally use `{"success":false,"error":{"code":"…","message":"…"}}`.
 | `409 DATABASE_IN_USE` | The database is under gateway maintenance. |
 | `413 TRANSACTION_QUEUE_LIMIT_EXCEEDED` | The transaction exceeds its statement or byte limit. |
 | `429 TRANSACTION_LIMIT_EXCEEDED` | The process has reached its transaction storage limit. |
+| `503 QUERY_CONNECTION_LIMIT` | The process-wide query connection budget is full. |
 | `503 QUERY_DATABASE_UNAVAILABLE` | The requested database's dedicated connection could not be opened or verified. |

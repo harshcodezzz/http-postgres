@@ -54,24 +54,17 @@ export async function verifyPassword(
 export default async function bootstrap(
   db: JsonDB = new JsonDB(),
 ): Promise<DataStore> {
-  await db.ensureExists();
+  let password: string | undefined;
+  const updatedData = await db.update<DataStore>(async (data) => {
+    if (data.admin?.hash) return data;
+    password = randomBytes(32).toString("base64url");
+    return { ...data, admin: { hash: await hashPassword(password) } };
+  });
 
-  const data = await db.read<DataStore>();
-
-  if (data.admin?.hash) {
+  if (!password) {
     console.log("[Bootstrap] Existing admin configuration loaded");
-    return data;
+    return updatedData;
   }
-
-  const password = randomBytes(32).toString("base64url");
-  const hash = await hashPassword(password);
-
-  const updatedData: DataStore = {
-    ...data,
-    admin: { hash },
-  };
-
-  await db.write(updatedData);
 
   console.log("\n========================================");
   console.log("       GATEWAY ADMIN CREDENTIALS");

@@ -32,6 +32,7 @@ const configSchema = z
         .object({
           min: z.number().int().min(0).default(2),
           max: z.number().int().positive().default(20),
+          maxGlobalQueries: z.number().int().positive().default(40),
         })
         .prefault({}),
     }),

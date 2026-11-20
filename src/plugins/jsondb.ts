@@ -1,6 +1,7 @@
 import fp from "fastify-plugin";
 import type { FastifyPluginAsync } from "fastify";
-import { mkdir, readFile, writeFile, rename, unlink } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rename, unlink, rmdir } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { resolve, dirname } from "node:path";
 import type { DatabaseScopes } from "../config/query-privileges.js";
@@ -31,45 +32,47 @@ export class JsonDB {
   readonly filePath: string;
   readonly dirPath: string;
 
-  // File-level update queues to serialize concurrent writes across instances
-  private static fileQueues = new Map<string, Promise<void>>();
-
   constructor(customPath?: string) {
-    this.filePath = customPath ?? resolve(process.cwd(), "data", "data.json");
+    this.filePath = resolve(customPath ?? "data/data.json");
     this.dirPath = dirname(this.filePath);
   }
 
-  private getQueue(): Promise<void> {
-    return JsonDB.fileQueues.get(this.filePath) ?? Promise.resolve();
+  private async withLock<T>(operation: () => Promise<T>): Promise<T> {
+    await mkdir(this.dirPath, { recursive: true });
+    const lockPath = `${this.filePath}.lock`;
+    const deadline = performance.now() + 5_000;
+    while (true) {
+      try {
+        await mkdir(lockPath, { mode: 0o700 });
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        if (performance.now() >= deadline) throw new Error(`Timed out acquiring JsonDB lock at ${lockPath}`);
+        await delay(25);
+      }
+    }
+    try {
+      return await operation();
+    } finally {
+      await rmdir(lockPath);
+    }
   }
 
-  private setQueue(p: Promise<void>): void {
-    JsonDB.fileQueues.set(this.filePath, p);
+  private async exists(): Promise<boolean> {
+    try {
+      await readFile(this.filePath);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      return false;
+    }
   }
 
   async ensureExists(initialData: DataStore = {}): Promise<void> {
-    await mkdir(this.dirPath, { recursive: true });
-
-    try {
-      await readFile(this.filePath);
-      return;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        throw error;
-      }
-    }
-
-    try {
-      await writeFile(this.filePath, JSON.stringify(initialData, null, 2), {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600,
-      });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-        throw error;
-      }
-    }
+    if (await this.exists()) return;
+    await this.withLock(async () => {
+      if (!(await this.exists())) await this.replace(initialData);
+    });
   }
 
   async read<T = DataStore>(): Promise<T> {
@@ -92,8 +95,10 @@ export class JsonDB {
   }
 
   async write<T = DataStore>(data: T): Promise<void> {
-    await mkdir(this.dirPath, { recursive: true });
+    await this.withLock(() => this.replace(data));
+  }
 
+  private async replace<T>(data: T): Promise<void> {
     const tempPath = `${this.filePath}.${randomUUID()}.tmp`;
 
     try {
@@ -125,20 +130,13 @@ export class JsonDB {
   async update<T = DataStore>(
     updater: (current: T) => T | Promise<T>,
   ): Promise<T> {
-    let result!: T;
-
-    const currentQueue = this.getQueue();
-    const operation = currentQueue.then(async () => {
+    await this.ensureExists();
+    return this.withLock(async () => {
       const current = await this.read<T>();
       const updated = await updater(current);
-      await this.write(updated);
-      result = updated;
+      await this.replace(updated);
+      return updated;
     });
-
-    this.setQueue(operation.catch(() => {}));
-    await operation;
-
-    return result;
   }
 }
 
