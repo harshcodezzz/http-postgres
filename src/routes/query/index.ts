@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
-import { Pool } from "pg";
+import { Pool, type QueryResult } from "pg";
 import config from "../../config/index.js";
-import { getDatabasePool } from "../../utils/pg-database.js";
+import { DatabaseError, getDatabasePool } from "../../utils/pg-database.js";
 
 interface QueryBody {
   query?: string;
@@ -10,11 +10,46 @@ interface QueryBody {
 }
 
 const poolsByDatabase = new Map<string, Pool>();
+const databasesUnderMaintenance = new Set<string>();
+
+export async function withQueryPoolMaintenance<T>(
+  databaseName: string,
+  operation: () => Promise<T>,
+  force = false,
+): Promise<T> {
+  if (databasesUnderMaintenance.has(databaseName)) {
+    throw new DatabaseError("Database maintenance is already in progress", "DATABASE_IN_USE");
+  }
+
+  databasesUnderMaintenance.add(databaseName);
+  try {
+    if (!force) {
+      await evictQueryPool(databaseName);
+    }
+    const result = await operation();
+    if (force) {
+      await evictQueryPool(databaseName);
+    }
+    return result;
+  } finally {
+    databasesUnderMaintenance.delete(databaseName);
+  }
+}
+
+function formatQueryResult(result: QueryResult) {
+  const rows = result.rows ?? [];
+  return {
+    command: result.command ?? "SELECT",
+    rowCount: result.rowCount ?? rows.length,
+    rows,
+    fields: result.fields?.map(({ name, dataTypeID }) => ({ name, dataTypeID })),
+  };
+}
 
 export function getQueryPool(
   databaseName: string,
   fastifyDb?: Pool,
-): { query: (text: string, values?: any[]) => Promise<any> } {
+): Pool {
   if (fastifyDb && !(fastifyDb instanceof Pool)) {
     return fastifyDb;
   }
@@ -123,34 +158,38 @@ const queryRoutes: FastifyPluginAsync = async (fastify) => {
 
     const parameters = Array.isArray(rawParams) ? rawParams : [];
 
+    if (databasesUnderMaintenance.has(database)) {
+      return reply.code(409).send({
+        success: false,
+        error: {
+          code: "DATABASE_IN_USE",
+          message: "Database maintenance is in progress",
+        },
+      });
+    }
+
     try {
       const pool = getQueryPool(database, fastify.db);
       const start = Date.now();
-      const result = await pool.query(query, parameters);
+      const result: QueryResult | QueryResult[] = await pool.query(query, parameters);
       const durationMs = Date.now() - start;
 
-      const rows = result.rows ?? [];
-      const rowCount = result.rowCount ?? rows.length;
-      const command = result.command ?? "SELECT";
-      const fields = result.fields?.map((f: any) => ({
-        name: f.name,
-        dataTypeID: f.dataTypeID,
-      }));
+      if (Array.isArray(result)) {
+        return {
+          success: true,
+          database,
+          durationMs,
+          results: result.map(formatQueryResult),
+        };
+      }
 
+      const data = formatQueryResult(result);
       return {
         success: true,
         database,
-        command,
-        rowCount,
-        rows,
-        fields,
+        ...data,
         durationMs,
-        data: {
-          command,
-          rowCount,
-          rows,
-          fields,
-        },
+        data,
       };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);

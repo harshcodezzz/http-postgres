@@ -26,6 +26,7 @@ const loggerPlugin: FastifyPluginAsync = async (app) => {
           frequency: "daily",
           size: "20m",
           mkdir: true,
+          symlink: true,
         },
       },
     ],

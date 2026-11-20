@@ -5,7 +5,7 @@ import adminApiRoutes from "./admin-api.js";
 import adminDatabaseRoutes from "./admin-database.js";
 
 const AUDIT_LOG_FILE = resolve(process.cwd(), "logs", "api-keys.log");
-const GATEWAY_LOG_FILE = resolve(process.cwd(), "logs", "gateway.log");
+const GATEWAY_LOG_FILE = resolve(process.cwd(), "logs", "current.log");
 
 async function checkHealth(fastify: FastifyInstance) {
   let postgresHealthy = false;

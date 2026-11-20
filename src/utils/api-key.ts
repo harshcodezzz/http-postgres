@@ -185,6 +185,13 @@ export async function createApiKey(
   options: CreateApiKeyOptions,
 ): Promise<CreateApiKeyResult> {
   const { environment = "LIVE" } = options;
+  if (environment !== "LIVE" && environment !== "TEST") {
+    throw new ApiKeyError(
+      "Environment must be 'LIVE' or 'TEST'",
+      "INVALID_ENVIRONMENT",
+    );
+  }
+
   const rawDatabases =
     options.databases ?? (options.database ? [options.database] : []);
   const databases = [...new Set(rawDatabases)];

@@ -34,8 +34,12 @@ const authPlugin: FastifyPluginAsync = async (fastify) => {
   fastify.decorateRequest("database", "");
 
   fastify.addHook("onRequest", async (request, reply) => {
-    const admin = request.headers["x-admin"];
     const urlPath = request.url.split("?")[0];
+    if (urlPath === "/health" && (request.method === "GET" || request.method === "HEAD")) {
+      return;
+    }
+
+    const admin = request.headers["x-admin"];
     const isAdminRoute = urlPath === "/admin" || urlPath.startsWith("/admin/");
 
     if (isAdminRoute) {
