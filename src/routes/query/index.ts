@@ -36,7 +36,11 @@ export async function withQueryPoolMaintenance<T>(
   }
 }
 
-function formatQueryResult(result: QueryResult) {
+export function isDatabaseUnderMaintenance(database: string): boolean {
+  return databasesUnderMaintenance.has(database);
+}
+
+export function formatQueryResult(result: QueryResult) {
   const rows = result.rows ?? [];
   return {
     command: result.command ?? "SELECT",
@@ -158,7 +162,7 @@ const queryRoutes: FastifyPluginAsync = async (fastify) => {
 
     const parameters = Array.isArray(rawParams) ? rawParams : [];
 
-    if (databasesUnderMaintenance.has(database)) {
+    if (isDatabaseUnderMaintenance(database)) {
       return reply.code(409).send({
         success: false,
         error: {

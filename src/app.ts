@@ -7,7 +7,13 @@ import { registerRoutes } from "./routes/index.js";
 
 export async function buildApp() {
   const app = Fastify({
-    logger: true,
+    logger: {
+      serializers: {
+        responseTime(milliseconds: unknown) {
+          return typeof milliseconds === "number" ? milliseconds.toFixed(3) : milliseconds;
+        },
+      },
+    },
   });
 
   await registerPlugins(app);
