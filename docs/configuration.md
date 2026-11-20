@@ -27,7 +27,7 @@ The table lists loader defaults. Explicit values in [gateway.yaml](../gateway.ya
 | `database.queryProfiles` | `{}` | Maps database names to PostgreSQL logins for explicit API-key privilege sets. |
 | `database.pool.min` | `2` | Minimum size of the administrative pool, zero or greater. |
 | `database.pool.max` | `20` | Maximum size of the administrative pool and of each query pool. A database has a separate pool for its default login and each configured privilege profile. The minimum cannot exceed the maximum. |
-| `database.pool.maxGlobalQueries` | `40` | Process-wide query connection budget across all databases and profiles. Includes pending checkouts and excludes the administrative pool. |
+| `database.pool.maxGlobalQueries` | `40` | Process-wide query connection budget across all databases and profiles. Includes connections being opened or closed and excludes the administrative pool. A full per-profile pool rejects new requests before they consume global slots. |
 | `redis.enabled` | `true` | Connect to Redis on startup. Set to `false` to use an in-memory store local to the gateway process. |
 | `redis.mode` | `external` | Accepts `external` or `managed`. Both currently connect to the configured Redis URL when enabled. |
 | `redis.url` | Required when enabled | Redis connection string. |

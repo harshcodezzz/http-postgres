@@ -24,6 +24,10 @@ The gateway checks the database name, identity, and query login before running S
 
 Pass `options.arrayMode: true` to receive positional rows. Duplicate column names are preserved and `fields` follows the same order as the row. Set `options.fullResults: false` to return just the rows for each statement while retaining the API response envelope. The default includes the result metadata.
 
+By default, JSON and JSONB, dates, timestamps, intervals, and their PostgreSQL arrays are returned as PostgreSQL text so values retain their precision. Non-finite scalar floating-point values are returned as strings. Set `options.lossless: false` to use the driver's legacy conversions. Use strings for input numbers that exceed JSON's safe integer range.
+
+A query response or transaction batch can retain up to 50,000 result rows and approximately 8 MiB of result data and metadata. The gateway closes its PostgreSQL connection when a caller disconnects before commit, a result exceeds the limit, or the request deadline expires. Immediate queries have a 35-second request deadline. Transaction execution has one 60-second deadline across acquisition, all statements, and commit. If the gateway has already sent `COMMIT` and cannot confirm the outcome, verify whether it committed before retrying.
+
 ## Single-request transactions
 
 `POST /transaction/execute` accepts 1 to 100 statements and runs them in order on a single PostgreSQL connection. A statement error rolls back the batch and returns the zero-based `queryIndex`. On success, `results` contains one entry per statement with its `queryIndex`. An unconfirmed commit returns `TRANSACTION_COMMIT_FAILED`. Verify the outcome before resubmitting the batch.
@@ -118,6 +122,9 @@ Errors generally use `{"success":false,"error":{"code":"…","message":"…"}}`.
 | `409 DATABASE_IN_USE` | The database is under gateway maintenance. |
 | `413 TRANSACTION_QUEUE_LIMIT_EXCEEDED` | The transaction exceeds its statement or byte limit. |
 | `429 TRANSACTION_LIMIT_EXCEEDED` | The process has reached its transaction storage limit. |
+| `503 QUERY_POOL_BUSY` | The selected database and profile pool is full. |
+| `413 RESULT_LIMIT_EXCEEDED` | The query or batch exceeded the result budget. |
+| `504 EXECUTION_DEADLINE_EXCEEDED` | The request exceeded its execution deadline. |
 | `503 QUERY_CONNECTION_LIMIT` | The process-wide query connection budget is full. |
 | `503 QUERY_DATABASE_UNAVAILABLE` | The requested database's dedicated connection could not be opened or verified. |
 

@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
-import { DatabaseError as PostgresError, type PoolClient, type QueryConfig } from "pg";
+import { DatabaseError as PostgresError, type PoolClient, type QueryResult } from "pg";
 import { queryConnectionError, queryExecutionError } from "../../utils/query-pool.js";
+import { createResultBudget, losslessTypes, watchExecution, type ResultStatement } from "../query/execution.js";
 import { formatQueryResult } from "../query/index.js";
 import { beginStatement, transactionOptions, type TransactionOptions } from "../query/options.js";
 
@@ -139,31 +140,41 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
     reply: FastifyReply,
     immediate = false,
   ) {
+    const execution = watchExecution(reply, 60_000);
+    const resultBudget = createResultBudget(execution);
     transaction.status = "committing";
     let client: PoolClient | undefined;
     let commitSent = false;
     let queryId: string | undefined;
     try {
-      client = await fastify.queryPools.connect(transaction.database, transaction.databaseOid, scopes);
-      await client.query(beginStatement(transaction.options));
+      const acquired = await execution.wait(fastify.queryPools.connect(transaction.database, transaction.databaseOid, scopes).then((connection) => {
+        execution.attach(connection);
+        return connection;
+      }));
+      client = acquired;
+      await execution.wait(client.query(beginStatement(transaction.options)));
+      execution.check();
       // Establish the snapshot before user SQL can try to change isolation or enable writes.
-      if (hasTransactionModes(transaction.options)) await client.query("SELECT 1");
+      if (hasTransactionModes(transaction.options)) await execution.wait(client.query("SELECT 1"));
       const results = [];
       for (const queued of transaction.queries.values()) {
+        execution.check();
         queryId = queued.queryId;
         // The extended protocol permits one SQL statement per queued query.
-        const statement: QueryConfig & { queryMode: "extended"; rowMode?: "array" } = {
+        const statement: ResultStatement = {
           text: queued.query,
+          types: transaction.options.lossless === false ? undefined : losslessTypes,
           values: JSON.parse(queued.serializedParameters),
           queryMode: "extended",
           rowMode: transaction.options.arrayMode ? "array" : undefined,
         };
-        const result = await client.query(statement);
+        const result = await execution.wait(resultBudget.query(client, statement)) as QueryResult;
         results.push({ ...(immediate ? { queryIndex: results.length } : { queryId }), ...formatQueryResult(result, transaction.options.fullResults) });
       }
+      execution.check();
       queryId = undefined;
       commitSent = true;
-      const result = await client.query("COMMIT");
+      const result = await execution.wait(client.query("COMMIT"));
       if (result.command === "ROLLBACK") {
         transaction.status = "pending";
         return fail(reply, 400, "TRANSACTION_ROLLED_BACK", "PostgreSQL rolled back the transaction");
@@ -188,14 +199,18 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
         fastify.log.error({ err: error, transactionId: transaction.transactionId }, "Commit could not be confirmed");
         return fail(reply, 500, "TRANSACTION_COMMIT_FAILED", "The commit could not be confirmed");
       }
-      if (client) {
+      if (client && !execution.stopped) {
         try {
-          await client.query("ROLLBACK");
+          await execution.wait(client.query("ROLLBACK"));
         } catch (rollbackError) {
           fastify.log.error({ err: rollbackError }, "Failed to roll back transaction");
         }
       }
       transaction.status = "pending";
+      if (execution.stopped) {
+        const { status, code, message } = execution.stopped;
+        return fail(reply, status, code, message);
+      }
       if (!client) {
         const { status, code, message } = queryConnectionError(error);
         if (status === 503) fastify.log.error({ err: error }, "Failed to open transaction connection");
@@ -205,11 +220,17 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
         const result = queryExecutionError(error);
         return reply.code(result.status).send({ success: false, error: { ...result.error, ...(immediate ? { queryIndex: Number(queryId) } : { queryId }) } });
       }
+      if (error instanceof PostgresError) {
+        const result = queryExecutionError(error);
+        return reply.code(error.code === "57014" ? 504 : 503).send({
+          success: false, error: { ...result.error, code: "TRANSACTION_UNAVAILABLE" },
+        });
+      }
       fastify.log.error({ err: error }, "Failed to start transaction");
       return fail(reply, 503, "TRANSACTION_UNAVAILABLE", "Could not start the PostgreSQL transaction");
     } finally {
       // Discard session-level changes made by queued SQL.
-      client?.release(true);
+      execution.close();
       transaction.expiresAt = Date.now() + retentionMs;
     }
   }

@@ -1,7 +1,8 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
-import type { PoolClient, QueryConfig, QueryResult } from "pg";
+import type { PoolClient, QueryResult } from "pg";
 import { queryConnectionError, queryExecutionError } from "../../utils/query-pool.js";
 
+import { createResultBudget, losslessTypes, watchExecution, type ResultStatement } from "./execution.js";
 import { resultOptions } from "./options.js";
 
 interface QueryBody {
@@ -57,22 +58,32 @@ const queryRoutes: FastifyPluginAsync = async (fastify) => {
     }
     const options = parsed.data;
     const start = Date.now();
+    const execution = watchExecution(reply, 35_000);
     let client: PoolClient;
     try {
-      client = await fastify.queryPools.connect(database, databaseOid, queryScopes);
+      client = await execution.wait(fastify.queryPools.connect(database, databaseOid, queryScopes).then((connection) => {
+        execution.attach(connection);
+        return connection;
+      }));
     } catch (err) {
+      execution.close();
+      if (execution.stopped) {
+        const { status, code, message } = execution.stopped;
+        return reply.code(status).send({ success: false, error: { code, message } });
+      }
       const { status, code, message } = queryConnectionError(err);
       if (status === 503) request.log.error({ err, database }, "Could not open query connection");
       return reply.code(status).send({ success: false, error: { code, message } });
     }
 
     try {
-      const statement: QueryConfig & { rowMode?: "array" } = {
+      const statement: ResultStatement = {
         text: body.query,
+        types: options.lossless === false ? undefined : losslessTypes,
         values: parameters ?? [],
         rowMode: options.arrayMode ? "array" : undefined,
       };
-      const result: QueryResult | QueryResult[] = await client.query(statement);
+      const result: QueryResult | QueryResult[] = await execution.wait(createResultBudget(execution).query(client, statement));
       const durationMs = Date.now() - start;
       if (Array.isArray(result)) {
         return {
@@ -86,10 +97,14 @@ const queryRoutes: FastifyPluginAsync = async (fastify) => {
       const data = formatQueryResult(result, options.fullResults);
       return { success: true, database, ...data, durationMs, data };
     } catch (err) {
+      if (execution.stopped) {
+        const { status, code, message } = execution.stopped;
+        return reply.code(status).send({ success: false, error: { code, message } });
+      }
       const { status, error } = queryExecutionError(err);
       return reply.code(status).send({ success: false, error });
     } finally {
-      client.release(true);
+      execution.close();
     }
   };
 

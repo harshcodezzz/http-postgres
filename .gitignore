@@ -1,6 +1,9 @@
 # Dependencies
 node_modules/
 
+# Local agent instructions
+/AGENTS.md
+
 # Production build output
 dist/
 

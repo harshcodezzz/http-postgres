@@ -83,6 +83,9 @@ export function createQueryPools(adminRoles: string[], log: FastifyBaseLogger) {
       databasePools.set(poolKey, pool);
     }
 
+    if (pool.totalCount >= config.database.pool.max && pool.idleCount === 0) {
+      throw new DatabaseError("The database query pool is busy", "QUERY_POOL_BUSY");
+    }
     queryConnections++;
     let client: PoolClient;
     try {

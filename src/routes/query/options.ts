@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 export const resultOptions = z.strictObject({
+  lossless: z.boolean().optional(),
   arrayMode: z.boolean().optional(),
   fullResults: z.boolean().optional(),
 });
