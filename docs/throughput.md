@@ -47,6 +47,34 @@ DB_NAME=mydb B1_VUS=8 API_KEY="$API_KEY" k6 run benchmark/b1.js
 
 Use 12 and 16 VUs only as saturation checks. The updated arrival profile starts at 25 requests per second and ramps to 200 requests per second, which can be changed with `B1_ARRIVAL_MAX_RATE`.
 
+## Social endurance workload
+
+The one-hour social-media workload uses joins, indexed lookups, multi-row responses, inserts, updates, foreign-key checks, and growing tables. It ramps through 50, 100, and 150 requests per second and targets p95 below 600 ms for the MacBook-to-VPS path. [Runbook and workload details](../benchmark/social.md)
+
+## B3–B6 application workloads
+
+| Script | Workload | Reads | Writes | Normal RPS | Peak RPS |
+| --- | --- | ---: | ---: | ---: | ---: |
+| [B3](../benchmark/b3.js) | Authentication | 95% | 5% | 75 | 150 |
+| [B4](../benchmark/b4.js) | Analytics | 20% | 80% | 50 | 125 |
+| [B5](../benchmark/b5.js) | Ticketing system | 85% | 15% | 30 | 100 |
+| [B6](../benchmark/b6.js) | Chat application | 65% | 35% | 50 | 150 |
+
+Load the synthetic fixture as an administrator in a dedicated benchmark database. The fixture grants access to `http_postgres_benchmark_crud` by default. Pass `-v query_role=your_role` if the API key's database profile uses a different login.
+
+```bash
+psql -X -U myuser -d mydb -f benchmark/workloads.sql
+```
+
+Run each rate separately with the same `API_KEY`, `BASE_URL`, and `DB_NAME` settings. Each run schedules one query request per iteration for 60 seconds by default.
+
+```bash
+DB_NAME=mydb API_KEY="$API_KEY" k6 run benchmark/b3.js
+DB_NAME=mydb API_KEY="$API_KEY" WORKLOAD_LEVEL=peak k6 run benchmark/b3.js
+```
+
+Use `WORKLOAD_DURATION`, `WORKLOAD_PRE_ALLOCATED_VUS`, and `WORKLOAD_MAX_VUS` to change the duration and k6 worker allocation. The `workload_reads`, `workload_writes`, `workload_errors`, and `workload_latency` metrics cover requests sent after setup. Check `dropped_iterations` to see whether k6 could sustain the configured rate.
+
 ## Reproduce the local starting run
 
 Set `database.pool` to the following values in `gateway.yaml` and restart the local gateway. [Pool configuration](configuration.md#yaml-settings)
