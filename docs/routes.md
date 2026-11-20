@@ -34,9 +34,13 @@ A query response or transaction batch can retain up to 50,000 result rows and ap
 
 `POST /transaction/execute` accepts 1 to 100 statements in an ordered JSON array. Each entry can be a SQL string or an object with `query` and optional `parameters`. An outer `BEGIN` and `COMMIT` pair is optional. The gateway manages the actual transaction boundary. Use an array so statements keep their order and repeated JSON keys cannot overwrite them.
 
-The gateway saves the batch in PostgreSQL and returns `202 Accepted` with `transactionId`, `status: "pending"`, and a `Location` header. Poll `GET /transaction/:id` or `GET /transaction` with the `transaction-id` header using the same API key and database. The lookup returns `progress.completed` and `progress.total` while the batch runs. Accepted work continues if the submission request disconnects.
+The gateway saves the batch in PostgreSQL and returns `202 Accepted` with `transactionId`, `status: "pending"`, and a `Location` header. Poll `GET /transaction/:id` or `GET /transaction` with the `transaction-id` header using the same API key and database. The lookup returns `progress.completed` and `progress.total` while the batch runs. Saved completion counts only move forward. Accepted work continues if the submission request disconnects.
 
-Set an `Idempotency-Key` before the first submission if you might retry it. Use 1 to 128 letters, digits, or `._~-`. Within the same API key and database, repeating the key with the same normalized batch returns the original `202` receipt and transaction ID. Reusing the key for different SQL, parameters, or options returns `409 IDEMPOTENCY_KEY_CONFLICT`. The key remains reserved until the configured retention period has elapsed and the transaction record is gone.
+Set an `Idempotency-Key` before the first submission if you might retry it. Use 1 to 128 letters, digits, or `._~-`. Within the same API key and database, repeating the key with the same normalized batch returns `200 OK` with the original transaction ID, its current `status` and `finalized` flag, and a `Location` to poll for progress and results. Reusing the key for different SQL, parameters, or options returns `409 IDEMPOTENCY_KEY_CONFLICT`.
+
+The fingerprint ignores the order of option fields and treats explicit result-format defaults like omitted values. SQL text, statement order, parameter order, and the order of object keys inside SQL parameters remain significant because PostgreSQL can observe them. Tombstones created by an earlier release with only the original fingerprint accept replays of the original normalized input.
+
+Removing a keyed record deletes its inputs and results. The gateway keeps a tombstone with the original transaction ID, final status, and removal time for the configured retention period after removal. Replays and status lookups return `410 TRANSACTION_RECORD_REMOVED` while that tombstone exists. Records removed before this change can have a tombstone without the final status or removal time.
 
 The first shutdown signal stops the server and lets accepted batches finish. A second signal forces an exit. Set the service manager's shutdown grace period to accommodate the 60-second execution deadline and transaction-store writes.
 
@@ -93,7 +97,7 @@ If a statement fails, the gateway rolls back and returns the failing `queryId`. 
 | Method and path | Behavior |
 | --- | --- |
 | `GET /admin` | Returns the admin service identity. |
-| `GET /admin/health` | Checks the configured PostgreSQL connection, key-value store, and JsonDB. The response body reports `healthy` or `degraded`. |
+| `GET /admin/health` | Checks PostgreSQL, the key-value store, JsonDB, and query-connection monitoring. Includes query capacity metrics and reports `healthy` or `degraded`. |
 | `GET /admin/logs` | Accepts `type=audit` (default) or `type=system`. `limit` defaults to 100 and is capped at 500. System logs come from the current file. Audit logs include the previous generation when needed. Reads scan up to 1 MiB per file. |
 | `GET /admin/keys` | Lists API key records. |
 | `GET /admin/keys/:id` | Gets one API key record by its record ID. |

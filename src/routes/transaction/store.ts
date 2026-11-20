@@ -1,11 +1,35 @@
 import type { Pool } from "pg";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
+import type { TransactionOptions } from "../query/options.js";
 
-type TransactionInput = { queries: unknown[]; options: unknown };
+type TransactionInput = {
+  queries: { query: string; parameters: unknown[] }[];
+  options: TransactionOptions;
+};
 type TransactionOutcome = { status: number; payload: object };
 type FinalStatus = "committed" | "rejected" | "failed" | "unknown";
 const pruneBatchSize = 500;
+const transactionIdPattern = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i;
+const saveTombstones = `
+  UPDATE http_postgres_gateway.submission_keys AS submission
+  SET removed_at = clock_timestamp(), final_status = removed.status
+  FROM removed
+  WHERE submission.transaction_id = removed.id AND submission.owner = removed.owner
+    AND submission.database_oid = removed.database_oid
+`;
+
+export interface RemovedExecution {
+  id: string;
+  lastStatus: FinalStatus | null;
+  removedAt: Date | null;
+}
+
+export interface SavedSubmission extends RemovedExecution {
+  matches: boolean;
+  status: string | null;
+  expired: boolean;
+}
 interface StoredTransaction {
   transactionId: string;
   status: string;
@@ -28,8 +52,23 @@ function decodePayload<T>(payload: T | string): T {
     : payload;
 }
 
-function inputHash(input: TransactionInput) {
+function inputHash(input: object) {
   return createHash("sha256").update(JSON.stringify(input)).digest("hex");
+}
+
+function canonicalInputHash({ queries, options }: TransactionInput) {
+  const normalizedOptions = {
+    ...options,
+    arrayMode: options.arrayMode === true,
+    fullResults: options.fullResults !== false,
+    lossless: options.lossless !== false,
+  };
+  const sortedOptions = Object.entries(normalizedOptions).sort(([a], [b]) => a < b ? -1 : Number(a > b));
+  return inputHash({
+    // The PostgreSQL driver can send a parameter object as order-sensitive JSON text.
+    queries: queries.map(({ query, parameters }) => ({ query, parameters })),
+    options: Object.fromEntries(sortedOptions),
+  });
 }
 
 export function createTransactionStore(pool: Pool) {
@@ -81,10 +120,28 @@ export function createTransactionStore(pool: Pool) {
             database_oid text NOT NULL,
             key text NOT NULL,
             input_hash text NOT NULL,
+            canonical_hash text,
             transaction_id uuid NOT NULL,
             created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+            removed_at timestamptz,
+            final_status text,
             PRIMARY KEY (owner, database_oid, key)
           );
+        END IF;
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_catalog.pg_attribute
+          WHERE attrelid = 'http_postgres_gateway.submission_keys'::pg_catalog.regclass
+            AND attname = 'canonical_hash' AND NOT attisdropped
+        ) THEN
+          ALTER TABLE http_postgres_gateway.submission_keys ADD COLUMN canonical_hash text;
+        END IF;
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_catalog.pg_attribute
+          WHERE attrelid = 'http_postgres_gateway.submission_keys'::pg_catalog.regclass
+            AND attname = 'removed_at' AND NOT attisdropped
+        ) THEN
+          ALTER TABLE http_postgres_gateway.submission_keys
+            ADD COLUMN removed_at timestamptz, ADD COLUMN final_status text;
         END IF;
         IF pg_catalog.to_regclass('http_postgres_gateway.transactions_retention_idx') IS NULL THEN
           CREATE INDEX transactions_retention_idx ON http_postgres_gateway.transactions (updated_at)
@@ -92,6 +149,9 @@ export function createTransactionStore(pool: Pool) {
         END IF;
         IF pg_catalog.to_regclass('http_postgres_gateway.submission_keys_retention_idx') IS NULL THEN
           CREATE INDEX submission_keys_retention_idx ON http_postgres_gateway.submission_keys (created_at);
+        END IF;
+        IF pg_catalog.to_regclass('http_postgres_gateway.submission_keys_transaction_idx') IS NULL THEN
+          CREATE INDEX submission_keys_transaction_idx ON http_postgres_gateway.submission_keys (transaction_id);
         END IF;
       END; $bootstrap$;
     `).catch((error) => {
@@ -102,12 +162,25 @@ export function createTransactionStore(pool: Pool) {
 
   async function getSubmission(owner: string, oid: string, key: string, input: TransactionInput) {
     await ensure();
-    const { rows: [existing] } = await pool.query<{ id: string; matches: boolean }>(`
-      SELECT transaction_id AS id, input_hash = $4 AS matches
-      FROM http_postgres_gateway.submission_keys
-      WHERE owner = $1 AND database_oid = $2 AND key = $3
-    `, [owner, oid, key, inputHash(input)]);
-    if (existing) return { ...existing, created: false };
+    const canonicalHash = canonicalInputHash(input);
+    const { rows: [existing] } = await pool.query<SavedSubmission & { legacyInput: TransactionInput | string | null }>(`
+      SELECT submission.transaction_id AS id, execution.status,
+             (submission.input_hash = $4 OR submission.canonical_hash IS NOT DISTINCT FROM $5) AS matches,
+             CASE WHEN submission.canonical_hash IS NULL AND submission.input_hash <> $4
+               THEN execution.input END AS "legacyInput",
+             submission.final_status AS "lastStatus", submission.removed_at AS "removedAt",
+             COALESCE(execution.deadline <= statement_timestamp(), false) AS expired
+      FROM http_postgres_gateway.submission_keys AS submission
+      LEFT JOIN http_postgres_gateway.transactions AS execution ON execution.id = submission.transaction_id
+        AND execution.owner = submission.owner AND execution.database_oid = submission.database_oid
+      WHERE submission.owner = $1 AND submission.database_oid = $2 AND submission.key = $3
+    `, [owner, oid, key, inputHash(input), canonicalHash]);
+    if (existing) {
+      const { legacyInput, ...submission } = existing;
+      const matches = submission.matches ||
+        (legacyInput !== null && canonicalInputHash(decodePayload(legacyInput)) === canonicalHash);
+      return { ...submission, matches, created: false as const };
+    }
   }
 
   async function create(
@@ -123,21 +196,23 @@ export function createTransactionStore(pool: Pool) {
     } else {
       const result = await pool.query(`
         WITH claimed AS (
-          INSERT INTO http_postgres_gateway.submission_keys (owner, database_oid, key, input_hash, transaction_id)
-          VALUES ($2, $4, $6, $7, $1)
+          INSERT INTO http_postgres_gateway.submission_keys (
+            owner, database_oid, key, input_hash, canonical_hash, transaction_id
+          )
+          VALUES ($2, $4, $6, $7, $8, $1)
           ON CONFLICT (owner, database_oid, key) DO NOTHING
           RETURNING transaction_id
         )
         INSERT INTO http_postgres_gateway.transactions (id, owner, database_name, database_oid, status, input)
         SELECT transaction_id, $2, $3, $4, 'pending', $5 FROM claimed
-      `, [...values, key, inputHash(input)]);
+      `, [...values, key, inputHash(input), canonicalInputHash(input)]);
       if (result.rowCount === 0) {
         const submission = await getSubmission(owner, oid, key, input);
         if (!submission) throw new Error("The idempotency record could not be read");
         return submission;
       }
     }
-    return { id, matches: true, created: true };
+    return { id, created: true as const };
   }
 
   async function advance(
@@ -145,7 +220,7 @@ export function createTransactionStore(pool: Pool) {
   ) {
     const result = await pool.query(`
       UPDATE http_postgres_gateway.transactions
-      SET status = $3, completed = COALESCE($4, completed), updated_at = clock_timestamp(),
+      SET status = $3, completed = GREATEST(completed, $4), updated_at = clock_timestamp(),
           prepared_outcome = COALESCE($5, prepared_outcome)
       WHERE id = $1 AND status = $2 AND deadline > clock_timestamp()
     `, [id, previous, status, completed ?? null, outcome ? encodePayload(outcome) : null]);
@@ -181,7 +256,7 @@ export function createTransactionStore(pool: Pool) {
 
   // A rename changes the label but preserves the database OID.
   async function get(id: string, owner: string, oid: string) {
-    if (!/^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i.test(id)) return;
+    if (!transactionIdPattern.test(id)) return;
     // Status lookup must not need schema-creation privileges for existing deployments.
     try {
       const { rows } = await pool.query<StoredTransaction>(`
@@ -206,21 +281,46 @@ export function createTransactionStore(pool: Pool) {
     }
   }
 
+  async function getRemoved(id: string, owner: string, oid: string) {
+    if (!transactionIdPattern.test(id)) return;
+    try {
+      const { rows: [record] } = await pool.query<RemovedExecution>(`
+        SELECT transaction_id AS id,
+               to_jsonb(submission)->>'final_status' AS "lastStatus",
+               (to_jsonb(submission)->>'removed_at')::timestamptz AS "removedAt"
+        FROM http_postgres_gateway.submission_keys AS submission
+        WHERE transaction_id = $1 AND owner = $2 AND database_oid = $3
+          AND NOT EXISTS (
+            SELECT 1 FROM http_postgres_gateway.transactions WHERE id = submission.transaction_id
+          )
+      `, [id, owner, oid]);
+      return record;
+    } catch (error) {
+      if (error instanceof Error && "code" in error && (error.code === "42P01" || error.code === "3F000")) return;
+      throw error;
+    }
+  }
+
   async function remove(id: string, owner: string, oid: string) {
+    await ensure();
     const result = await pool.query(`
-      DELETE FROM http_postgres_gateway.transactions
-      WHERE id = $1 AND owner = $2 AND database_oid = $3
-        AND status IN ('committed', 'rejected', 'failed', 'unknown')
+      WITH removed AS (
+        DELETE FROM http_postgres_gateway.transactions
+        WHERE id = $1 AND owner = $2 AND database_oid = $3
+          AND status IN ('committed', 'rejected', 'failed', 'unknown')
+        RETURNING id, owner, database_oid, status
+      ), tombstones AS (${saveTombstones})
+      SELECT id FROM removed
     `, [id, owner, oid]);
     return result.rowCount === 1;
   }
 
   async function prune(retentionDays: number) {
-    const { rows: [tables] } = await pool.query<{ hasRecords: boolean; hasKeys: boolean }>(`
-      SELECT pg_catalog.to_regclass('http_postgres_gateway.transactions') IS NOT NULL AS "hasRecords",
-             pg_catalog.to_regclass('http_postgres_gateway.submission_keys') IS NOT NULL AS "hasKeys"
+    const { rows: [tables] } = await pool.query<{ hasRecords: boolean }>(`
+      SELECT pg_catalog.to_regclass('http_postgres_gateway.transactions') IS NOT NULL AS "hasRecords"
     `);
     if (!tables?.hasRecords) return false;
+    await ensure();
     const records = await pool.query(`
       WITH expired AS (
         SELECT id FROM http_postgres_gateway.transactions
@@ -228,15 +328,18 @@ export function createTransactionStore(pool: Pool) {
           AND updated_at <= statement_timestamp() - pg_catalog.make_interval(days => $1)
         ORDER BY updated_at
         LIMIT $2 FOR UPDATE SKIP LOCKED
-      )
-      DELETE FROM http_postgres_gateway.transactions AS transaction
-      USING expired WHERE transaction.id = expired.id
+      ), removed AS (
+        DELETE FROM http_postgres_gateway.transactions AS execution
+        USING expired WHERE execution.id = expired.id
+        RETURNING execution.id, execution.owner, execution.database_oid, execution.status
+      ), tombstones AS (${saveTombstones})
+      SELECT id FROM removed
     `, [retentionDays, pruneBatchSize]);
-    if (!tables.hasKeys) return records.rowCount === pruneBatchSize;
     const keys = await pool.query(`
       WITH expired AS (
         SELECT owner, database_oid, key FROM http_postgres_gateway.submission_keys AS submission
         WHERE created_at <= statement_timestamp() - pg_catalog.make_interval(days => $1)
+          AND (removed_at IS NULL OR removed_at <= statement_timestamp() - pg_catalog.make_interval(days => $1))
           AND NOT EXISTS (
             SELECT 1 FROM http_postgres_gateway.transactions WHERE id = submission.transaction_id
           )
@@ -251,5 +354,5 @@ export function createTransactionStore(pool: Pool) {
     return records.rowCount === pruneBatchSize || keys.rowCount === pruneBatchSize;
   }
 
-  return { create, getSubmission, advance, finish, get, remove, prune };
+  return { create, getSubmission, advance, finish, get, getRemoved, remove, prune };
 }

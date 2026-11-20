@@ -6,6 +6,8 @@ Run PostgreSQL queries over HTTP with database-scoped API keys. The gateway supp
 
 Use Node.js 22.13+ on the 22.x line or Node.js 23.4+, with npm and a running PostgreSQL server. The supplied configuration also expects a running Redis server. For local development without Redis, set `redis.enabled` to `false` in `gateway.yaml`.
 
+The gateway checks the Node.js version and built-in SQLite module at startup. Use a Node.js build with `node:sqlite` enabled for the JsonDB lock.
+
 ```sh
 npm ci
 cp .env.example .env

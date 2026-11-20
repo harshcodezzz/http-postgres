@@ -1,4 +1,4 @@
-import { createTransactionStore } from "./store.js";
+import { createTransactionStore, type RemovedExecution, type SavedSubmission } from "./store.js";
 import { randomUUID } from "node:crypto";
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 import config from "../../config/index.js";
@@ -59,6 +59,22 @@ function canQueue(sql: string, options: TransactionOptions) {
 
 function fail(reply: FastifyReply, status: number, code: string, message: string) {
   return reply.code(status).send({ success: false, error: { code, message } });
+}
+
+function executionStatus(status: string, expired: boolean) {
+  const finalized = ["committed", "rejected", "failed", "unknown"].includes(status);
+  const stalled = expired && !finalized;
+  return { status: stalled ? (status === "committing" ? "unknown" : "failed") : status, finalized };
+}
+
+function sendRemoved(reply: FastifyReply, { id, lastStatus, removedAt }: RemovedExecution) {
+  return reply.code(410).send({
+    success: false,
+    transactionId: id,
+    ...(lastStatus && { lastStatus }),
+    ...(removedAt && { removedAt }),
+    error: { code: "TRANSACTION_RECORD_REMOVED", message: "The execution record was removed" },
+  });
 }
 
 const transactionRoutes: FastifyPluginAsync = async (fastify) => {
@@ -375,9 +391,12 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
         success: true, transactionId: id, status: "pending",
       });
     }
-    function replay({ id, matches }: { id: string; matches: boolean }) {
-      return matches ? accept(id) :
-        fail(reply, 409, "IDEMPOTENCY_KEY_CONFLICT", "This key already belongs to a different batch");
+    function replay(submission: SavedSubmission) {
+      if (!submission.matches) return fail(reply, 409, "IDEMPOTENCY_KEY_CONFLICT", "This key already belongs to a different batch");
+      if (submission.status === null) return sendRemoved(reply, submission);
+      return reply.header("Location", `/transaction/${submission.id}`).code(200).send({
+        success: true, transactionId: submission.id, ...executionStatus(submission.status, submission.expired),
+      });
     }
     let reserved = false;
     const transactionId = transaction.transactionId;
@@ -523,11 +542,13 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
     if (queued) return describeQueued(queued);
     try {
       const record = await storedTransaction(request, id);
-      if (!record) return fail(reply, 404, "TRANSACTION_NOT_FOUND", "Transaction not found");
+      if (!record) {
+        const removed = await store.getRemoved(id, request.apiKey?.id ?? "", request.databaseOid);
+        return removed ? sendRemoved(reply, removed) : fail(reply, 404, "TRANSACTION_NOT_FOUND", "Transaction not found");
+      }
       const { expired, input, outcome, completedQueries, ...metadata } = record;
-      const finalized = ["committed", "rejected", "failed", "unknown"].includes(record.status);
+      const { status, finalized } = executionStatus(record.status, expired);
       const abandoned = expired && !finalized;
-      const status = abandoned ? (record.status === "committing" ? "unknown" : "failed") : record.status;
       const abandonedError = abandoned && {
         code: status === "unknown" ? "TRANSACTION_COMMIT_FAILED" : "TRANSACTION_INTERRUPTED",
         message: status === "unknown" ? "The commit could not be confirmed" : "The transaction did not finish",

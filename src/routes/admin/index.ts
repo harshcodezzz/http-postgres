@@ -38,7 +38,9 @@ async function checkHealth(fastify: FastifyInstance) {
     jsondbHealthy = false;
   }
 
-  const isHealthy = postgresHealthy && redisHealthy && jsondbHealthy;
+  const queryConnections = fastify.queryPools.capacity();
+  const isHealthy = postgresHealthy && redisHealthy && jsondbHealthy &&
+    queryConnections.monitoring.status !== "degraded";
 
   return {
     success: true,
@@ -57,6 +59,7 @@ async function checkHealth(fastify: FastifyInstance) {
       jsondb: {
         status: jsondbHealthy ? "up" : "down",
       },
+      queryConnections,
     },
   };
 }

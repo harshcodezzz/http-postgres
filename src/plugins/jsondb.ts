@@ -4,8 +4,24 @@ import { lstat, mkdir, readFile, writeFile, rename, unlink } from "node:fs/promi
 import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { resolve, dirname } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
 import type { DatabaseScopes } from "../config/query-privileges.js";
+
+let sqlite: Promise<typeof import("node:sqlite")> | undefined;
+
+function loadSQLite() {
+  // Keep the supported release ranges in sync with package.json.
+  const [major, minor] = process.versions.node.split(".").map(Number);
+  if (major < 22 || (major === 22 && minor < 13) || (major === 23 && minor < 4)) {
+    throw new Error(`Node.js 22.13+ on the 22.x line or 23.4+ is required. Running ${process.versions.node}.`);
+  }
+  return sqlite ??= import("node:sqlite").then((module) => {
+    if (typeof module.DatabaseSync !== "function") throw new Error("SQLite DatabaseSync is unavailable");
+    return module;
+  }).catch((cause) => {
+    throw new Error("JsonDB requires an enabled node:sqlite module. Use a supported Node.js build and enable SQLite.", { cause });
+  });
+}
 
 export interface ApiKeyRecord {
   id: string;
@@ -39,6 +55,7 @@ export class JsonDB {
   }
 
   private async withLock<T>(operation: () => Promise<T>): Promise<T> {
+    const { DatabaseSync } = await loadSQLite();
     await mkdir(this.dirPath, { recursive: true });
     const lockPath = `${this.filePath}.lock`;
     const deadline = performance.now() + 5_000;
@@ -171,6 +188,7 @@ const jsondbPlugin: FastifyPluginAsync<JsonDBPluginOptions> = async (
   app,
   opts,
 ) => {
+  await loadSQLite();
   const db = new JsonDB(opts.path);
 
   await db.ensureExists(opts.initialData);

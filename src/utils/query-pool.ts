@@ -24,17 +24,42 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
   const maintenance = new Set<string>();
   const reservedClients = new WeakSet<PoolClient>();
   const backends = new WeakMap<PoolClient, BackendSession>();
-  const closingBackends = new Set<BackendSession>();
+  const closingBackends = new Map<BackendSession, number>();
   let closeCheck: NodeJS.Timeout | undefined;
-  let closeCheckFailed = false;
+  let monitoringFailure: {
+    reason: "server_mismatch" | "observer_error";
+    since: string;
+    consecutiveFailures: number;
+  } | null = null;
+  let lastSuccessfulCheckAt: string | null = null;
+  let rejectionsAtLimit = 0;
   let closed = false;
+
+  function capacity() {
+    const limit = config.database.pool.maxGlobalQueries;
+    const oldest = closingBackends.values().next().value;
+    return {
+      limit,
+      reserved: queryConnections,
+      available: Math.max(0, limit - queryConnections),
+      awaitingVerification: closingBackends.size,
+      oldestUnverifiedMs: oldest === undefined ? null : Math.floor(performance.now() - oldest),
+      rejectionsAtLimit,
+      monitoring: {
+        status: monitoringFailure ? "degraded" : closingBackends.size ? "checking" : "idle",
+        failure: monitoringFailure,
+        lastSuccessfulCheckAt,
+      },
+    };
+  }
 
   function scheduleCloseCheck(waitMs: number) {
     if (closed || closeCheck || closingBackends.size === 0) return;
     closeCheck = setTimeout(async () => {
       let nextDelay = 100;
+      let serverMismatch = false;
       try {
-        const sessions = [...closingBackends];
+        const sessions = [...closingBackends.keys()];
         const { rows } = await adminDb.query<{
           serverStartedAt: string;
           pid: number | null;
@@ -54,7 +79,6 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
         const observedServer = rows[0]?.serverStartedAt;
         if (!observedServer) throw new Error("PostgreSQL did not identify the monitoring server");
         const byPid = new Map(rows.map((row) => [row.pid, row]));
-        let serverMismatch = false;
         for (const session of sessions) {
           if (session.serverStartedAt !== observedServer) {
             serverMismatch = true;
@@ -68,10 +92,20 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
           if ((!original || reset) && closingBackends.delete(session)) queryConnections--;
         }
         if (serverMismatch) throw new Error("PostgreSQL backend checks reached a different server");
-        closeCheckFailed = false;
+        const recovered = monitoringFailure !== null;
+        monitoringFailure = null;
+        lastSuccessfulCheckAt = new Date().toISOString();
+        if (recovered) log.info({ capacity: capacity() }, "Query backend monitoring recovered");
       } catch (err) {
-        if (!closed && !closeCheckFailed) log.warn({ err }, "Could not verify that closed query backends finished");
-        closeCheckFailed = true;
+        if (closed) return;
+        const reason = serverMismatch ? "server_mismatch" : "observer_error";
+        const changed = monitoringFailure?.reason !== reason;
+        monitoringFailure = {
+          reason,
+          since: monitoringFailure?.since ?? new Date().toISOString(),
+          consecutiveFailures: (monitoringFailure?.consecutiveFailures ?? 0) + 1,
+        };
+        if (changed) log.warn({ err, capacity: capacity() }, "Could not verify that closed query backends finished");
         nextDelay = 1_000;
       } finally {
         closeCheck = undefined;
@@ -126,6 +160,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
       throw new DatabaseError("Query credentials are unavailable for this database", "QUERY_DATABASE_UNAVAILABLE");
     }
     if (queryConnections >= config.database.pool.maxGlobalQueries) {
+      rejectionsAtLimit++;
       throw new DatabaseError("The gateway query connection budget is exhausted", "QUERY_CONNECTION_LIMIT");
     }
     let databasePools = pools.get(database);
@@ -147,7 +182,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
         if (!reservedClients.delete(client)) return;
         const session = backends.get(client);
         if (session && !closed && !session.idle) {
-          closingBackends.add(session);
+          closingBackends.set(session, performance.now());
           scheduleCloseCheck(0);
         } else {
           queryConnections--;
@@ -256,7 +291,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
     }
   }
 
-  return { connect, queryDispatched, withMaintenance, close };
+  return { connect, queryDispatched, withMaintenance, capacity, close };
 }
 
 export type QueryPools = ReturnType<typeof createQueryPools>;
