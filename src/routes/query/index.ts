@@ -72,7 +72,7 @@ const queryRoutes: FastifyPluginAsync = async (fastify) => {
         return reply.code(status).send({ success: false, error: { code, message } });
       }
       const { status, code, message } = queryConnectionError(err);
-      if (status === 503) request.log.error({ err, database }, "Could not open query connection");
+      if (code === "QUERY_DATABASE_UNAVAILABLE") request.log.error({ err, database }, "Could not open query connection");
       return reply.code(status).send({ success: false, error: { code, message } });
     }
 

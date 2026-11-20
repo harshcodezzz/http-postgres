@@ -33,6 +33,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
   } | null = null;
   let lastSuccessfulCheckAt: string | null = null;
   let rejectionsAtLimit = 0;
+  let rejectionsAtPoolLimit = 0;
   let closed = false;
 
   function capacity() {
@@ -45,6 +46,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
       awaitingVerification: closingBackends.size,
       oldestUnverifiedMs: oldest === undefined ? null : Math.floor(performance.now() - oldest),
       rejectionsAtLimit,
+      rejectionsAtPoolLimit,
       monitoring: {
         status: monitoringFailure ? "degraded" : closingBackends.size ? "checking" : "idle",
         failure: monitoringFailure,
@@ -192,6 +194,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
     }
 
     if (pool.totalCount >= config.database.pool.max && pool.idleCount === 0) {
+      rejectionsAtPoolLimit++;
       throw new DatabaseError("The database query pool is busy", "QUERY_POOL_BUSY");
     }
     queryConnections++;

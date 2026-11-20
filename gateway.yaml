@@ -1,16 +1,21 @@
 version: 1
 
 server:
-  host: "0.0.0.0"
+  host: "127.0.0.1"
   port: 8080
 
 database:
   url: "${DATABASE_URL:-postgresql://postgres:postgres@127.0.0.1:5432/postgres}"
   queryUrls: {}
-  queryProfiles: {}
+  queryProfiles:
+    postgres:
+      - scopes: [SELECT, INSERT, UPDATE, DELETE]
+        role: http_postgres_benchmark_crud
+        url: "${BENCHMARK_DATABASE_URL:-postgresql://http_postgres_benchmark_crud@127.0.0.1:5432/postgres}"
   pool:
     min: 2
-    max: 20
+    max: 50
+    maxGlobalQueries: 100
 
 redis:
   enabled: true
@@ -18,7 +23,7 @@ redis:
   url: "${REDIS_URL:-redis://127.0.0.1:6379}"
 
 ratelimit:
-  enabled: true
+  enabled: false
   requestPerMinute: 1000
   requestPerMinutePerIp: 1000
   whitelistedIPs:

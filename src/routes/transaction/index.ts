@@ -305,7 +305,7 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
       }
       if (!client) {
         const { status, code, message } = queryConnectionError(error);
-        if (status === 503) fastify.log.error({ err: error }, "Failed to open transaction connection");
+        if (code === "QUERY_DATABASE_UNAVAILABLE") fastify.log.error({ err: error }, "Failed to open transaction connection");
         return failure(status, code, message);
       }
       if (queryId) {

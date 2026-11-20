@@ -87,7 +87,7 @@ When renaming a served database, configure the destination name and connection U
 
 ### Recover query connection capacity
 
-Poll authenticated `GET /admin/health` on each gateway process. Its `services.queryConnections` object reports reserved and available slots, slots awaiting verification, the age of the oldest one, the number of budget rejections since startup, and PostgreSQL monitoring status. The gateway logs the start and recovery of a monitoring failure. A sustained increase in `oldestUnverifiedMs` or `rejectionsAtLimit` identifies processes that need attention.
+Poll authenticated `GET /admin/health` on each gateway process. Its `services.queryConnections` object reports reserved and available slots, slots awaiting verification, the age of the oldest one, and PostgreSQL monitoring status. `rejectionsAtLimit` counts process-wide capacity rejections since startup. `rejectionsAtPoolLimit` counts rejections when a database or profile exhausts its own pool. The gateway logs the start and recovery of a monitoring failure. Compare both counters with `oldestUnverifiedMs` to tell load saturation from stuck backend verification.
 
 Restore the administrative connection and its ability to inspect sessions on the PostgreSQL server that owns the interrupted backends. For `server_mismatch`, check that the admin and query URLs or proxies still target the same server. The gateway retries verification and releases slots as it confirms that sessions exited or reset. If the gateway must move to a replacement server, drain traffic and confirm that its old PostgreSQL sessions have ended or that the old server is offline before restarting the gateway against the replacement.
 
