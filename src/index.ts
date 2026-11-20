@@ -11,15 +11,14 @@ async function start() {
   let isShuttingDown = false;
 
   const shutdown = async (signal: string) => {
-    if (isShuttingDown) return;
+    if (isShuttingDown) {
+      console.error(`Received ${signal} during graceful shutdown, forcing exit`);
+      process.exit(1);
+    }
     isShuttingDown = true;
 
     app.log.info(`Received ${signal}, starting graceful shutdown...`);
 
-    const forceExitTimer = setTimeout(() => {
-      console.error("Graceful shutdown timed out, forcing exit");
-      process.exit(1);
-    }, 10_000);
     try {
       await app.close();
       await closeApiKeyPool();
@@ -28,8 +27,6 @@ async function start() {
     } catch (error) {
       console.error("Error occurred during graceful shutdown", error);
       process.exitCode = 1;
-    } finally {
-      clearTimeout(forceExitTimer);
     }
   };
 

@@ -27,7 +27,7 @@ The table lists loader defaults. Explicit values in [gateway.yaml](../gateway.ya
 | `database.queryProfiles` | `{}` | Maps database names to PostgreSQL logins for explicit API-key privilege sets. |
 | `database.pool.min` | `2` | Minimum size of the administrative pool, zero or greater. |
 | `database.pool.max` | `20` | Maximum size of the administrative pool and of each query pool. A database has a separate pool for its default login and each configured privilege profile. The minimum cannot exceed the maximum. |
-| `database.pool.maxGlobalQueries` | `40` | Process-wide query connection budget across all databases and profiles. Includes connections being opened or closed and excludes the administrative pool. A full per-profile pool rejects new requests before they consume global slots. |
+| `database.pool.maxGlobalQueries` | `40` | Process-wide budget across all databases and profiles. Includes opening connections and interrupted backends that may still be active. Excludes the administrative pool. A full per-profile pool rejects new requests before they consume global slots. |
 | `redis.enabled` | `true` | Connect to Redis on startup. Set to `false` to use an in-memory store local to the gateway process. |
 | `redis.mode` | `external` | Accepts `external` or `managed`. Both currently connect to the configured Redis URL when enabled. |
 | `redis.url` | Required when enabled | Redis connection string. |
@@ -52,7 +52,7 @@ redis:
 
 Configure a dedicated PostgreSQL login for each default connection or privilege profile. Give the login `CONNECT` on its database and the schema and object privileges needed by the queries. The gateway checks that the login is separate from the administrative roles, has no elevated role memberships, and lacks `CONNECT` on other connectable databases. PostgreSQL grants `CONNECT` to `PUBLIC` by default. On a shared cluster, grant access explicitly to the roles that need each database before revoking the public grant. Keep cross-database connections, foreign servers, and privileged routines out of the query login's grants. [PostgreSQL privileges](https://www.postgresql.org/docs/current/ddl-priv.html)
 
-Use a direct PostgreSQL connection or a session-mode proxy that resets each backend session on client disconnect. The admin and query URLs must point to the same PostgreSQL cluster. Provide the full URL for each database, including its database name. Store credentials in environment variables and reference them from YAML.
+Use a direct PostgreSQL connection or a session-mode proxy that resets each backend session on client disconnect. The admin and query URLs must point to the same PostgreSQL server. The gateway verifies each query session through the administrative connection's `pg_stat_activity` view. If a session-mode proxy retains its backend connections, grant the administrative role `pg_read_all_stats` so the gateway can recognize when those sessions have reset after an interruption. Provide the full URL for each database, including its database name. Store credentials in environment variables and reference them from YAML.
 
 ```yaml
 database:
@@ -78,7 +78,16 @@ database:
 
 Provision the PostgreSQL grants before using a profile. For example, grant `sales_reader` `CONNECT` on `sales`, `USAGE` on the needed schema, and `SELECT` on the intended tables. PostgreSQL also honors permissions inherited from other roles or granted to `PUBLIC`, plus permissions exposed through views and routines. Review those paths when provisioning a login. The profile selects the login, and its PostgreSQL grants determine access to individual objects. [PostgreSQL privileges](https://www.postgresql.org/docs/current/ddl-priv.html)
 
-When renaming a served database, configure the destination name and connection URLs and restart the gateway. Record IDs and secrets of older API keys can be preserved by resaving their verified database scopes through the admin API. See the [upgrade procedure](fixes.md#upgrade-procedure).
+When renaming a served database, configure the destination name and connection URLs and restart the gateway. If a key needs a new database binding, follow the [API key upgrade procedure](#rebind-existing-api-keys).
+
+## Rebind existing API keys
+
+Use `GET /admin/keys` to find the record ID of an active key that returns `API_KEY_SCOPE_REBIND_REQUIRED`. Verify that every intended database name refers to the correct PostgreSQL database. Then send `PATCH /admin/keys/:id` with the admin password in `x-admin` and the key's complete database assignment in the JSON body.
+
+- For a name-only key, send `{"databases":["sales","events"]}`.
+- For a key with explicit privileges, send a database-to-privileges map, such as `{"databases":{"sales":["SELECT"],"events":["SELECT","INSERT"]}}`. Each privilege set must match a configured profile.
+
+The update refreshes the PostgreSQL identity bindings and preserves the key's record ID and secret. Verify the updated key against each intended database.
 
 ## Runtime files
 
@@ -92,4 +101,4 @@ When renaming a served database, configure the destination name and connection U
 
 Fastify's request completion logs print `responseTime` in milliseconds as a JSON string with three decimal places. Processes sharing JsonDB must use the same data path on a filesystem that supports atomic directory creation and rename. Writers wait up to five seconds for the adjacent `data.json.lock` directory. If a process dies while holding the lock, remove the lock directory only after confirming all gateway processes using the file have stopped. Use a separate audit-log directory per process. Transaction queues are held in process memory and have no runtime file.
 
-Accepted `/transaction/execute` batches, including SQL, parameters, progress, and outcomes, are stored in `http_postgres_gateway.transactions` in the administrative database. The administrative role must own the storage schema and have permission to create it for first use. Keep that schema private to the administrative role. Records are retained until explicitly deleted. Deferred transaction queues remain process-local.
+Accepted `/transaction/execute` batches, including SQL, parameters, progress, and outcomes, are stored in `http_postgres_gateway.transactions` in the administrative database. The administrative role must own the storage schema. A DBA can provision it for that role with `CREATE SCHEMA http_postgres_gateway AUTHORIZATION gateway_admin`. If the schema is missing, the gateway needs database-level `CREATE` to provision it. Keep the schema private to the administrative role. Records are retained until explicitly deleted. New inputs and outcomes are stored as base64-encoded JSON strings in the existing JSONB columns. The gateway reads both formats. Deferred transaction queues remain process-local.

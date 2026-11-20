@@ -214,21 +214,28 @@ export async function getPostgresDatabaseDetails(
       lc_ctype: string;
       connection_limit: number;
       allow_connections: boolean;
-      size_bytes?: string;
-      size_pretty?: string;
+      size_bytes: string | null;
+      size_pretty: string | null;
     }>(
-      `SELECT
-        d.datname,
-        pg_catalog.pg_get_userbyid(d.datdba) AS owner,
-        pg_catalog.pg_encoding_to_char(d.encoding) AS encoding,
-        d.datcollate AS lc_collate,
-        d.datctype AS lc_ctype,
-        d.datconnlimit AS connection_limit,
-        d.datallowconn AS allow_connections,
-        pg_catalog.pg_database_size(d.datname)::text AS size_bytes,
-        pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(d.datname)) AS size_pretty
-      FROM pg_catalog.pg_database d
-      WHERE d.datname = $1 AND d.datistemplate = false`,
+      `WITH details AS MATERIALIZED (
+        SELECT d.datname,
+          pg_catalog.pg_get_userbyid(d.datdba) AS owner,
+          pg_catalog.pg_encoding_to_char(d.encoding) AS encoding,
+          d.datcollate AS lc_collate,
+          d.datctype AS lc_ctype,
+          d.datconnlimit AS connection_limit,
+          d.datallowconn AS allow_connections,
+          CASE WHEN pg_catalog.has_database_privilege(d.oid, 'CONNECT')
+                 OR pg_catalog.pg_has_role('pg_read_all_stats', 'USAGE')
+            THEN pg_catalog.pg_database_size(d.oid)
+          END AS bytes
+        FROM pg_catalog.pg_database d
+        WHERE d.datname = $1 AND d.datistemplate = false
+      )
+      SELECT datname, owner, encoding, lc_collate, lc_ctype, connection_limit, allow_connections,
+        bytes::pg_catalog.text AS size_bytes,
+        pg_catalog.pg_size_pretty(bytes) AS size_pretty
+      FROM details`,
       [databaseName],
     );
 

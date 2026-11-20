@@ -110,7 +110,7 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
   }
 
   function storedTransaction(request: FastifyRequest, id: string) {
-    return store.get(id, request.apiKey?.id ?? "", request.database, request.databaseOid);
+    return store.get(id, request.apiKey?.id ?? "", request.databaseOid);
   }
 
   async function requireTransaction(request: FastifyRequest, reply: FastifyReply) {
@@ -163,7 +163,10 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
     transaction: Transaction,
     scopes: FastifyRequest["queryScopes"],
     reply?: FastifyReply,
-    progress?: { completed: (count: number) => Promise<void>; committing: () => Promise<void> },
+    progress?: {
+      completed: (count: number) => Promise<void>;
+      committing: (outcome: { status: number; payload: object }) => Promise<void>;
+    },
   ) {
     const immediate = !reply;
     const respond = (status: number, payload: object) => ({ status, payload });
@@ -213,7 +216,8 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
       }
       execution.check();
       queryId = undefined;
-      if (progress) await saveProgress(progress.committing());
+      const outcome = respond(200, { success: true, transactionId: transaction.transactionId, results });
+      if (progress) await saveProgress(progress.committing(outcome));
       execution.check();
       commitSent = true;
       const result = await execution.wait(client.query("COMMIT"));
@@ -223,11 +227,11 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
       }
       if (result.command !== "COMMIT") throw new Error("Unexpected PostgreSQL COMMIT result");
       transaction.status = "committed";
-      return respond(200, { success: true, transactionId: transaction.transactionId, results });
+      return outcome;
     } catch (error) {
       if (commitSent) {
-        if (error instanceof PostgresError && error.severity === "ERROR" && error.code &&
-          (error.code.startsWith("23") || error.code === "40001" || error.code === "40P01")) {
+        // A server ErrorResponse to COMMIT rejects it. A fatal or transport error may lose its reply.
+        if (error instanceof PostgresError && error.severity === "ERROR") {
           transaction.status = "pending";
           return respond(400, {
             success: false,
@@ -351,11 +355,11 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
         await store.advance(transactionId, "pending", "running");
         const outcome = await commit(transaction, scopes, undefined, {
           completed: (count) => store.advance(transactionId, "running", "running", count),
-          committing: () => store.advance(transactionId, "running", "committing"),
+          committing: (outcome) => store.advance(transactionId, "running", "committing", undefined, outcome),
         });
         const status = transaction.status === "committed" ? "committed" :
           transaction.status === "failed" ? "unknown" : outcome.status < 500 ? "rejected" : "failed";
-        await store.finish(transactionId, status, outcome);
+        await store.finish(transactionId, status, status === "committed" ? undefined : outcome);
       } catch (error) {
         // Leave the stored phase intact when writing the final outcome fails.
         request.log.error({ err: error, transactionId }, "Could not record transaction outcome");
@@ -475,7 +479,7 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
       };
       return {
         success: true,
-        ...metadata, ...input, status,
+        ...metadata, ...input, status, database: request.database,
         progress: { completed: completedQueries, total: input.queries.length },
         ...(outcome && { outcome }),
         ...(abandonedError && { error: abandonedError }),
@@ -509,7 +513,7 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
       try {
         const record = await storedTransaction(request, id);
         if (!record) return fail(reply, 404, "TRANSACTION_NOT_FOUND", "Transaction not found");
-        if (!await store.remove(id, request.apiKey?.id ?? "", request.database, request.databaseOid)) {
+        if (!await store.remove(id, request.apiKey?.id ?? "", request.databaseOid)) {
           return fail(reply, 409, "TRANSACTION_IN_PROGRESS", "The execution record is still in use");
         }
       } catch (error) {

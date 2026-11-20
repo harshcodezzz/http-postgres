@@ -1,8 +1,8 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
-import type { PoolClient, QueryResult } from "pg";
+import { DatabaseError as PostgresError, type PoolClient, type QueryResult } from "pg";
 import { queryConnectionError, queryExecutionError } from "../../utils/query-pool.js";
 
-import { createResultBudget, losslessTypes, watchExecution, type ResultStatement } from "./execution.js";
+import { createResultBudget, ExecutionStopped, losslessTypes, watchExecution, type ResultStatement } from "./execution.js";
 import { resultOptions } from "./options.js";
 
 interface QueryBody {
@@ -76,6 +76,7 @@ const queryRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.code(status).send({ success: false, error: { code, message } });
     }
 
+    let submitted = false;
     try {
       const statement: ResultStatement = {
         text: body.query,
@@ -83,7 +84,10 @@ const queryRoutes: FastifyPluginAsync = async (fastify) => {
         values: parameters ?? [],
         rowMode: options.arrayMode ? "array" : undefined,
       };
-      const result: QueryResult | QueryResult[] = await execution.wait(createResultBudget(execution).query(client, statement));
+      execution.check();
+      const operation = createResultBudget(execution).query(client, statement);
+      submitted = true;
+      const result: QueryResult | QueryResult[] = await execution.wait(operation);
       const durationMs = Date.now() - start;
       if (Array.isArray(result)) {
         return {
@@ -97,6 +101,18 @@ const queryRoutes: FastifyPluginAsync = async (fastify) => {
       const data = formatQueryResult(result, options.fullResults);
       return { success: true, database, ...data, durationMs, data };
     } catch (err) {
+      const interruption = execution.stopped ?? (err instanceof ExecutionStopped ? err : undefined);
+      if (submitted && (interruption || !(err instanceof PostgresError) || err.severity !== "ERROR")) {
+        const cause = interruption?.code ?? "QUERY_RESULT_UNAVAILABLE";
+        return reply.code(500).send({
+          success: false,
+          error: {
+            code: "QUERY_OUTCOME_UNKNOWN",
+            message: "The SQL may have taken effect. Verify its outcome before retrying.",
+            cause,
+          },
+        });
+      }
       if (execution.stopped) {
         const { status, code, message } = execution.stopped;
         return reply.code(status).send({ success: false, error: { code, message } });

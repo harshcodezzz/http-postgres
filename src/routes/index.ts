@@ -5,7 +5,7 @@ import transactionRoutes from "./transaction/index.js";
 import { createQueryPools } from "../utils/query-pool.js";
 
 export async function registerRoutes(app: FastifyInstance) {
-  const queryPools = createQueryPools(app.databaseAdminRoles, app.log);
+  const queryPools = createQueryPools(app.db, app.databaseAdminRoles, app.log);
   app.decorate("queryPools", queryPools);
   app.addHook("onClose", () => queryPools.close());
 

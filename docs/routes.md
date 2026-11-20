@@ -24,15 +24,19 @@ The gateway checks the database name, identity, and query login before running S
 
 Pass `options.arrayMode: true` to receive positional rows. Duplicate column names are preserved and `fields` follows the same order as the row. Set `options.fullResults: false` to return just the rows for each statement while retaining the API response envelope. The default includes the result metadata.
 
-By default, JSON and JSONB, dates, timestamps, intervals, and their PostgreSQL arrays are returned as PostgreSQL text so values retain their precision. Non-finite scalar floating-point values are returned as strings. Set `options.lossless: false` to use the driver's legacy conversions. Use strings for input numbers that exceed JSON's safe integer range.
+By default, JSON and JSONB, dates, timestamps, intervals, and their PostgreSQL arrays are returned as PostgreSQL text so values retain their precision. A `numeric[]` result preserves the array shape and returns non-null elements as exact decimal strings. Non-finite scalar floating-point values are returned as strings. Set `options.lossless: false` to use the driver's legacy conversions. Use strings for input numbers that exceed JSON's safe integer range.
 
-A query response or transaction batch can retain up to 50,000 result rows and approximately 8 MiB of result data and metadata. For synchronous execution, the gateway closes its PostgreSQL connection when a caller disconnects before commit, a result exceeds the limit, or the request deadline expires. Immediate queries have a 35-second request deadline. Transaction execution has one 60-second deadline across acquisition, all statements, and commit. If the gateway has already sent `COMMIT` and cannot confirm the outcome, verify whether it committed before retrying.
+The JSON routes reject `COPY FROM STDIN` and `COPY TO STDOUT` with `COPY_STREAM_UNSUPPORTED`. For immediate SQL, the code appears in `error.cause` because earlier statements in the same request could have taken effect.
+
+A query response or transaction batch can retain up to 50,000 result rows and approximately 8 MiB of result data and metadata. Immediate queries have a 35-second request deadline. If the gateway loses the result after sending immediate SQL, it returns `500 QUERY_OUTCOME_UNKNOWN` with the underlying reason in `error.cause`. This includes result-limit and deadline interruptions. Immediate SQL can commit on the server before the gateway detects an interruption. Verify any writes before retrying. Transaction execution has one 60-second deadline across acquisition, all statements, and commit. If the gateway has already sent `COMMIT` and cannot confirm the outcome, verify whether it committed before retrying.
 
 ## Single-request transactions
 
 `POST /transaction/execute` accepts 1 to 100 statements in an ordered JSON array. Each entry can be a SQL string or an object with `query` and optional `parameters`. An outer `BEGIN` and `COMMIT` pair is optional. The gateway manages the actual transaction boundary. Use an array so statements keep their order and repeated JSON keys cannot overwrite them.
 
 The gateway saves the batch in PostgreSQL and returns `202 Accepted` with `transactionId`, `status: "pending"`, and a `Location` header. Poll `GET /transaction/:id` or `GET /transaction` with the `transaction-id` header using the same API key and database. The lookup returns `progress.completed` and `progress.total` while the batch runs. Accepted work continues if the submission request disconnects.
+
+The first shutdown signal stops the server and lets accepted batches finish. A second signal forces an exit. Set the service manager's shutdown grace period to accommodate the 60-second execution deadline and transaction-store writes.
 
 | Status | Meaning |
 | --- | --- |
@@ -42,7 +46,7 @@ The gateway saves the batch in PostgreSQL and returns `202 Accepted` with `trans
 | `failed` | Execution did not reach a successful commit. |
 | `unknown` | The commit outcome could not be confirmed. Verify it before resubmitting. |
 
-Execution records survive gateway restarts. Interrupted batches are never replayed automatically. A record that stalls is reported as `failed` or `unknown` after its execution window. Delete a finished record with `DELETE /transaction/:id` or the header-based delete route. Deleting a record does not undo committed SQL.
+Execution records survive gateway restarts. The gateway saves the results before sending `COMMIT` and retries a failed final status update. A crash or prolonged storage outage near commit can still leave the status uncertain. Interrupted batches are never replayed automatically. A record that stalls is reported as `failed` or `unknown` after its execution window. Delete a finished record with `DELETE /transaction/:id` or the header-based delete route. After a database rename, use its new name with the same, updated API key to look up or delete saved records. Deleting a record does not undo committed SQL.
 
 ```json
 {
@@ -135,8 +139,9 @@ Errors generally use `{"success":false,"error":{"code":"…","message":"…"}}`.
 | `413 TRANSACTION_QUEUE_LIMIT_EXCEEDED` | The transaction exceeds its statement or byte limit. |
 | `429 TRANSACTION_LIMIT_EXCEEDED` | The process has reached its transaction storage limit. |
 | `503 QUERY_POOL_BUSY` | The selected database and profile pool is full. |
-| `413 RESULT_LIMIT_EXCEEDED` | The query or batch exceeded the result budget. |
-| `504 EXECUTION_DEADLINE_EXCEEDED` | The request exceeded its execution deadline. |
+| `413 RESULT_LIMIT_EXCEEDED` | A transaction exceeded the result budget before commit. |
+| `504 EXECUTION_DEADLINE_EXCEEDED` | Execution exceeded its deadline before immediate SQL or a transaction commit was sent. |
+| `500 QUERY_OUTCOME_UNKNOWN` | Immediate SQL was sent and may have taken effect. Check the underlying reason in `error.cause` and verify any writes before retrying. |
 | `503 QUERY_CONNECTION_LIMIT` | The process-wide query connection budget is full. |
 | `503 QUERY_DATABASE_UNAVAILABLE` | The requested database's dedicated connection could not be opened or verified. |
 
