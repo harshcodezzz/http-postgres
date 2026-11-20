@@ -3,7 +3,40 @@ import { appendFile, mkdir } from "node:fs/promises";
 import { resolve, dirname } from "node:path";
 import { Pool } from "pg";
 import config from "../config/index.js";
-import { JsonDB, type ApiKeyRecord, type DataStore } from "../plugins/jsondb.js";
+import {
+  JsonDB,
+  type ApiKeyRecord,
+  type DataStore,
+} from "../plugins/jsondb.js";
+import {
+  isValidDatabaseName,
+  checkDatabaseExists,
+  listPostgresDatabases,
+  getPostgresDatabaseDetails,
+  createPostgresDatabase,
+  alterPostgresDatabase,
+  deletePostgresDatabase,
+  SYSTEM_DATABASES,
+  DatabaseError,
+  type CreatePostgresDatabaseOptions,
+  type PostgresDatabaseDetails,
+  type AlterPostgresDatabaseOptions,
+} from "./pg-database.js";
+
+export {
+  isValidDatabaseName,
+  checkDatabaseExists,
+  listPostgresDatabases,
+  getPostgresDatabaseDetails,
+  createPostgresDatabase,
+  alterPostgresDatabase,
+  deletePostgresDatabase,
+  SYSTEM_DATABASES,
+  DatabaseError,
+  type CreatePostgresDatabaseOptions,
+  type PostgresDatabaseDetails,
+  type AlterPostgresDatabaseOptions,
+};
 
 export { ApiKeyRecord };
 
@@ -53,47 +86,6 @@ export async function closeApiKeyPool(): Promise<void> {
     const pool = sharedPgPool;
     sharedPgPool = null;
     await pool.end();
-  }
-}
-
-/**
- * Validates whether a database name complies with PostgreSQL identifier rules.
- */
-export function isValidDatabaseName(name: unknown): name is string {
-  if (typeof name !== "string") return false;
-  if (name.length === 0 || name.length > 63) return false;
-  return /^[a-zA-Z_][a-zA-Z0-9_-]{0,62}$/.test(name);
-}
-
-/**
- * Checks whether a database exists in PostgreSQL using parameterized query.
- * Distinguishes between database not found and insufficient permissions.
- */
-export async function checkDatabaseExists(
-  databaseName: string,
-  pool?: Pool,
-): Promise<boolean> {
-  if (!isValidDatabaseName(databaseName)) {
-    return false;
-  }
-
-  const pg = pool ?? getApiKeyPool();
-
-  try {
-    const res = await pg.query(
-      "SELECT 1 FROM pg_database WHERE datname = $1 AND datistemplate = false",
-      [databaseName],
-    );
-    return (res.rowCount ?? 0) > 0;
-  } catch (err: unknown) {
-    const pgErr = err as { code?: string; message?: string };
-    if (pgErr && pgErr.code === "42501") {
-      throw new ApiKeyError(
-        "Insufficient privileges to verify database in pg_database",
-        "INSUFFICIENT_PRIVILEGE",
-      );
-    }
-    throw err;
   }
 }
 
@@ -191,7 +183,8 @@ export async function createApiKey(
   options: CreateApiKeyOptions,
 ): Promise<CreateApiKeyResult> {
   const { environment = "LIVE" } = options;
-  const rawDatabases = options.databases ?? (options.database ? [options.database] : []);
+  const rawDatabases =
+    options.databases ?? (options.database ? [options.database] : []);
   const databases = [...new Set(rawDatabases)];
   const db = options.db ?? new JsonDB();
   const auditPath = options.auditLogPath ?? API_KEY_LOG_FILE;
@@ -464,7 +457,9 @@ export async function revokeApiKey(
       };
       revokedRecord = apiKeys[keyHash];
     } else {
-      const entry = Object.entries(apiKeys).find(([, r]) => r.id === apiKeyOrId);
+      const entry = Object.entries(apiKeys).find(
+        ([, r]) => r.id === apiKeyOrId,
+      );
       if (entry) {
         apiKeys[entry[0]] = {
           ...entry[1],
@@ -549,7 +544,9 @@ export async function updateApiKeyScope(
     if (keyHash && apiKeys[keyHash]) {
       targetHash = keyHash;
     } else {
-      const entry = Object.entries(apiKeys).find(([, r]) => r.id === apiKeyOrId);
+      const entry = Object.entries(apiKeys).find(
+        ([, r]) => r.id === apiKeyOrId,
+      );
       if (entry) {
         targetHash = entry[0];
       }
@@ -625,7 +622,9 @@ export async function deleteApiKey(
       deletedRecord = apiKeys[keyHash];
       delete apiKeys[keyHash];
     } else {
-      const entry = Object.entries(apiKeys).find(([, r]) => r.id === apiKeyOrId);
+      const entry = Object.entries(apiKeys).find(
+        ([, r]) => r.id === apiKeyOrId,
+      );
       if (entry) {
         deletedRecord = entry[1];
         delete apiKeys[entry[0]];
@@ -657,4 +656,26 @@ export async function deleteApiKey(
   }
 
   return success;
+}
+
+/**
+ * Lists all API key records from JsonDB.
+ */
+export async function listApiKeys(
+  db: JsonDB = new JsonDB(),
+): Promise<ApiKeyRecord[]> {
+  const data = await db.read<DataStore>();
+  return Object.values(data.apiKeys ?? {});
+}
+
+/**
+ * Retrieves a single API key record by its ID.
+ */
+export async function getApiKeyById(
+  id: string,
+  db: JsonDB = new JsonDB(),
+): Promise<ApiKeyRecord | null> {
+  const data = await db.read<DataStore>();
+  const record = Object.values(data.apiKeys ?? {}).find((r) => r.id === id);
+  return record ?? null;
 }

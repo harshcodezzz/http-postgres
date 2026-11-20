@@ -55,12 +55,8 @@ const authPlugin: FastifyPluginAsync = async (fastify) => {
       });
     }
 
-    const rawApiKey =
-      request.headers["x-api-key"] ?? request.headers.authorization;
     const apiKey =
-      typeof rawApiKey === "string" && /^Bearer\s+/i.test(rawApiKey)
-        ? rawApiKey.replace(/^Bearer\s+/i, "").trim()
-        : rawApiKey;
+      request.headers["x-api-key"] ?? request.headers.authorization;
     const database =
       request.headers["x-database"] ?? request.headers["x-db-name"];
 

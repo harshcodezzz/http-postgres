@@ -4,7 +4,7 @@ import { config as loadEnv } from "dotenv";
 import YAML from "yaml";
 import { z } from "zod";
 
-loadEnv();
+loadEnv({ quiet: true });
 
 const configSchema = z
   .object({
