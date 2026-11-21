@@ -1,13 +1,9 @@
 import { randomBytes, createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { Pool } from "pg";
-import config, { findQueryProfile } from "../config/index.js";
-import {
-  databaseScopes as databaseScopesSchema,
-  queryScopeList,
-  type DatabaseScopes,
-  type QueryPrivilege,
-} from "../config/query-privileges.js";
+import config from "../config/index.js";
+import { crudList, type DatabaseAccess, type TableName } from "../config/query-privileges.js";
+import { provisionQueryAccess, queryAccess, type QueryAccess } from "./query-access.js";
 import { appendAuditLine } from "./log-files.js";
 import {
   JsonDB,
@@ -109,9 +105,15 @@ export interface ApiKeyAuditLog {
   reason?: string;
 }
 
-export interface CreateApiKeyOptions {
+export interface ApiKeyScopeInput {
   databases?: unknown;
-  database?: string;
+  database?: unknown;
+  tables?: unknown;
+  "scope-database"?: unknown;
+  "scope-table"?: unknown;
+}
+
+export interface CreateApiKeyOptions extends ApiKeyScopeInput {
   environment?: ApiKeyEnvironment;
   db?: JsonDB;
   pgPool?: Pool;
@@ -127,7 +129,7 @@ export interface VerifyApiKeyResult {
   valid: boolean;
   record?: ApiKeyRecord;
   databaseOid?: string;
-  scopes?: QueryPrivilege[];
+  access?: QueryAccess;
   error?: VerifyApiKeyError;
 }
 
@@ -141,8 +143,7 @@ export interface DeleteApiKeyOptions {
   auditLogPath?: string;
 }
 
-export interface UpdateApiKeyScopeOptions {
-  databases: unknown;
+export interface UpdateApiKeyScopeOptions extends ApiKeyScopeInput {
   db?: JsonDB;
   pgPool?: Pool;
   auditLogPath?: string;
@@ -182,30 +183,83 @@ export async function writeAuditLog(
   await appendAuditLine(logPath, JSON.stringify({ ...entry, database }) + "\n");
 }
 
-function parseDatabaseTargets(value: unknown): { names: unknown[]; scopes?: DatabaseScopes } {
-  if (Array.isArray(value) && value.length > 0) return { names: [...new Set(value)] };
-
-  if (value && typeof value === "object" && !Array.isArray(value)) {
-    const names = Object.keys(value);
-    const result = databaseScopesSchema.safeParse(value);
-    if (names.length === 0 || !result.success || Object.keys(result.data).length !== names.length) {
-      throw new ApiKeyError(
-        "Provide a database-to-privileges map with a nonempty list of PostgreSQL privileges per database",
-        "INVALID_DATABASE_SCOPE",
-      );
-    }
-    for (const [database, scopes] of Object.entries(result.data)) {
-      if (!findQueryProfile(database, scopes)) {
-        throw new ApiKeyError(
-          `No query profile is configured for '${database}' with privileges ${scopes.join(", ")}`,
-          "UNCONFIGURED_DATABASE_SCOPE",
-        );
-      }
-    }
-    return { names, scopes: result.data };
+function parseDatabaseTargets(input: ApiKeyScopeInput) {
+  const { database, databases, tables, "scope-database": databaseScope, "scope-table": tableScope } = input;
+  if (database !== undefined && databases !== undefined) {
+    throw new ApiKeyError("Use either 'database' or 'databases'", "INVALID_DATABASE_SCOPE");
+  }
+  const assignments = database ?? databases;
+  const names = Array.isArray(assignments) ? [...new Set<unknown>(assignments)] :
+    typeof assignments === "string" ? [assignments] : [];
+  if (names.length === 0) {
+    throw new ApiKeyError("Provide a nonempty array of database names", "INVALID_DATABASE_SCOPE");
+  }
+  if (!Array.isArray(database) && tables === undefined && databaseScope === undefined && tableScope === undefined) {
+    return { names };
   }
 
-  throw new ApiKeyError("At least one database is required", "INVALID_DATABASE_NAME");
+  const parsedDatabase = crudList.safeParse(databaseScope === undefined ? [] : databaseScope);
+  const parsedTable = crudList.safeParse(tableScope === undefined ? [] : tableScope);
+  if (!parsedDatabase.success || !parsedTable.success || (tables !== undefined && !Array.isArray(tables))) {
+    throw new ApiKeyError("Use arrays for tables and CRUD scopes. Allowed operations are c, r, u, and d", "INVALID_DATABASE_SCOPE");
+  }
+  const tablesByDatabase = new Map<unknown, TableName[]>();
+  function validIdentifier(value: unknown): value is string {
+    return typeof value === "string" && value.length > 0 && !value.includes("\0") && Buffer.byteLength(value) <= 63;
+  }
+  for (const value of tables ?? []) {
+    const entry = typeof value === "string"
+      ? (value.includes(".") ? value.split(".") : ["public", value])
+      : undefined;
+    const table = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+    const target = table?.database ?? (names.length === 1 ? names[0] : undefined);
+    const schema = entry?.[0] ?? table?.schema ?? "public";
+    const name = entry?.[1] ?? table?.name;
+    if ((entry && entry.length !== 2) || !names.includes(target) || !validIdentifier(schema) || !validIdentifier(name)) {
+      throw new ApiKeyError(
+        "Use 'schema.table' for a single database or {database, schema, name} for multiple databases",
+        "INVALID_TABLE_SCOPE",
+      );
+    }
+    const selected = tablesByDatabase.get(target) ?? [];
+    if (!selected.some((table) => table.schema === schema && table.name === name)) selected.push({ schema, name });
+    tablesByDatabase.set(target, selected);
+  }
+  if (Boolean(tablesByDatabase.size) !== Boolean(parsedTable.data.length) ||
+      (!parsedDatabase.data.length && names.some((name) => !tablesByDatabase.has(name)))) {
+    throw new ApiKeyError("Assign at least one operation to every database and pair 'tables' with 'scope-table'", "INVALID_DATABASE_SCOPE");
+  }
+
+  const policies = new Map(names.map((name) => [name, {
+    database: parsedDatabase.data,
+    tables: tablesByDatabase.get(name) ?? [],
+    table: parsedTable.data,
+  }]));
+  return { names, policies };
+}
+
+async function provisionScopes(
+  targets: ReturnType<typeof parseDatabaseTargets>,
+  bindings: [string, string][],
+  db: JsonDB,
+  pgPool?: Pool,
+) {
+  const { policies } = targets;
+  if (!policies) return;
+  const secret = (await db.read<DataStore>()).queryRoleSecret ??
+    (await db.update<DataStore>((current) => current.queryRoleSecret ? current : {
+      ...current, queryRoleSecret: randomBytes(32).toString("base64url"),
+    })).queryRoleSecret;
+  if (!secret) throw new Error("Could not initialize PostgreSQL role credentials");
+
+  const scopes: [string, DatabaseAccess][] = [];
+  for (const [database, oid] of bindings) {
+    const policy = policies.get(database);
+    if (!policy) throw new Error("Missing database scope");
+    const scope = await provisionQueryAccess(database, oid, policy, secret, pgPool ?? getApiKeyPool());
+    scopes.push([database, scope]);
+  }
+  return Object.fromEntries(scopes);
 }
 
 /**
@@ -223,7 +277,7 @@ export async function createApiKey(
     );
   }
 
-  const targets = parseDatabaseTargets(options.databases ?? (options.database ? [options.database] : []));
+  const targets = parseDatabaseTargets(options);
   const db = options.db ?? new JsonDB();
   const auditPath = options.auditLogPath ?? API_KEY_LOG_FILE;
 
@@ -269,6 +323,7 @@ export async function createApiKey(
     bindings.push([database, oid]);
   }
 
+  const accessScopes = await provisionScopes(targets, bindings, db, options.pgPool);
   const secret = randomBytes(24).toString("base64url");
   const apiKey = `KEY_${environment}_${secret}`;
   const keyHash = hashApiKeySecret(secret);
@@ -281,7 +336,7 @@ export async function createApiKey(
     keyPrefix,
     databases: bindings.map(([database]) => database),
     databaseOids: Object.fromEntries(bindings),
-    ...(targets.scopes && { databaseScopes: targets.scopes }),
+    ...(accessScopes && { accessScopes }),
     environment,
     status: "active",
     createdAt: new Date().toISOString(),
@@ -439,12 +494,12 @@ export async function verifyApiKey(
     : undefined;
   if (!databaseOid) return { valid: false, error: "DATABASE_SCOPE_UNBOUND" };
 
-  let scopes: QueryPrivilege[] | undefined;
-  if (record.databaseScopes !== undefined) {
-    const map = record.databaseScopes;
-    const result = queryScopeList.safeParse(map && Object.hasOwn(map, databaseName) ? map[databaseName] : undefined);
-    if (!result.success) return { valid: false, error: "DATABASE_SCOPE_UNBOUND" };
-    scopes = result.data;
+  if (record.databaseScopes !== undefined) return { valid: false, error: "DATABASE_SCOPE_UNBOUND" };
+  let access: QueryAccess | undefined;
+  if (record.accessScopes !== undefined) {
+    const scope = Object.hasOwn(record.accessScopes, databaseName) ? record.accessScopes[databaseName] : undefined;
+    if (!scope?.roleToken || !data.queryRoleSecret) return { valid: false, error: "DATABASE_SCOPE_UNBOUND" };
+    access = queryAccess(data.queryRoleSecret, scope.roleToken);
   }
 
   const now = Date.now();
@@ -467,7 +522,7 @@ export async function verifyApiKey(
     }).catch(() => {}).finally(() => pendingLastUsedWrites.delete(keyHash));
   }
 
-  return { valid: true, record, databaseOid, scopes };
+  return { valid: true, record, databaseOid, access };
 }
 
 /**
@@ -541,9 +596,19 @@ export async function updateApiKeyScope(
   apiKeyOrId: string,
   options: UpdateApiKeyScopeOptions,
 ): Promise<ApiKeyRecord> {
-  const targets = parseDatabaseTargets(options.databases);
+  const targets = parseDatabaseTargets(options);
   const db = options.db ?? new JsonDB();
   const auditPath = options.auditLogPath ?? API_KEY_LOG_FILE;
+
+  const parsed = parseApiKey(apiKeyOrId);
+  const keyHash = parsed ? hashApiKeySecret(parsed.secret) : null;
+  const current = await db.read<DataStore>();
+  const record = keyHash ? current.apiKeys?.[keyHash] :
+    Object.values(current.apiKeys ?? {}).find((entry) => entry.id === apiKeyOrId);
+  if (record?.status !== "active") throw new ApiKeyError("API key not found or is not active", "KEY_NOT_FOUND");
+  if ((record.databaseScopes !== undefined || record.accessScopes !== undefined) && !targets.policies) {
+    throw new ApiKeyError("This key requires an explicit CRUD scope", "DATABASE_SCOPES_REQUIRED");
+  }
 
   const bindings: [string, string][] = [];
   for (const database of targets.names) {
@@ -564,9 +629,9 @@ export async function updateApiKeyScope(
     bindings.push([database, oid]);
   }
 
-  const parsed = parseApiKey(apiKeyOrId);
-  const keyHash = parsed ? hashApiKeySecret(parsed.secret) : null;
   let updatedRecord: ApiKeyRecord | null = null;
+
+  const accessScopes = await provisionScopes(targets, bindings, db, options.pgPool);
 
   await db.update((current) => {
     const apiKeys = { ...(current.apiKeys ?? {}) };
@@ -590,16 +655,19 @@ export async function updateApiKeyScope(
     if (apiKeys[targetHash].status !== "active") {
       return current;
     }
-    if (apiKeys[targetHash].databaseScopes !== undefined && !targets.scopes) {
-      throw new ApiKeyError("This key requires an explicit database-to-privileges map", "DATABASE_SCOPES_REQUIRED");
+    const record = apiKeys[targetHash];
+    if ((record.databaseScopes !== undefined || record.accessScopes !== undefined) && !accessScopes) {
+      throw new ApiKeyError("This key requires an explicit CRUD scope", "DATABASE_SCOPES_REQUIRED");
     }
 
-    apiKeys[targetHash] = {
-      ...apiKeys[targetHash],
+    const updated = {
+      ...record,
       databases: bindings.map(([database]) => database),
       databaseOids: Object.fromEntries(bindings),
-      ...(targets.scopes && { databaseScopes: targets.scopes }),
+      ...(accessScopes && { accessScopes }),
     };
+    delete updated.databaseScopes;
+    apiKeys[targetHash] = updated;
     updatedRecord = apiKeys[targetHash];
 
     return {

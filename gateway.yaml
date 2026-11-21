@@ -1,17 +1,12 @@
 version: 1
 
 server:
-  host: "127.0.0.1"
+  host: "0.0.0.0"
   port: 8080
 
 database:
   url: "${DATABASE_URL:-postgresql://postgres:postgres@127.0.0.1:5432/postgres}"
   queryUrls: {}
-  queryProfiles:
-    postgres:
-      - scopes: [SELECT, INSERT, UPDATE, DELETE]
-        role: http_postgres_benchmark_crud
-        url: "${BENCHMARK_DATABASE_URL:-postgresql://http_postgres_benchmark_crud@127.0.0.1:5432/postgres}"
   pool:
     min: 2
     queryMin: 2

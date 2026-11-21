@@ -1,4 +1,4 @@
-import { escapeLiteral, Pool, type PoolClient } from "pg";
+import { Client, escapeLiteral, Pool, type PoolClient } from "pg";
 import config from "../config/index.js";
 import type { JsonDB } from "../plugins/jsondb.js";
 
@@ -18,6 +18,17 @@ let defaultPgPool: Pool | null = null;
 
 function withoutDatabases<T>(entries: Record<string, T>, ...names: string[]): Record<string, T> {
   return Object.fromEntries(Object.entries(entries).filter(([name]) => !names.includes(name)));
+}
+
+function renameDatabaseScope<T>(
+  entries: Record<string, T>,
+  from: string,
+  to: string,
+): Record<string, T> {
+  return {
+    ...withoutDatabases(entries, from, to),
+    ...(Object.hasOwn(entries, from) && { [to]: entries[from] }),
+  };
 }
 
 function getPgErrorCode(err: unknown): string | undefined {
@@ -61,7 +72,7 @@ function toDatabaseError(
   }
 }
 
-function quoteIdentifier(identifier: string): string {
+export function quoteIdentifier(identifier: string): string {
   return `"${identifier.replace(/"/g, '""')}"`;
 }
 
@@ -164,13 +175,14 @@ export async function getPostgresDatabaseOid(
 }
 
 /**
- * Lists all accessible non-template databases from PostgreSQL.
+ * Lists databases from the PostgreSQL catalog.
  */
-export async function listPostgresDatabases(pool?: Pool): Promise<string[]> {
+export async function listPostgresDatabases(pool?: Pool, includeTemplates = false): Promise<string[]> {
   const pg = pool ?? getDatabasePool();
   try {
     const res = await pg.query<{ datname: string }>(
-      "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname",
+      "SELECT datname FROM pg_catalog.pg_database WHERE $1 OR NOT datistemplate ORDER BY datname",
+      [includeTemplates],
     );
     return res.rows.map((r) => r.datname);
   } catch (err: unknown) {
@@ -180,8 +192,52 @@ export async function listPostgresDatabases(pool?: Pool): Promise<string[]> {
   }
 }
 
+export function databaseUrl(name: string): URL {
+  const url = new URL(config.database.url);
+  url.pathname = encodeURIComponent(name);
+  url.searchParams.delete("dbname");
+  url.searchParams.delete("database");
+  return url;
+}
+
+export async function withPostgresDatabase<T>(
+  name: string,
+  operation: (client: Client) => Promise<T>,
+): Promise<T> {
+  const client = new Client({
+    connectionString: databaseUrl(name).toString(),
+    connectionTimeoutMillis: 5_000,
+    query_timeout: 30_000,
+    statement_timeout: 30_000,
+  });
+  try {
+    await client.connect();
+    return await operation(client);
+  } catch (error) {
+    throw toDatabaseError(error, `Database operation failed for '${name}'`) ?? error;
+  } finally {
+    await client.end();
+  }
+}
+
+export async function listPostgresTables(client: Pick<Client, "query">) {
+  const { rows } = await client.query<{ oid: string; schema: string; name: string }>(`
+    SELECT c.oid::text, n.nspname AS schema, c.relname AS name
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind IN ('r', 'p') AND c.relpersistence <> 't'
+      AND n.nspname <> ALL(ARRAY['information_schema', 'http_postgres_gateway'])
+      AND pg_catalog.left(n.nspname, 3) <> 'pg_'
+    ORDER BY n.nspname, c.relname
+  `);
+  return rows;
+}
+
 export interface PostgresDatabaseDetails {
+  id: string;
   name: string;
+  serverVersion: string;
+  collationVersion: string | null;
   owner: string;
   encoding: string;
   lcCollate: string;
@@ -198,16 +254,19 @@ export interface PostgresDatabaseDetails {
 export async function getPostgresDatabaseDetails(
   databaseName: string,
   pool?: Pool,
+  includeTemplates = false,
 ): Promise<PostgresDatabaseDetails | null> {
-  if (!isValidDatabaseName(databaseName)) {
-    return null;
-  }
+  const byOid = /^[0-9]{1,10}$/.test(databaseName) && Number(databaseName) <= 4_294_967_295;
+  if (!databaseName || databaseName.includes("\0")) return null;
 
   const pg = pool ?? getDatabasePool();
 
   try {
     const res = await pg.query<{
+      id: string;
       datname: string;
+      server_version: string;
+      collation_version: string | null;
       owner: string;
       encoding: string;
       lc_collate: string;
@@ -218,7 +277,9 @@ export async function getPostgresDatabaseDetails(
       size_pretty: string | null;
     }>(
       `WITH details AS MATERIALIZED (
-        SELECT d.datname,
+        SELECT d.oid::pg_catalog.text AS id, d.datname,
+          pg_catalog.current_setting('server_version') AS server_version,
+          pg_catalog.to_jsonb(d)->>'datcollversion' AS collation_version,
           pg_catalog.pg_get_userbyid(d.datdba) AS owner,
           pg_catalog.pg_encoding_to_char(d.encoding) AS encoding,
           d.datcollate AS lc_collate,
@@ -230,13 +291,13 @@ export async function getPostgresDatabaseDetails(
             THEN pg_catalog.pg_database_size(d.oid)
           END AS bytes
         FROM pg_catalog.pg_database d
-        WHERE d.datname = $1 AND d.datistemplate = false
+        WHERE ${byOid ? "d.oid = $1::pg_catalog.oid" : "d.datname = $1"} AND ($2 OR NOT d.datistemplate)
       )
-      SELECT datname, owner, encoding, lc_collate, lc_ctype, connection_limit, allow_connections,
+      SELECT id, datname, server_version, collation_version, owner, encoding, lc_collate, lc_ctype, connection_limit, allow_connections,
         bytes::pg_catalog.text AS size_bytes,
         pg_catalog.pg_size_pretty(bytes) AS size_pretty
       FROM details`,
-      [databaseName],
+      [databaseName, includeTemplates],
     );
 
     if (res.rowCount === 0 || !res.rows[0]) {
@@ -251,7 +312,10 @@ export async function getPostgresDatabaseDetails(
         : undefined;
 
     return {
+      id: row.id,
       name: row.datname,
+      serverVersion: row.server_version,
+      collationVersion: row.collation_version,
       owner: row.owner,
       encoding: row.encoding,
       lcCollate: row.lc_collate,
@@ -269,6 +333,26 @@ export async function getPostgresDatabaseDetails(
     if (mapped) throw mapped;
     throw err;
   }
+}
+
+export async function refreshPostgresDatabaseVersion(database: PostgresDatabaseDetails, pool: Pool) {
+  try {
+    await inDatabaseTransaction(pool, async (client) => {
+      const { rows: [server] } = await client.query<{ supported: boolean }>(
+        "SELECT pg_catalog.current_setting('server_version_num')::integer >= 150000 AS supported",
+      );
+      if (!server.supported) {
+        throw new DatabaseError("Database collation version refresh requires PostgreSQL 15 or newer", "DATABASE_VERSION_UNSUPPORTED");
+      }
+      await client.query(`ALTER DATABASE ${quoteIdentifier(database.name)} REFRESH COLLATION VERSION`);
+      if (await getPostgresDatabaseOid(database.name, client) !== database.id) {
+        throw new DatabaseError("Database identity changed during maintenance", "DATABASE_IN_USE");
+      }
+    });
+  } catch (err) {
+    throw toDatabaseError(err, `Failed to refresh the collation version for '${database.name}'`) ?? err;
+  }
+  return getPostgresDatabaseDetails(database.id, pool);
 }
 
 export interface CreatePostgresDatabaseOptions {
@@ -435,6 +519,7 @@ export async function alterPostgresDatabase(
   options: AlterPostgresDatabaseOptions,
   pool?: Pool,
   jsondb?: JsonDB,
+  expectedOid?: string,
 ): Promise<{ database: string; renamed: boolean }> {
   if (!isValidDatabaseName(databaseName)) {
     throw new DatabaseError(
@@ -456,6 +541,10 @@ export async function alterPostgresDatabase(
   const isProtected = SYSTEM_DATABASES.has(databaseName.toLowerCase());
 
   // Upfront validation for all fields and system-database restrictions
+  if (expectedOid && databaseOid !== expectedOid) {
+    throw new DatabaseError("Database identity changed before maintenance", "DATABASE_IN_USE");
+  }
+
   if (options.newName !== undefined && options.newName !== databaseName) {
     if (!isValidDatabaseName(options.newName)) {
       throw new DatabaseError(
@@ -631,19 +720,15 @@ export async function alterPostgresDatabase(
           const boundOid = Object.hasOwn(bindings, databaseName) ? bindings[databaseName] : undefined;
           if (boundOid && boundOid !== databaseOid) continue;
           const nextBindings = withoutDatabases(bindings, databaseName);
-          const privilegeMap = record.databaseScopes;
-          const scopes = privilegeMap && Object.hasOwn(privilegeMap, databaseName)
-            ? privilegeMap[databaseName]
-            : undefined;
           apiKeys[hash] = {
             ...record,
             databases: [...new Set(record.databases.map((name) => name === databaseName ? currentDbName : name))],
             databaseOids: boundOid ? { ...nextBindings, [currentDbName]: boundOid } : nextBindings,
-            ...(privilegeMap && {
-              databaseScopes: {
-                ...withoutDatabases(privilegeMap, databaseName, currentDbName),
-                ...(scopes && { [currentDbName]: scopes }),
-              },
+            ...(record.databaseScopes && {
+              databaseScopes: renameDatabaseScope(record.databaseScopes, databaseName, currentDbName),
+            }),
+            ...(record.accessScopes && {
+              accessScopes: renameDatabaseScope(record.accessScopes, databaseName, currentDbName),
             }),
           };
         }
@@ -724,6 +809,9 @@ export async function deletePostgresDatabase(
             databaseOids: withoutDatabases(bindings, databaseName),
             ...(record.databaseScopes && {
               databaseScopes: withoutDatabases(record.databaseScopes, databaseName),
+            }),
+            ...(record.accessScopes && {
+              accessScopes: withoutDatabases(record.accessScopes, databaseName),
             }),
           };
         }

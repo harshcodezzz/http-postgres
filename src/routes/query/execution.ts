@@ -89,7 +89,7 @@ export const losslessTypes: CustomTypesConfig = {
   },
 };
 
-export type ResultStatement = QueryConfig & { rowMode?: "array"; queryMode?: "extended" };
+export type ResultStatement = QueryConfig & { rowMode?: "array"; queryMode?: "extended"; query_timeout?: number };
 
 export function createResultBudget(execution: ReturnType<typeof watchExecution>) {
   const maxBytes = 8 * 1024 * 1024;
@@ -128,6 +128,8 @@ export function createResultBudget(execution: ReturnType<typeof watchExecution>)
               charge(row);
             } catch (error) { reject(error); }
           });
+          // The driver reads the timeout from the submitted Query instance.
+          if (statement.query_timeout !== undefined) Object.assign(query, { query_timeout: statement.query_timeout });
           client.query(query);
         });
       } finally {

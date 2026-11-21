@@ -2,25 +2,19 @@ import { z } from "zod";
 
 export const databaseName = z.string().regex(/^[a-zA-Z_][a-zA-Z0-9_-]{0,62}$/);
 
-const queryPrivileges = [
-  "SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER",
-  "CREATE", "CONNECT", "TEMPORARY", "EXECUTE", "USAGE", "MAINTAIN",
-] as const;
+export const crudList = z.array(z.enum(["c", "r", "u", "d"]))
+  .transform((operations) => [...new Set(operations)].sort());
 
-export type QueryPrivilege = (typeof queryPrivileges)[number];
-export type DatabaseScopes = Record<string, QueryPrivilege[]>;
+export type CrudOperation = z.infer<typeof crudList>[number];
 
-const privilege = z.preprocess(
-  (value) => typeof value === "string" ? value.trim().toUpperCase() : value,
-  z.enum(queryPrivileges),
-);
+export interface TableName {
+  schema: string;
+  name: string;
+}
 
-export const queryScopeList = z.array(privilege)
-  .min(1)
-  .transform((scopes) => [...new Set(scopes)].sort());
-
-export const databaseScopes = z.record(databaseName, queryScopeList);
-
-export function scopeKey(scopes: readonly QueryPrivilege[]): string {
-  return scopes.join(",");
+export interface DatabaseAccess {
+  database: CrudOperation[];
+  tables: TableName[];
+  table: CrudOperation[];
+  roleToken: string;
 }

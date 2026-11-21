@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { Client, DatabaseError as PostgresError, Pool, type PoolClient } from "pg";
 import type { FastifyBaseLogger } from "fastify";
-import config, { findQueryProfile } from "../config/index.js";
-import { scopeKey, type QueryPrivilege } from "../config/query-privileges.js";
+import config from "../config/index.js";
+import { scopedQueryUrl, scopedRoleSafety, type QueryAccess } from "./query-access.js";
 import { DatabaseError, getPostgresDatabaseOid } from "./pg-database.js";
 
 const connectionTimeoutMillis = 5_000;
@@ -229,10 +229,10 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
       for (const state of group.values()) {
         const { pool } = state;
         if (pool === requested || state.retired || state.waiters.size ||
-            pool.totalCount <= config.database.pool.queryMin || pool.idleCount <= pool.waitingCount) continue;
+            pool.totalCount <= (pool.options.min ?? 0) || pool.idleCount <= pool.waitingCount) continue;
         const client = await pool.connect().catch(() => undefined);
         if (client) {
-          if (state.retired || state.waiters.size || pool.totalCount <= config.database.pool.queryMin) {
+          if (state.retired || state.waiters.size || pool.totalCount <= (pool.options.min ?? 0)) {
             client.release();
             continue;
           }
@@ -424,9 +424,10 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
   async function connect(
     database: string,
     oid: string,
-    scopes: readonly QueryPrivilege[] | null = null,
+    access: QueryAccess | null = null,
     ownerId?: string,
     signal?: AbortSignal,
+    statementTimeoutMs = statementTimeoutMillis,
   ): Promise<PoolClient> {
     function checkMaintenance() {
       if (closing || maintenance.has(database)) {
@@ -435,11 +436,10 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
     }
     checkMaintenance();
 
-    const profile = scopes ? findQueryProfile(database, scopes) : undefined;
     const defaultUrl = Object.hasOwn(config.database.queryUrls, database)
       ? config.database.queryUrls[database]
       : undefined;
-    const connectionString = scopes ? profile?.url : defaultUrl;
+    const connectionString = access ? scopedQueryUrl(database, access) : defaultUrl;
     if (!connectionString) {
       throw new DatabaseError("Query credentials are unavailable for this database", "QUERY_DATABASE_UNAVAILABLE");
     }
@@ -448,7 +448,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
       databasePools = new Map();
       pools.set(database, databasePools);
     }
-    const poolKey = scopes ? scopeKey(scopes) : "";
+    const poolKey = access?.login ?? "";
     let state = databasePools.get(poolKey);
     if (!state) {
       const pool = new Pool({
@@ -456,7 +456,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
         Client: BudgetedClient,
         pipeline: false,
         max: config.database.pool.max,
-        min: config.database.pool.queryMin,
+        min: access ? 0 : config.database.pool.queryMin,
         idleTimeoutMillis: 30_000,
         keepAlive: true,
         connectionTimeoutMillis,
@@ -471,7 +471,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
       pool.on("release", (_err: Error | undefined, client: PoolClient) => {
         client.removeListener("error", checkedOutError);
         if (pendingCheckouts && queryConnections >= config.database.pool.maxGlobalQueries &&
-            pool.totalCount > config.database.pool.queryMin) wakePools();
+            pool.totalCount > (pool.options.min ?? 0)) wakePools();
         else wake(managed);
       });
       pool.on("error", (err) => log.error({ err, database }, "Query connection pool error"));
@@ -485,7 +485,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
           queryConnections--;
           wakePools();
         }
-        if (warmTimer && !closing && !managed.retired && pool.totalCount < config.database.pool.queryMin) {
+        if (!access && warmTimer && !closing && !managed.retired && pool.totalCount < config.database.pool.queryMin) {
           queueMicrotask(() => { void replenish(); });
         }
       });
@@ -500,11 +500,6 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
     }
     async function verify(client: PoolClient): Promise<BackendSession> {
       checkPool();
-      const excludedRoles = scopes
-        ? adminRoles.concat(config.database.queryProfiles[database]
-            .filter((candidate) => candidate.scopes.some((scope) => !scopes.includes(scope)))
-            .map((candidate) => candidate.role))
-        : adminRoles;
       const previous = backends.get(client);
       const sessionName = previous?.applicationName ?? `http-postgres-${randomUUID()}`;
       queryDispatched(client);
@@ -528,7 +523,9 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
             SELECT 1 FROM pg_catalog.pg_database other
             WHERE other.oid OPERATOR(pg_catalog.<>) d.oid AND other.datallowconn
               AND pg_catalog.has_database_privilege(session_user, other.oid, 'CONNECT')
-          ) AS safe,
+          )
+          ${access ? `AND (${scopedRoleSafety("session_user")})` : ""}
+          AS safe,
           activity.pid,
           EXTRACT(EPOCH FROM activity.backend_start)::pg_catalog.text AS "startedAt",
           EXTRACT(EPOCH FROM pg_catalog.pg_postmaster_start_time())::pg_catalog.text AS "serverStartedAt",
@@ -537,10 +534,10 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
         FROM pg_catalog.pg_database d
         JOIN pg_catalog.pg_stat_activity activity ON activity.pid OPERATOR(pg_catalog.=) pg_catalog.pg_backend_pid()
         WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
-      `, [excludedRoles, sessionName, String(statementTimeoutMillis)]),
+      `, [adminRoles, sessionName, String(statementTimeoutMs)]),
       previous && observeServer(previous, false)]);
       checkPool();
-      if (target?.name !== database || !target.safe || (profile && target.login !== profile.role)) {
+      if (target?.name !== database || !target.safe || (access && target.login !== access.login)) {
         throw new DatabaseError("Query credentials are unavailable for this database", "QUERY_DATABASE_UNAVAILABLE");
       }
       if (target.oid !== oid) {
@@ -601,20 +598,14 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
   }
 
   const warmFailures = new Set<string>();
-  const targets = [
-    ...Object.keys(config.database.queryUrls).map((database) => ({ database, scopes: null })),
-    ...Object.entries(config.database.queryProfiles).flatMap(([database, profiles]) =>
-      profiles.map(({ scopes }) => ({ database, scopes }))),
-  ];
+  const targets = Object.keys(config.database.queryUrls);
 
   async function warmPools() {
-    for (const { database, scopes } of targets) {
+    for (const database of targets) {
       if (closing) break;
-      const key = scopes ? scopeKey(scopes) : "";
-      const pool = pools.get(database)?.get(key)?.pool;
+      const pool = pools.get(database)?.get("")?.pool;
       const count = pool?.totalCount ?? 0;
       if (count >= config.database.pool.queryMin || maintenance.has(database)) continue;
-      const target = `${database}:${key}`;
       try {
         if (queryConnections >= config.database.pool.maxGlobalQueries && !await reclaimIdleConnection(pool)) continue;
         const oid = await getPostgresDatabaseOid(database, adminDb);
@@ -625,15 +616,15 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
         // Hold all prewarmed clients until the connections have been opened.
         const clients = await Promise.allSettled(Array.from(
           { length: Math.max(0, targetSize - alreadyInUse) },
-          () => connect(database, oid, scopes),
+          () => connect(database, oid),
         ));
         for (const client of clients) if (client.status === "fulfilled") client.value.release();
         const failed = clients.find((client) => client.status === "rejected");
         if (failed) throw failed.reason;
-        warmFailures.delete(target);
+        warmFailures.delete(database);
       } catch (error) {
-        if (!closing && !warmFailures.has(target)) log.warn({ err: error, database }, "Could not prewarm query connections");
-        warmFailures.add(target);
+        if (!closing && !warmFailures.has(database)) log.warn({ err: error, database }, "Could not prewarm query connections");
+        warmFailures.add(database);
       }
     }
   }

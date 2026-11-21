@@ -12,7 +12,7 @@
     "zod": "^4.6.7"
   },
   "name": "http-postgres",
-  "version": "1.0.0",
+  "version": "1.5.0",
   "engines": {
     "node": "^22.13.0 || >=23.4.0"
   },

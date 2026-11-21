@@ -6,6 +6,8 @@ export const resultOptions = z.strictObject({
   fullResults: z.boolean().optional(),
 });
 
+export type ResultOptions = z.infer<typeof resultOptions>;
+
 const isolationLevels = ["read uncommitted", "read committed", "repeatable read", "serializable"] as const;
 
 export const transactionOptions = resultOptions.extend({

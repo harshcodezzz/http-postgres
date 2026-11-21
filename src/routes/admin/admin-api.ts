@@ -7,7 +7,25 @@ import {
   updateApiKeyScope,
   ApiKeyError,
   type ApiKeyEnvironment,
+  type ApiKeyScopeInput,
 } from "../../utils/api-key.js";
+import { DatabaseError } from "../../utils/pg-database.js";
+
+function scopeErrorStatus(error: ApiKeyError | DatabaseError): number {
+  switch (error.code) {
+    case "KEY_NOT_FOUND":
+    case "TABLE_NOT_FOUND":
+    case "DATABASE_NOT_FOUND":
+      return 404;
+    case "INSUFFICIENT_PRIVILEGE":
+      return 403;
+    case "UNSAFE_DATABASE_SCOPE":
+    case "DATABASE_SCOPE_CHANGED":
+      return 409;
+    default:
+      return 400;
+  }
+}
 
 const adminApiRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get("/keys", async () => {
@@ -38,18 +56,18 @@ const adminApiRoutes: FastifyPluginAsync = async (fastify) => {
   });
 
   fastify.post<{
-    Body: {
-      databases?: unknown;
-      database?: string;
-      environment?: ApiKeyEnvironment;
-    };
+    Body: ApiKeyScopeInput & { environment?: ApiKeyEnvironment };
   }>("/keys", async (request, reply) => {
-    const { databases, database, environment = "LIVE" } = request.body ?? {};
+    const { databases, database, tables, "scope-database": databaseScope, "scope-table": tableScope,
+      environment = "LIVE" } = request.body ?? {};
 
     try {
       const result = await createApiKey({
         databases,
         database,
+        tables,
+        "scope-database": databaseScope,
+        "scope-table": tableScope,
         environment,
         db: fastify.jsondb,
         pgPool: fastify.db,
@@ -60,8 +78,8 @@ const adminApiRoutes: FastifyPluginAsync = async (fastify) => {
         data: result,
       });
     } catch (err: unknown) {
-      if (err instanceof ApiKeyError) {
-        return reply.code(400).send({
+      if (err instanceof ApiKeyError || err instanceof DatabaseError) {
+        return reply.code(scopeErrorStatus(err)).send({
           success: false,
           error: {
             code: err.code,
@@ -74,14 +92,18 @@ const adminApiRoutes: FastifyPluginAsync = async (fastify) => {
   });
 
   const updateScopeHandler = async (
-    request: FastifyRequest<{ Params: { id: string }; Body: { databases?: unknown } }>,
+    request: FastifyRequest<{ Params: { id: string }; Body: ApiKeyScopeInput }>,
     reply: FastifyReply,
   ) => {
-    const { databases } = request.body ?? {};
+    const { databases, database, tables, "scope-database": databaseScope, "scope-table": tableScope } = request.body ?? {};
 
     try {
       const updated = await updateApiKeyScope(request.params.id, {
         databases,
+        database,
+        tables,
+        "scope-database": databaseScope,
+        "scope-table": tableScope,
         db: fastify.jsondb,
         pgPool: fastify.db,
       });
@@ -91,9 +113,8 @@ const adminApiRoutes: FastifyPluginAsync = async (fastify) => {
         key: updated,
       };
     } catch (err: unknown) {
-      if (err instanceof ApiKeyError) {
-        const statusCode = err.code === "KEY_NOT_FOUND" ? 404 : 400;
-        return reply.code(statusCode).send({
+      if (err instanceof ApiKeyError || err instanceof DatabaseError) {
+        return reply.code(scopeErrorStatus(err)).send({
           success: false,
           error: {
             code: err.code,
@@ -105,11 +126,11 @@ const adminApiRoutes: FastifyPluginAsync = async (fastify) => {
     }
   };
 
-  fastify.patch<{ Params: { id: string }; Body: { databases?: unknown } }>(
+  fastify.patch<{ Params: { id: string }; Body: ApiKeyScopeInput }>(
     "/keys/:id",
     updateScopeHandler,
   );
-  fastify.put<{ Params: { id: string }; Body: { databases?: unknown } }>(
+  fastify.put<{ Params: { id: string }; Body: ApiKeyScopeInput }>(
     "/keys/:id",
     updateScopeHandler,
   );

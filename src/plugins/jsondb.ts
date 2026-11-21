@@ -5,7 +5,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { resolve, dirname } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import type { DatabaseScopes } from "../config/query-privileges.js";
+import type { DatabaseAccess } from "../config/query-privileges.js";
 
 let sqlite: Promise<typeof import("node:sqlite")> | undefined;
 
@@ -29,7 +29,8 @@ export interface ApiKeyRecord {
   keyPrefix: string;
   databases: string[];
   databaseOids?: Record<string, string>;
-  databaseScopes?: DatabaseScopes;
+  databaseScopes?: Record<string, unknown>;
+  accessScopes?: Record<string, DatabaseAccess>;
   environment: "LIVE" | "TEST";
   status: "active" | "revoked";
   createdAt: string;
@@ -42,6 +43,7 @@ export interface DataStore {
     hash: string;
   };
   apiKeys?: Record<string, ApiKeyRecord>;
+  queryRoleSecret?: string;
   [key: string]: unknown;
 }
 

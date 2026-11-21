@@ -24,7 +24,7 @@ const authPlugin: FastifyPluginAsync = async (fastify) => {
   fastify.decorateRequest("admin", false);
   fastify.decorateRequest("database", "");
   fastify.decorateRequest("databaseOid", "");
-  fastify.decorateRequest("queryScopes", null);
+  fastify.decorateRequest("queryAccess", null);
 
   fastify.addHook("onRequest", async (request, reply) => {
     if (request.routeOptions.config.publicHealth) return;
@@ -103,7 +103,7 @@ const authPlugin: FastifyPluginAsync = async (fastify) => {
     request.apiKey = result.record;
     request.database = database;
     request.databaseOid = result.databaseOid;
-    request.queryScopes = result.scopes ?? null;
+    request.queryAccess = result.access ?? null;
   });
 };
 

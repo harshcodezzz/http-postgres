@@ -1,8 +1,9 @@
-import { createTransactionStore, type RemovedExecution, type SavedSubmission } from "./store.js";
+import type { ExecutionStore, RemovedExecution, SavedSubmission } from "../execution-store.js";
 import { randomUUID } from "node:crypto";
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 import config from "../../config/index.js";
 import { DatabaseError as PostgresError, type PoolClient, type QueryResult } from "pg";
+import { isScopedStatement } from "../../utils/query-access.js";
 import { queryConnectionError, queryExecutionError } from "../../utils/query-pool.js";
 import { createResultBudget, losslessTypes, watchExecution, type ResultStatement } from "../query/execution.js";
 import { formatQueryResult } from "../query/index.js";
@@ -77,8 +78,7 @@ function sendRemoved(reply: FastifyReply, { id, lastStatus, removedAt }: Removed
   });
 }
 
-const transactionRoutes: FastifyPluginAsync = async (fastify) => {
-  const store = createTransactionStore(fastify.db);
+const transactionRoutes: FastifyPluginAsync<{ store: ExecutionStore }> = async (fastify, { store }) => {
   const activeBatches = new Set<Promise<void>>();
   let batchSlots = 0;
   const { retentionDays } = config.transactions;
@@ -92,7 +92,7 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
       pruning = store.prune(retentionDays).then((more) => {
         if (more) nextDelay = 1_000;
       }).catch((err) => {
-        fastify.log.error({ err }, "Could not prune expired transaction records");
+        fastify.log.error({ err }, "Could not prune expired execution records");
       }).finally(() => {
         pruning = undefined;
         schedulePrune(nextDelay);
@@ -201,7 +201,7 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
 
   async function commit(
     transaction: Transaction,
-    scopes: FastifyRequest["queryScopes"],
+    access: FastifyRequest["queryAccess"],
     reply?: FastifyReply,
     progress?: {
       completed: (count: number) => Promise<void>;
@@ -213,6 +213,10 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
     const failure = (status: number, code: string, message: string) =>
       respond(status, { success: false, error: { code, message } });
     const execution = watchExecution(reply, 60_000, fastify.queryPools);
+    if (access && [...transaction.queries.values()].some(({ query }) => !isScopedStatement(query))) {
+      execution.close();
+      return failure(403, "INSUFFICIENT_PRIVILEGE", "Scoped API keys can run only data queries");
+    }
     let storeFailed = false;
     async function saveProgress(operation: Promise<void>) {
       try {
@@ -230,7 +234,7 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
     try {
       execution.check();
       const acquired = await execution.wait(fastify.queryPools.connect(
-        transaction.database, transaction.databaseOid, scopes, transaction.owner, execution.signal,
+        transaction.database, transaction.databaseOid, access, transaction.owner, execution.signal,
       ).then((connection) => {
         execution.attach(connection);
         return connection;
@@ -427,11 +431,11 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
       return fail(reply, 503, "TRANSACTION_STORE_UNAVAILABLE", "Could not save transaction");
     }
 
-    const scopes = request.queryScopes;
+    const access = request.queryAccess;
     const batch = (async () => {
       try {
         await store.advance(transactionId, "pending", "running");
-        const outcome = await commit(transaction, scopes, undefined, {
+        const outcome = await commit(transaction, access, undefined, {
           completed: (count) => store.advance(transactionId, "running", "running", count),
           committing: (outcome) => store.advance(transactionId, "running", "committing", undefined, outcome),
         });
@@ -474,7 +478,7 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
       if (parameters?.length) {
         return fail(reply, 400, "INVALID_PARAMETERS", "COMMIT takes no parameters");
       }
-      const outcome = await commit(transaction, request.queryScopes, reply);
+      const outcome = await commit(transaction, request.queryAccess, reply);
       return reply.code(outcome.status).send(outcome.payload);
     }
 
@@ -540,17 +544,29 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
     };
   }
 
+  function readQueued(transaction: Transaction, request: FastifyRequest) {
+    const response = describeQueued(transaction);
+    if (request.method === "GET" && (transaction.status === "committed" || transaction.status === "failed")) {
+      removeTransaction(transaction);
+    }
+    return response;
+  }
+
   async function getById(request: FastifyRequest, reply: FastifyReply, id: string) {
+    reply.header("Cache-Control", "no-store");
     const queued = findTransaction(request, id);
-    if (queued) return describeQueued(queued);
+    if (queued) return readQueued(queued, request);
     try {
-      const record = await storedTransaction(request, id);
-      if (!record) {
-        const removed = await store.getRemoved(id, request.apiKey?.id ?? "", request.databaseOid);
+      const owner = request.apiKey?.id ?? "";
+      const oid = request.databaseOid;
+      const record = await store.get(id, owner, oid);
+      const state = record && executionStatus(record.status, record.expired);
+      if (!record || !state || (state.finalized && request.method === "GET" && !await store.remove(id, owner, oid))) {
+        const removed = await store.getRemoved(id, owner, oid);
         return removed ? sendRemoved(reply, removed) : fail(reply, 404, "TRANSACTION_NOT_FOUND", "Transaction not found");
       }
       const { expired, input, outcome, completedQueries, ...metadata } = record;
-      const { status, finalized } = executionStatus(record.status, expired);
+      const { status, finalized } = state;
       const abandoned = expired && !finalized;
       const abandonedError = abandoned && {
         code: status === "unknown" ? "TRANSACTION_COMMIT_FAILED" : "TRANSACTION_INTERRUPTED",
@@ -573,9 +589,10 @@ const transactionRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get<{ Querystring: { queryId?: string } }>("/", async (request, reply) => {
     const queryId = request.headers["query-id"] ?? request.headers["x-query-id"] ?? request.query?.queryId;
     if (queryId !== undefined) {
+      reply.header("Cache-Control", "no-store");
       const id = typeof queryId === "string" ? queryTransactions.get(queryId) : undefined;
       const transaction = id ? findTransaction(request, id) : undefined;
-      return transaction ? describeQueued(transaction) : fail(reply, 404, "QUERY_NOT_FOUND", "Query not found");
+      return transaction ? readQueued(transaction, request) : fail(reply, 404, "QUERY_NOT_FOUND", "Query not found");
     }
     const id = transactionHeader(request, reply);
     if (id) return getById(request, reply, id);

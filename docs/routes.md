@@ -5,7 +5,7 @@ The default base URL is `http://localhost:8080`. Send JSON bodies with `Content-
 | Routes | Authentication |
 | --- | --- |
 | `GET /health`, `HEAD /health` | Public and exempt from request limits. `GET` returns `{"status":"ok"}`. |
-| `/admin` | Put the admin password in `x-admin`. |
+| `/admin/*` | Put the gateway admin password in `x-admin`. |
 | `/query`, `/transaction` | Send `x-api-key` and `x-database`. The key must be active and scoped to the named database. |
 
 Query and transaction routes also accept the raw key in `Authorization` and the database name in `x-db-name`. Send the raw key without a `Bearer` prefix.
@@ -30,19 +30,33 @@ The JSON routes reject `COPY FROM STDIN` and `COPY TO STDOUT` with `COPY_STREAM_
 
 A query response or transaction batch can retain up to 50,000 result rows and approximately 8 MiB of result data and metadata. Immediate queries have a 35-second request deadline. If the gateway loses the result after sending immediate SQL, it returns `500 QUERY_OUTCOME_UNKNOWN` with the underlying reason in `error.cause`. This includes result-limit and deadline interruptions. Immediate SQL can commit on the server before the gateway detects an interruption. Verify any writes before retrying. Transaction execution has one 60-second deadline across acquisition, all statements, and commit. If the gateway has already sent `COMMIT` and cannot confirm the outcome, verify whether it committed before retrying.
 
+## Asynchronous queries
+
+Send `type: "async"` to either query POST endpoint. Omit `type` or use `"sync"` for an immediate response.
+
+```json
+{"type":"async","query":"SELECT $1::integer AS value","parameters":[42]}
+```
+
+The gateway returns `202 Accepted` with `queryId`, `status: "running"`, and a `Location` header. Poll `GET /query/:id` with the same API key and database. You can also send `query-id` or `x-query-id` to `GET /query`, or use `?queryId=…`.
+
+While SQL is running, polls return `finalized: false`. The first poll to get `finalized: true` returns `outcome.status` with the HTTP status the query would have returned directly and `outcome.payload` with its results or error. That poll consumes the result, and further GETs return `404 QUERY_NOT_FOUND`. A disconnected response can still consume the result.
+
+Async statements have a five-minute PostgreSQL statement timeout and the same result limits as immediate queries. Each gateway process accepts up to 32 concurrent asynchronous queries. Accepted work continues after the submission disconnects and during graceful shutdown. Stored outcomes survive gateway restarts. If the gateway loses the outcome, the expired record returns `status: "unknown"` and `QUERY_OUTCOME_UNKNOWN` on its final retrieval.
+
 ## Single-request transactions
 
 `POST /transaction/execute` accepts 1 to 100 statements in an ordered JSON array. Each entry can be a SQL string or an object with `query` and optional `parameters`. An outer `BEGIN` and `COMMIT` pair is optional. The gateway manages the actual transaction boundary. Use an array so statements keep their order and repeated JSON keys cannot overwrite them.
 
-The gateway saves the batch in PostgreSQL and returns `202 Accepted` with `transactionId`, `status: "pending"`, and a `Location` header. Poll `GET /transaction/:id` or `GET /transaction` with the `transaction-id` header using the same API key and database. The lookup returns `progress.completed` and `progress.total` while the batch runs. Saved completion counts only move forward. Accepted work continues if the submission request disconnects.
+The gateway saves the batch in PostgreSQL and returns `202 Accepted` with `transactionId`, `status: "pending"`, and a `Location` header. Poll `GET /transaction/:id` or `GET /transaction` with the `transaction-id` header using the same API key and database. The lookup returns `progress.completed` and `progress.total` while the batch runs. Saved completion counts only move forward. Accepted work continues if the submission request disconnects. The first GET that returns `finalized: true` also removes the execution record. Later GETs return `404 TRANSACTION_NOT_FOUND` or `410 TRANSACTION_RECORD_REMOVED` when the batch has an idempotency key.
 
 Set an `Idempotency-Key` before the first submission if you might retry it. Use 1 to 128 letters, digits, or `._~-`. Within the same API key and database, repeating the key with the same normalized batch returns `200 OK` with the original transaction ID, its current `status` and `finalized` flag, and a `Location` to poll for progress and results. Reusing the key for different SQL, parameters, or options returns `409 IDEMPOTENCY_KEY_CONFLICT`.
 
 The fingerprint ignores the order of option fields and treats explicit result-format defaults like omitted values. SQL text, statement order, parameter order, and the order of object keys inside SQL parameters remain significant because PostgreSQL can observe them. Tombstones created by an earlier release with only the original fingerprint accept replays of the original normalized input.
 
-Removing a keyed record deletes its inputs and results. The gateway keeps a tombstone with the original transaction ID, final status, and removal time for the configured retention period after removal. Replays and status lookups return `410 TRANSACTION_RECORD_REMOVED` while that tombstone exists. Records removed before this change can have a tombstone without the final status or removal time.
+Retrieving, explicitly deleting, or pruning a finalized keyed record deletes its inputs and results. The gateway keeps a tombstone with the original transaction ID, final status, and removal time for the configured retention period after removal. Replays and status lookups return `410 TRANSACTION_RECORD_REMOVED` while that tombstone exists. Records removed before this change can have a tombstone without the final status or removal time.
 
-The first shutdown signal stops the server and lets accepted batches finish. A second signal forces an exit. Set the service manager's shutdown grace period to accommodate the 60-second execution deadline and transaction-store writes.
+The first shutdown signal stops the server and lets accepted batches finish. A second signal forces an exit. Set the service manager's shutdown grace period to accommodate execution and storage writes. Transactions have a 60-second execution deadline. Asynchronous queries allow up to 305 seconds for acquisition and execution.
 
 | Status | Meaning |
 | --- | --- |
@@ -81,7 +95,7 @@ Use the same API key and database for every request in a transaction. Queues liv
 | `POST /transaction/create` or `POST /transaction` | Returns `201` with `transactionId`. |
 | `POST /transaction/add` | Send the `transaction-id` header and a JSON object with `query` and optional `parameters` or `params`. Returns `201` with `transactionId` and `queryId`. |
 | `POST /transaction/remove` or `DELETE /transaction/remove` | Send `transaction-id` and the `query-id` header. A JSON body with `queryId` also works in place of that header. The transaction must be pending. |
-| `GET /transaction` | Send `transaction-id`, or look up the containing transaction with the `query-id` header or `?queryId=…`. Returns the transaction status and its queued statements and parameters. |
+| `GET /transaction` | Send `transaction-id`, or look up the containing transaction with the `query-id` header or `?queryId=…`. Returns the transaction status and its queued statements and parameters. The first GET of a committed or terminal failed queue removes its record and query lookups. |
 | `DELETE /transaction` | Send `transaction-id`. Deletes the transaction record and its query lookups. Any committed changes remain in PostgreSQL. |
 
 The ID headers also accept `x-transaction-id` and `x-query-id`. Each queue entry is one SQL statement and must begin with a SQL command. Use the gateway's commit operation for transaction control.
@@ -101,33 +115,39 @@ If a statement fails, the gateway rolls back and returns the failing `queryId`. 
 | `GET /admin/logs` | Accepts `type=audit` (default) or `type=system`. `limit` defaults to 100 and is capped at 500. System logs come from the current file. Audit logs include the previous generation when needed. Reads scan up to 1 MiB per file. |
 | `GET /admin/keys` | Lists API key records. |
 | `GET /admin/keys/:id` | Gets one API key record by its record ID. |
-| `POST /admin/keys` | Creates a key from a `databases` privilege map. Name-only keys can use `database` or a `databases` array. `environment` accepts `LIVE` (default) or `TEST`. Save `data.apiKey` from the creation response. |
-| `PATCH /admin/keys/:id`, `PUT /admin/keys/:id` | Replaces an active key's complete database and privilege assignment. Explicitly scoped keys require a `databases` privilege map. |
+| `POST /admin/keys` | Creates a key with database and table CRUD scopes. `environment` accepts `LIVE` (default) or `TEST`. Save `data.apiKey` from the creation response. |
+| `PATCH /admin/keys/:id`, `PUT /admin/keys/:id` | Replaces the complete scope of an active key. |
 | `DELETE /admin/keys/:id` | Revokes the key. Add `?hard=true` to remove its record permanently. |
-| `GET /admin/databases` | Lists non-template databases. |
-| `GET /admin/databases/:name` | Gets database metadata, including ownership, encoding, and size when available. |
-| `POST /admin/databases` | Creates a database. Send `name` or `database`. Optional fields include `owner`, `template`, `encoding`, `lcCollate`, `lcCtype`, `tablespace`, and `connectionLimit`. |
-| `PATCH /admin/databases/:name`, `PUT /admin/databases/:name` | Updates `newName`, `owner`, `allowConnections`, `connectionLimit`, `settings`, or `resetSettings`. |
+| `GET /admin/database` | Lists all database names in the PostgreSQL cluster. |
+| `GET /admin/database/:id` | Accepts a database name or PostgreSQL OID. Returns the OID as `id`, ownership, encoding, server version, recorded collation version, and size when available. |
+| `POST /admin/database` | Creates a database. Send `name` or `database`. Optional fields include `owner`, `template`, `encoding`, `lcCollate`, `lcCtype`, `tablespace`, and `connectionLimit`. |
+| `PUT /admin/database` | Refreshes the recorded database collation version on PostgreSQL 15+. Send `{"database":"sales","version":"collation"}` after rebuilding objects affected by the collation change. PostgreSQL server upgrades are cluster-wide operations. |
+| `PATCH /admin/database` | Updates `newName`, `owner`, `allowConnections`, `connectionLimit`, `settings`, or `resetSettings`. Send the target in `database` or `id`. |
+| `GET /admin/table` | Lists regular and partitioned tables in the database selected by `x-database`. Each entry includes `oid`, `schema`, and `name`. |
 | `DELETE /admin/databases/:name` | Drops a database. Add `?force=true` to ask PostgreSQL to terminate existing connections. |
 
-Database administration uses the role configured in `database.url`. Databases created through the gateway require explicit `CONNECT` grants for application roles. Database updates run in one PostgreSQL transaction. Renaming or dropping a database also updates stored API-key scopes. A failure to update the local scope file after PostgreSQL succeeds is reported with a `PARTIAL_*` error. The gateway restricts destructive operations on `postgres`, `template0`, and `template1`. PostgreSQL requires a connection to another database to rename or drop the gateway's configured connection database.
+Database administration uses the PostgreSQL administrator configured in `database.url`. Databases created through the gateway require explicit `CONNECT` grants for application roles. Renaming or dropping a database also updates stored API-key scopes. A failure to update the local scope file after PostgreSQL succeeds is reported with a `PARTIAL_*` error. PostgreSQL requires a connection to another database to rename or drop the gateway's configured connection database.
 
-## API-key privileges by database
+The previous plural database routes remain available, including `PUT /admin/databases/:name` for property changes.
 
-Send a map of database names to PostgreSQL privileges when creating or updating a key. A single key can have a different set for each database.
+## API-key database and table scopes
+
+Send the database names in `database` and the database-wide operations in `scope-database`. Use `tables` and `scope-table` to add operations for selected tables. In this example, the key can read all current user tables in `sales` and insert into `public.orders`.
 
 ```json
 {
-  "databases": {
-    "sales": ["SELECT"],
-    "events": ["SELECT", "INSERT"]
-  }
+  "database": ["sales"],
+  "scope-database": ["r"],
+  "tables": ["public.orders"],
+  "scope-table": ["c"]
 }
 ```
 
-Each privilege list must match an exact [configured query profile](configuration.md#query-database-access). Case and order are ignored. Supported names are `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER`, `CREATE`, `CONNECT`, `TEMPORARY`, `EXECUTE`, `USAGE`, and `MAINTAIN`. Availability depends on the PostgreSQL version and the target object. [PostgreSQL privileges](https://www.postgresql.org/docs/current/ddl-priv.html)
+Use `c` for INSERT, `r` for SELECT, `u` for UPDATE, and `d` for DELETE. An empty `scope-database` makes a key table-only. Use `{"database":"sales","schema":"public","name":"orders"}` for table entries in a multi-database key. For a single database, use `schema.table` or an unqualified table name in `public`.
 
-Key records expose the assignment in `databaseScopes`. Query requests still supply `x-database` to choose the target. PostgreSQL applies that database's selected login privileges. Queued commits use the permissions in effect when the commit request authenticates. Existing name-only keys continue to use the default login configured for each database.
+The gateway creates a separate PostgreSQL login for each distinct grant set. PostgreSQL checks permissions on queries and transactions, including any SELECT privileges needed for `RETURNING` or for reading columns in a write statement. Scoped SQL requests accept one data statement at a time. Database-wide grants cover the tables present when the key is saved. Resave the key to include new tables. Queued commits use the permissions in effect when the commit request authenticates. [PostgreSQL privileges](https://www.postgresql.org/docs/current/ddl-priv.html)
+
+Existing name-only assignments use `database` as a string or `databases` as an array and connect through the corresponding default login in `queryUrls`.
 
 ## Errors and rate limits
 
@@ -136,18 +156,24 @@ Errors generally use `{"success":false,"error":{"code":"…","message":"…"}}`.
 | Error | Meaning |
 | --- | --- |
 | `401 API_KEY_SCOPE_REBIND_REQUIRED` | An older key needs an administrator to resave its database scope. |
-| `400 INVALID_DATABASE_SCOPE` | A database-to-privileges map or one of its privilege lists is invalid. |
-| `400 UNCONFIGURED_DATABASE_SCOPE` | The database lacks a query profile with exactly the requested privileges. |
-| `400 DATABASE_SCOPES_REQUIRED` | Updating an explicitly scoped key requires a database-to-privileges map. |
+| `400 INVALID_DATABASE_SCOPE`, `INVALID_TABLE_SCOPE` | A database or table scope is invalid or incomplete. |
+| `400 DATABASE_SCOPES_REQUIRED` | Updating an explicitly scoped key requires CRUD scopes. |
+| `404 TABLE_NOT_FOUND` | A table in the requested scope is missing. |
+| `409 UNSAFE_DATABASE_SCOPE` | PostgreSQL grants outside the requested scopes prevent provisioning a scoped login. |
+| `422 DATABASE_VERSION_UNSUPPORTED` | The version request requires the collation operation supported in PostgreSQL 15 and later. |
 | `403 DATABASE_SCOPE_CHANGED` | The database identity differs from the key's stored scope. |
 | `403 INSUFFICIENT_PRIVILEGE` | PostgreSQL denied the query login permission to run the SQL. |
 | `409 DATABASE_IN_USE` | The database is under gateway maintenance. |
 | `413 TRANSACTION_QUEUE_LIMIT_EXCEEDED` | The transaction exceeds its statement or byte limit. |
 | `429 TRANSACTION_LIMIT_EXCEEDED` | The process has reached its transaction storage limit. |
-| `503 QUERY_POOL_BUSY` | A checkout waited 400 ms and the selected database and profile pool was at capacity. |
+| `400 INVALID_QUERY_TYPE` | The query type was neither `async` nor `sync`. |
+| `404 QUERY_NOT_FOUND` | The asynchronous result was consumed or the query ID does not belong to this key and database. |
+| `503 QUERY_QUEUE_FULL` | The process has reached the concurrent asynchronous-query limit. |
+| `503 QUERY_STORE_UNAVAILABLE` | The gateway could not save or retrieve the asynchronous query record. |
+| `503 QUERY_POOL_BUSY` | A checkout waited 400 ms and the selected PostgreSQL login pool was at capacity. |
 | `413 RESULT_LIMIT_EXCEEDED` | A transaction exceeded the result budget before commit. |
 | `504 EXECUTION_DEADLINE_EXCEEDED` | Execution exceeded its deadline before immediate SQL or a transaction commit was sent. |
-| `500 QUERY_OUTCOME_UNKNOWN` | Immediate SQL was sent and may have taken effect. Check the underlying reason in `error.cause` and verify any writes before retrying. |
+| `500 QUERY_OUTCOME_UNKNOWN` | SQL was sent and may have taken effect. Check the underlying reason in `error.cause` and verify any writes before retrying. |
 | `503 QUERY_CONNECTION_LIMIT` | A checkout waited 400 ms and the process-wide query connection budget was full. |
 | `503 QUERY_POOL_WAIT_TIMEOUT` | No verified PostgreSQL session became available within the 400 ms checkout deadline. |
 | `503 QUERY_DATABASE_UNAVAILABLE` | The requested database's dedicated connection could not be opened or verified. |

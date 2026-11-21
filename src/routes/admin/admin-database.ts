@@ -2,9 +2,14 @@ import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 import {
   listPostgresDatabases,
   getPostgresDatabaseDetails,
+  getPostgresDatabaseOid,
   createPostgresDatabase,
   alterPostgresDatabase,
   deletePostgresDatabase,
+  refreshPostgresDatabaseVersion,
+  isValidDatabaseName,
+  listPostgresTables,
+  withPostgresDatabase,
   DatabaseError,
 } from "../../utils/pg-database.js";
 
@@ -46,7 +51,10 @@ function mapDatabaseErrorStatus(code: string): number {
     case "PROTECTED_DATABASE":
     case "INSUFFICIENT_PRIVILEGE":
       return 403;
+    case "DATABASE_VERSION_UNSUPPORTED":
+      return 422;
     case "INVALID_PARAMETER_VALUE":
+    case "DATABASE_REQUIRED":
     case "INVALID_DATABASE_NAME":
     case "INVALID_REQUEST_BODY":
       return 400;
@@ -166,9 +174,9 @@ function parseOptionalRecord(value: unknown, fieldName: string): Record<string, 
 }
 
 const adminDatabaseRoutes: FastifyPluginAsync = async (fastify) => {
-  fastify.get("/databases", async (_request, reply) => {
+  const listDatabases = async (reply: FastifyReply, includeTemplates: boolean) => {
     try {
-      const databases = await listPostgresDatabases(fastify.db);
+      const databases = await listPostgresDatabases(fastify.db, includeTemplates);
       return {
         success: true,
         count: databases.length,
@@ -183,113 +191,164 @@ const adminDatabaseRoutes: FastifyPluginAsync = async (fastify) => {
         "Failed to list databases",
       );
     }
-  });
+  };
+  fastify.get("/database", (_request, reply) => listDatabases(reply, true));
+  fastify.get("/databases", (_request, reply) => listDatabases(reply, false));
 
-  fastify.get<{ Params: { name: string } }>(
-    "/databases/:name",
-    async (request, reply) => {
-      const dbName = request.params.name;
-      try {
-        const details = await getPostgresDatabaseDetails(dbName, fastify.db);
+  const getDatabase = async (dbName: string, reply: FastifyReply, includeTemplates: boolean) => {
+    try {
+      const details = await getPostgresDatabaseDetails(dbName, fastify.db, includeTemplates);
 
-        if (!details) {
-          return reply.code(404).send({
-            success: false,
-            error: {
-              code: "DATABASE_NOT_FOUND",
-              message: `Database '${dbName}' not found`,
-            },
-          });
-        }
-
-        return {
-          success: true,
-          database: details,
-        };
-      } catch (err: unknown) {
-        return sendErrorReply(
-          reply,
-          err,
-          fastify.log,
-          "Failed to retrieve database details",
-          "Failed to retrieve database details",
-        );
-      }
-    },
-  );
-
-  fastify.post<{ Body: Record<string, unknown> }>(
-    "/databases",
-    async (request, reply) => {
-      const body = (request.body && typeof request.body === "object" ? request.body : {}) as Record<string, unknown>;
-      const rawName = getField(body, "name", "database");
-
-      if (rawName === undefined || rawName === null || typeof rawName !== "string" || rawName.trim() === "") {
-        return reply.code(400).send({
+      if (!details) {
+        return reply.code(404).send({
           success: false,
           error: {
-            code: "INVALID_DATABASE_NAME",
-            message: "Database name is required in 'name' or 'database'",
+            code: "DATABASE_NOT_FOUND",
+            message: `Database '${dbName}' not found`,
           },
         });
       }
 
-      try {
-        const owner = parseOptionalString(getField(body, "owner", "owner"), "owner");
-        const template = parseOptionalString(getField(body, "template", "template"), "template");
-        const encoding = parseOptionalString(getField(body, "encoding", "encoding"), "encoding");
-        const lcCollate = parseOptionalString(getField(body, "lcCollate", "lc_collate"), "lcCollate");
-        const lcCtype = parseOptionalString(getField(body, "lcCtype", "lc_ctype"), "lcCtype");
-        const tablespace = parseOptionalString(getField(body, "tablespace", "tablespace"), "tablespace");
-        const connectionLimit = parseOptionalInteger(
-          getField(body, "connectionLimit", "connection_limit"),
-          "connectionLimit",
-          -1,
-        );
+      return {
+        success: true,
+        database: details,
+      };
+    } catch (err: unknown) {
+      return sendErrorReply(
+        reply,
+        err,
+        fastify.log,
+        "Failed to retrieve database details",
+        "Failed to retrieve database details",
+      );
+    }
+  };
+  fastify.get<{ Params: { id: string } }>("/database/:id", (request, reply) => getDatabase(request.params.id, reply, true));
+  fastify.get<{ Params: { id: string } }>("/databases/:id", (request, reply) => getDatabase(request.params.id, reply, false));
 
-        await createPostgresDatabase(
-          {
-            name: rawName.trim(),
-            owner,
-            template,
-            encoding,
-            lcCollate,
-            lcCtype,
-            tablespace,
-            connectionLimit,
-          },
-          fastify.db,
-        );
+  const createHandler = async (request: FastifyRequest<{ Body: Record<string, unknown> }>, reply: FastifyReply) => {
+    const body = (request.body && typeof request.body === "object" ? request.body : {}) as Record<string, unknown>;
+    const rawName = getField(body, "name", "database");
 
-        return reply.code(201).send({
-          success: true,
-          message: `Database '${rawName.trim()}' created successfully`,
-          database: rawName.trim(),
-        });
-      } catch (err: unknown) {
-        return sendErrorReply(
-          reply,
-          err,
-          fastify.log,
-          "Failed to create database",
-          "Failed to create database",
-        );
+    if (rawName === undefined || rawName === null || typeof rawName !== "string" || rawName.trim() === "") {
+      return reply.code(400).send({
+        success: false,
+        error: {
+          code: "INVALID_DATABASE_NAME",
+          message: "Database name is required in 'name' or 'database'",
+        },
+      });
+    }
+
+    try {
+      const owner = parseOptionalString(getField(body, "owner", "owner"), "owner");
+      const template = parseOptionalString(getField(body, "template", "template"), "template");
+      const encoding = parseOptionalString(getField(body, "encoding", "encoding"), "encoding");
+      const lcCollate = parseOptionalString(getField(body, "lcCollate", "lc_collate"), "lcCollate");
+      const lcCtype = parseOptionalString(getField(body, "lcCtype", "lc_ctype"), "lcCtype");
+      const tablespace = parseOptionalString(getField(body, "tablespace", "tablespace"), "tablespace");
+      const connectionLimit = parseOptionalInteger(
+        getField(body, "connectionLimit", "connection_limit"),
+        "connectionLimit",
+        -1,
+      );
+
+      await createPostgresDatabase(
+        {
+          name: rawName.trim(),
+          owner,
+          template,
+          encoding,
+          lcCollate,
+          lcCtype,
+          tablespace,
+          connectionLimit,
+        },
+        fastify.db,
+      );
+
+      return reply.code(201).send({
+        success: true,
+        message: `Database '${rawName.trim()}' created successfully`,
+        database: rawName.trim(),
+      });
+    } catch (err: unknown) {
+      return sendErrorReply(
+        reply,
+        err,
+        fastify.log,
+        "Failed to create database",
+        "Failed to create database",
+      );
+    }
+  };
+  fastify.post("/database", createHandler);
+  fastify.post("/databases", createHandler);
+
+  fastify.get("/table", async (request, reply) => {
+    const database = request.headers["x-database"];
+    try {
+      if (database === undefined) {
+        throw new DatabaseError("The x-database header is required", "DATABASE_REQUIRED");
       }
-    },
-  );
+      if (!isValidDatabaseName(database)) {
+        throw new DatabaseError("A valid database name is required in x-database", "INVALID_DATABASE_NAME");
+      }
+      const oid = await getPostgresDatabaseOid(database, fastify.db);
+      if (!oid) throw new DatabaseError(`Database '${database}' not found`, "DATABASE_NOT_FOUND");
+      const tables = await withPostgresDatabase(database, async (client) => {
+        if (await getPostgresDatabaseOid(database, client) !== oid) {
+          throw new DatabaseError("Database identity changed while listing tables", "DATABASE_IN_USE");
+        }
+        return listPostgresTables(client);
+      });
+      return { success: true, database, count: tables.length, tables };
+    } catch (err) {
+      return sendErrorReply(reply, err, fastify.log, "Failed to list tables", "Failed to list tables");
+    }
+  });
+
+  function databaseTarget(request: FastifyRequest<{ Body: Record<string, unknown> }>) {
+    const target = request.body?.database ?? request.body?.id ?? request.headers["x-database"] ?? request.body?.name;
+    if (typeof target !== "string" || !target) {
+      throw new DatabaseError("A database name or ID is required", "INVALID_DATABASE_NAME");
+    }
+    return target;
+  }
+
+  fastify.put<{ Body: Record<string, unknown> }>("/database", async (request, reply) => {
+    try {
+      if (request.body?.version !== undefined && request.body.version !== "collation") {
+        throw new DatabaseError("Use version 'collation' to refresh the database collation version", "DATABASE_VERSION_UNSUPPORTED");
+      }
+      const target = databaseTarget(request);
+      const database = await getPostgresDatabaseDetails(target, fastify.db);
+      if (!database) throw new DatabaseError(`Database '${target}' not found`, "DATABASE_NOT_FOUND");
+      const updated = await fastify.queryPools.withMaintenance(
+        database.name, () => refreshPostgresDatabaseVersion(database, fastify.db),
+      );
+      return { success: true, database: updated };
+    } catch (err) {
+      return sendErrorReply(reply, err, fastify.log, "Failed to refresh database version", "Failed to refresh database version");
+    }
+  });
 
   const alterHandler = async (
     request: FastifyRequest<{
-      Params: { name: string };
+      Params: { name?: string };
       Body: Record<string, unknown>;
     }>,
     reply: FastifyReply,
   ) => {
-    const dbName = request.params.name;
     const body = (request.body && typeof request.body === "object" ? request.body : {}) as Record<string, unknown>;
 
     try {
-      const newName = parseOptionalString(getField(body, "newName", "name"), "newName");
+      const pathName = request.params.name;
+      const target = pathName ?? databaseTarget(request);
+      const details = pathName ? null : await getPostgresDatabaseDetails(target, fastify.db);
+      if (!pathName && !details) throw new DatabaseError(`Database '${target}' not found`, "DATABASE_NOT_FOUND");
+      const dbName = details?.name ?? target;
+      const newName = parseOptionalString(pathName ? getField(body, "newName", "name") : body.newName, "newName");
       const owner = parseOptionalString(getField(body, "owner", "owner"), "owner");
       const allowConnections = parseOptionalBoolean(
         getField(body, "allowConnections", "allow_connections"),
@@ -318,6 +377,7 @@ const adminDatabaseRoutes: FastifyPluginAsync = async (fastify) => {
         },
         fastify.db,
         fastify.jsondb,
+        details?.id,
       );
 
       const result = newName && newName !== dbName
@@ -342,6 +402,8 @@ const adminDatabaseRoutes: FastifyPluginAsync = async (fastify) => {
       );
     }
   };
+
+  fastify.patch<{ Params: { name?: string }; Body: Record<string, unknown> }>("/database", alterHandler);
 
   fastify.patch<{
     Params: { name: string };

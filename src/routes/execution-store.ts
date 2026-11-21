@@ -1,16 +1,16 @@
 import type { Pool } from "pg";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
-import type { TransactionOptions } from "../query/options.js";
+import type { TransactionOptions } from "./query/options.js";
 
 type TransactionInput = {
   queries: { query: string; parameters: unknown[] }[];
   options: TransactionOptions;
 };
-type TransactionOutcome = { status: number; payload: object };
+export type ExecutionOutcome = { status: number; payload: object };
 type FinalStatus = "committed" | "rejected" | "failed" | "unknown";
 const pruneBatchSize = 500;
-const transactionIdPattern = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i;
+const executionIdPattern = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i;
 const saveTombstones = `
   UPDATE http_postgres_gateway.submission_keys AS submission
   SET removed_at = clock_timestamp(), final_status = removed.status
@@ -34,14 +34,14 @@ interface StoredTransaction {
   transactionId: string;
   status: string;
   input: TransactionInput | string;
-  outcome: TransactionOutcome | string | null;
+  outcome: ExecutionOutcome | string | null;
   completedQueries: number;
   createdAt: Date;
   updatedAt: Date;
   expired: boolean;
 }
 
-function encodePayload(payload: TransactionInput | TransactionOutcome) {
+function encodePayload(payload: TransactionInput | ExecutionOutcome) {
   // JSONB strings containing base64 also work with non-UTF-8 databases and escaped NULs.
   return JSON.stringify(Buffer.from(JSON.stringify(payload), "utf8").toString("base64"));
 }
@@ -71,7 +71,24 @@ function canonicalInputHash({ queries, options }: TransactionInput) {
   });
 }
 
-export function createTransactionStore(pool: Pool) {
+function missingStorage(error: unknown) {
+  return error instanceof Error && "code" in error && (error.code === "42P01" || error.code === "3F000");
+}
+
+async function retryFinalization(operation: () => Promise<void>) {
+  const delays = [0, 100, 500];
+  for (const [attempt, waitMs] of delays.entries()) {
+    if (waitMs) await delay(waitMs);
+    try {
+      await operation();
+      return;
+    } catch (error) {
+      if (attempt === delays.length - 1) throw error;
+    }
+  }
+}
+
+export function createExecutionStore(pool: Pool) {
   let ready: Promise<unknown> | undefined;
   function ensure() {
     return ready ??= pool.query(`
@@ -88,7 +105,7 @@ export function createTransactionStore(pool: Pool) {
           WHERE nspname = 'http_postgres_gateway'
             AND nspowner = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user)
         ) THEN
-          RAISE EXCEPTION 'The transaction storage schema must belong to the administrative role';
+          RAISE EXCEPTION 'The execution storage schema must belong to the administrative role';
         END IF;
         REVOKE ALL ON SCHEMA http_postgres_gateway FROM PUBLIC;
         IF pg_catalog.to_regclass('http_postgres_gateway.transactions') IS NULL THEN
@@ -143,6 +160,18 @@ export function createTransactionStore(pool: Pool) {
           ALTER TABLE http_postgres_gateway.submission_keys
             ADD COLUMN removed_at timestamptz, ADD COLUMN final_status text;
         END IF;
+        IF pg_catalog.to_regclass('http_postgres_gateway.async_queries') IS NULL THEN
+          CREATE TABLE http_postgres_gateway.async_queries (
+            id uuid PRIMARY KEY,
+            owner text NOT NULL,
+            database_oid text NOT NULL,
+            deadline timestamptz NOT NULL,
+            outcome jsonb,
+            completed_at timestamptz
+          );
+          CREATE INDEX async_queries_retention_idx ON http_postgres_gateway.async_queries
+            (COALESCE(completed_at, deadline));
+        END IF;
         IF pg_catalog.to_regclass('http_postgres_gateway.transactions_retention_idx') IS NULL THEN
           CREATE INDEX transactions_retention_idx ON http_postgres_gateway.transactions (updated_at)
             WHERE status IN ('committed', 'rejected', 'failed', 'unknown');
@@ -158,6 +187,53 @@ export function createTransactionStore(pool: Pool) {
       ready = undefined;
       throw error;
     });
+  }
+
+  async function createQuery(id: string, owner: string, oid: string, windowMs: number) {
+    await ensure();
+    await pool.query(`
+      INSERT INTO http_postgres_gateway.async_queries (id, owner, database_oid, deadline)
+      VALUES ($1, $2, $3, clock_timestamp() + $4::integer * interval '1 millisecond')
+    `, [id, owner, oid, windowMs]);
+  }
+
+  async function finishQuery(id: string, outcome: ExecutionOutcome) {
+    const payload = encodePayload(outcome);
+    await retryFinalization(async () => {
+      await pool.query(`
+        UPDATE http_postgres_gateway.async_queries
+        SET outcome = $2, completed_at = clock_timestamp()
+        WHERE id = $1 AND outcome IS NULL
+      `, [id, payload]);
+    });
+  }
+
+  async function takeQuery(id: string, owner: string, oid: string) {
+    if (!executionIdPattern.test(id)) return;
+    try {
+      const { rows: [record] } = await pool.query<{ outcome: ExecutionOutcome | string | null; finalized: boolean }>(`
+        WITH consumed AS (
+          DELETE FROM http_postgres_gateway.async_queries
+          WHERE id = $1 AND owner = $2 AND database_oid = $3
+            AND (outcome IS NOT NULL OR deadline <= statement_timestamp())
+          RETURNING outcome
+        )
+        SELECT outcome, true AS finalized FROM consumed
+        UNION ALL
+        SELECT NULL, false
+        FROM http_postgres_gateway.async_queries
+        WHERE id = $1 AND owner = $2 AND database_oid = $3
+          AND outcome IS NULL AND deadline > statement_timestamp()
+      `, [id, owner, oid]);
+      if (record) {
+        return {
+          finalized: record.finalized,
+          outcome: record.outcome === null ? null : decodePayload(record.outcome),
+        };
+      }
+    } catch (error) {
+      if (!missingStorage(error)) throw error;
+    }
   }
 
   async function getSubmission(owner: string, oid: string, key: string, input: TransactionInput) {
@@ -216,7 +292,7 @@ export function createTransactionStore(pool: Pool) {
   }
 
   async function advance(
-    id: string, previous: string, status: string, completed?: number, outcome?: TransactionOutcome,
+    id: string, previous: string, status: string, completed?: number, outcome?: ExecutionOutcome,
   ) {
     const result = await pool.query(`
       UPDATE http_postgres_gateway.transactions
@@ -227,36 +303,30 @@ export function createTransactionStore(pool: Pool) {
     if (result.rowCount !== 1) throw new Error("Transaction execution window expired");
   }
 
-  async function finish(id: string, status: FinalStatus, outcome?: TransactionOutcome) {
+  async function finish(id: string, status: FinalStatus, outcome?: ExecutionOutcome) {
     const payload = outcome ? encodePayload(outcome) : null;
-    const delays = [0, 100, 500];
-    for (const [attempt, waitMs] of delays.entries()) {
-      if (waitMs) await delay(waitMs);
-      try {
-        const result = await pool.query(`
-          UPDATE http_postgres_gateway.transactions
-          SET status = $2,
-              outcome = CASE WHEN $2 = 'committed' THEN prepared_outcome ELSE $3 END,
-              prepared_outcome = NULL, updated_at = clock_timestamp()
-          WHERE id = $1 AND status IN ('pending', 'running', 'committing')
-            AND ($2 <> 'committed' OR (status = 'committing' AND prepared_outcome IS NOT NULL))
-        `, [id, status, payload]);
-        if (result.rowCount === 0) {
-          const { rows: [record] } = await pool.query<{ status: string }>(`
-            SELECT status FROM http_postgres_gateway.transactions WHERE id = $1
-          `, [id]);
-          if (record?.status !== status) throw new Error("The stored transaction could not be finalized");
-        }
-        return;
-      } catch (error) {
-        if (attempt === delays.length - 1) throw error;
+    await retryFinalization(async () => {
+      const result = await pool.query(`
+        UPDATE http_postgres_gateway.transactions
+        SET status = $2,
+            outcome = CASE WHEN $2 = 'committed' THEN prepared_outcome ELSE $3 END,
+            prepared_outcome = NULL, updated_at = clock_timestamp()
+        WHERE id = $1 AND status IN ('pending', 'running', 'committing')
+          AND ($2 <> 'committed' OR (status = 'committing' AND prepared_outcome IS NOT NULL))
+      `, [id, status, payload]);
+      if (result.rowCount === 0) {
+        const { rows: [record] } = await pool.query<{ status: string }>(`
+          SELECT status FROM http_postgres_gateway.transactions WHERE id = $1
+        `, [id]);
+        // A previous attempt may have committed just before the first poll consumed it.
+        if (record && record.status !== status) throw new Error("The stored transaction could not be finalized");
       }
-    }
+    });
   }
 
   // A rename changes the label but preserves the database OID.
   async function get(id: string, owner: string, oid: string) {
-    if (!transactionIdPattern.test(id)) return;
+    if (!executionIdPattern.test(id)) return;
     // Status lookup must not need schema-creation privileges for existing deployments.
     try {
       const { rows } = await pool.query<StoredTransaction>(`
@@ -276,13 +346,12 @@ export function createTransactionStore(pool: Pool) {
         };
       }
     } catch (error) {
-      if (error instanceof Error && "code" in error && (error.code === "42P01" || error.code === "3F000")) return;
-      throw error;
+      if (!missingStorage(error)) throw error;
     }
   }
 
   async function getRemoved(id: string, owner: string, oid: string) {
-    if (!transactionIdPattern.test(id)) return;
+    if (!executionIdPattern.test(id)) return;
     try {
       const { rows: [record] } = await pool.query<RemovedExecution>(`
         SELECT transaction_id AS id,
@@ -296,8 +365,7 @@ export function createTransactionStore(pool: Pool) {
       `, [id, owner, oid]);
       return record;
     } catch (error) {
-      if (error instanceof Error && "code" in error && (error.code === "42P01" || error.code === "3F000")) return;
-      throw error;
+      if (!missingStorage(error)) throw error;
     }
   }
 
@@ -351,8 +419,20 @@ export function createTransactionStore(pool: Pool) {
       WHERE (submission.owner, submission.database_oid, submission.key) =
             (expired.owner, expired.database_oid, expired.key)
     `, [retentionDays, pruneBatchSize]);
-    return records.rowCount === pruneBatchSize || keys.rowCount === pruneBatchSize;
+    const queries = await pool.query(`
+      WITH expired AS (
+        SELECT id FROM http_postgres_gateway.async_queries
+        WHERE COALESCE(completed_at, deadline) <= statement_timestamp() - pg_catalog.make_interval(days => $1)
+        ORDER BY COALESCE(completed_at, deadline)
+        LIMIT $2 FOR UPDATE SKIP LOCKED
+      )
+      DELETE FROM http_postgres_gateway.async_queries AS query
+      USING expired WHERE query.id = expired.id
+    `, [retentionDays, pruneBatchSize]);
+    return [records, keys, queries].some(({ rowCount }) => rowCount === pruneBatchSize);
   }
 
-  return { create, getSubmission, advance, finish, get, getRemoved, remove, prune };
+  return { create, getSubmission, advance, finish, get, getRemoved, remove, prune, createQuery, finishQuery, takeQuery };
 }
+
+export type ExecutionStore = ReturnType<typeof createExecutionStore>;
