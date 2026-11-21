@@ -40,21 +40,21 @@ Send `type: "async"` to either query POST endpoint. Omit `type` or use `"sync"` 
 
 The gateway returns `202 Accepted` with `queryId`, `status: "running"`, and a `Location` header. Poll `GET /query/:id` with the same API key and database. You can also send `query-id` or `x-query-id` to `GET /query`, or use `?queryId=…`.
 
-While SQL is running, polls return `finalized: false`. The first poll to get `finalized: true` returns `outcome.status` with the HTTP status the query would have returned directly and `outcome.payload` with its results or error. That poll consumes the result, and further GETs return `404 QUERY_NOT_FOUND`. A disconnected response can still consume the result.
+While SQL is running, polls return `finalized: false`. Once `finalized` is true, the response includes `outcome.status` with the HTTP status the query would have returned directly and `outcome.payload` with its results or error. GET requests can be repeated. After receiving the result, send `DELETE /query/:id` with the same API key and database. Deleting a running query returns `409 QUERY_IN_PROGRESS`. After removal, GET returns `404 QUERY_NOT_FOUND`.
 
-Async statements have a five-minute PostgreSQL statement timeout and the same result limits as immediate queries. Each gateway process accepts up to 32 concurrent asynchronous queries. Accepted work continues after the submission disconnects and during graceful shutdown. Stored outcomes survive gateway restarts. If the gateway loses the outcome, the expired record returns `status: "unknown"` and `QUERY_OUTCOME_UNKNOWN` on its final retrieval.
+Async statements have a five-minute PostgreSQL statement timeout and the same result limits as immediate queries. Each gateway process accepts up to 32 concurrent asynchronous queries. Accepted work continues after the submission disconnects and during graceful shutdown. Stored outcomes survive gateway restarts. If the gateway loses the outcome, polls report `status: "unknown"` and `QUERY_OUTCOME_UNKNOWN` after the execution window expires.
 
 ## Single-request transactions
 
 `POST /transaction/execute` accepts 1 to 100 statements in an ordered JSON array. Each entry can be a SQL string or an object with `query` and optional `parameters`. An outer `BEGIN` and `COMMIT` pair is optional. The gateway manages the actual transaction boundary. Use an array so statements keep their order and repeated JSON keys cannot overwrite them.
 
-The gateway saves the batch in PostgreSQL and returns `202 Accepted` with `transactionId`, `status: "pending"`, and a `Location` header. Poll `GET /transaction/:id` or `GET /transaction` with the `transaction-id` header using the same API key and database. The lookup returns `progress.completed` and `progress.total` while the batch runs. Saved completion counts only move forward. Accepted work continues if the submission request disconnects. The first GET that returns `finalized: true` also removes the execution record. Later GETs return `404 TRANSACTION_NOT_FOUND` or `410 TRANSACTION_RECORD_REMOVED` when the batch has an idempotency key.
+The gateway saves the batch in PostgreSQL and returns `202 Accepted` with `transactionId`, `status: "pending"`, and a `Location` header. Poll `GET /transaction/:id` or `GET /transaction` with the `transaction-id` header using the same API key and database. The lookup returns `progress.completed` and `progress.total` while the batch runs. Saved completion counts only move forward. Accepted work continues if the submission request disconnects. GET requests can be repeated. After receiving the final outcome, send `DELETE /transaction/:id`. After removal, GET returns `404 TRANSACTION_NOT_FOUND` or `410 TRANSACTION_RECORD_REMOVED` when the batch has an idempotency key.
 
 Set an `Idempotency-Key` before the first submission if you might retry it. Use 1 to 128 letters, digits, or `._~-`. Within the same API key and database, repeating the key with the same normalized batch returns `200 OK` with the original transaction ID, its current `status` and `finalized` flag, and a `Location` to poll for progress and results. Reusing the key for different SQL, parameters, or options returns `409 IDEMPOTENCY_KEY_CONFLICT`.
 
 The fingerprint ignores the order of option fields and treats explicit result-format defaults like omitted values. SQL text, statement order, parameter order, and the order of object keys inside SQL parameters remain significant because PostgreSQL can observe them. Tombstones created by an earlier release with only the original fingerprint accept replays of the original normalized input.
 
-Retrieving, explicitly deleting, or pruning a finalized keyed record deletes its inputs and results. The gateway keeps a tombstone with the original transaction ID, final status, and removal time for the configured retention period after removal. Replays and status lookups return `410 TRANSACTION_RECORD_REMOVED` while that tombstone exists. Records removed before this change can have a tombstone without the final status or removal time.
+Deleting or pruning a finalized keyed record removes its inputs and results. The gateway keeps a tombstone with the original transaction ID, final status, and removal time for the configured retention period after removal. Replays and status lookups return `410 TRANSACTION_RECORD_REMOVED` while that tombstone exists. Records removed before this change can have a tombstone without the final status or removal time.
 
 The first shutdown signal stops the server and lets accepted batches finish. A second signal forces an exit. Set the service manager's shutdown grace period to accommodate execution and storage writes. Transactions have a 60-second execution deadline. Asynchronous queries allow up to 305 seconds for acquisition and execution.
 
@@ -66,7 +66,7 @@ The first shutdown signal stops the server and lets accepted batches finish. A s
 | `failed` | Execution did not reach a successful commit. |
 | `unknown` | The commit outcome could not be confirmed. Verify it before resubmitting. |
 
-Execution records survive gateway restarts. The gateway stages the results before sending `COMMIT`. It publishes them only after PostgreSQL confirms the commit and the gateway saves the `committed` status. A crash or prolonged storage outage near commit can still leave the status uncertain. Interrupted batches are never replayed automatically. After the execution window, a stalled record is reported as `failed` or `unknown` with `finalized: false`. Only records with `finalized: true` can be deleted with `DELETE /transaction/:id` or the header-based delete route. After a database rename, use its new name with the same, updated API key to look up or delete saved records. Deleting a record does not undo committed SQL.
+Execution records survive gateway restarts. The gateway stages the results before sending `COMMIT`. It publishes them only after PostgreSQL confirms the commit and the gateway saves the `committed` status. A crash or prolonged storage outage near commit can still leave the status uncertain. Interrupted batches are never replayed automatically. After the execution window, a stalled record is reported as `failed` or `unknown` with `finalized: true`. Finalized records can be deleted with `DELETE /transaction/:id` or the header-based delete route. Deleting a batch that is still running returns `409 TRANSACTION_IN_PROGRESS`. After a database rename, use its new name with the same, updated API key to look up or delete saved records. Deleting a record does not undo committed SQL.
 
 ```json
 {
@@ -95,7 +95,7 @@ Use the same API key and database for every request in a transaction. Queues liv
 | `POST /transaction/create` or `POST /transaction` | Returns `201` with `transactionId`. |
 | `POST /transaction/add` | Send the `transaction-id` header and a JSON object with `query` and optional `parameters` or `params`. Returns `201` with `transactionId` and `queryId`. |
 | `POST /transaction/remove` or `DELETE /transaction/remove` | Send `transaction-id` and the `query-id` header. A JSON body with `queryId` also works in place of that header. The transaction must be pending. |
-| `GET /transaction` | Send `transaction-id`, or look up the containing transaction with the `query-id` header or `?queryId=…`. Returns the transaction status and its queued statements and parameters. The first GET of a committed or terminal failed queue removes its record and query lookups. |
+| `GET /transaction` | Send `transaction-id`, or look up the containing transaction with the `query-id` header or `?queryId=…`. Returns the transaction status and queued SQL. |
 | `DELETE /transaction` | Send `transaction-id`. Deletes the transaction record and its query lookups. Any committed changes remain in PostgreSQL. |
 
 The ID headers also accept `x-transaction-id` and `x-query-id`. Each queue entry is one SQL statement and must begin with a SQL command. Use the gateway's commit operation for transaction control.
@@ -113,6 +113,7 @@ If a statement fails, the gateway rolls back and returns the failing `queryId`. 
 | `GET /admin` | Returns the admin service identity. |
 | `GET /admin/health` | Checks PostgreSQL, the key-value store, JsonDB, and query-connection monitoring. Includes query capacity metrics and reports `healthy` or `degraded`. |
 | `GET /admin/logs` | Accepts `type=audit` (default) or `type=system`. `limit` defaults to 100 and is capped at 500. System logs come from the current file. Audit logs include the previous generation when needed. Reads scan up to 1 MiB per file. |
+| `GET /admin/analytics` | Returns total and failed query counts, usage by API key ID, and recent failed SQL. `limit` defaults to 50 and is capped at 200. |
 | `GET /admin/keys` | Lists API key records. |
 | `GET /admin/keys/:id` | Gets one API key record by its record ID. |
 | `POST /admin/keys` | Creates a key with database and table CRUD scopes. `environment` accepts `LIVE` (default) or `TEST`. Save `data.apiKey` from the creation response. |
@@ -130,6 +131,10 @@ Database administration uses the PostgreSQL administrator configured in `databas
 
 The previous plural database routes remain available, including `PUT /admin/databases/:name` for property changes.
 
+Analytics counts completed query executions and each attempted statement in a transaction. A legacy query submission containing multiple statements counts once. Polling, idempotent replays, and statements skipped after a batch error leave counts unchanged. Transaction counts reflect statement execution even when a later statement causes a rollback.
+
+Only failed SQL is stored in analytics, with the SQLSTATE and gateway error code where available. SQL text is limited to 8,192 characters per failure. Bound values are omitted from analytics and new transaction inputs. Use placeholders for sensitive inputs because SQL literals remain part of the statement text.
+
 ## API-key database and table scopes
 
 Send the database names in `database` and the database-wide operations in `scope-database`. Use `tables` and `scope-table` to add operations for selected tables. In this example, the key can read all current user tables in `sales` and insert into `public.orders`.
@@ -145,7 +150,7 @@ Send the database names in `database` and the database-wide operations in `scope
 
 Use `c` for INSERT, `r` for SELECT, `u` for UPDATE, and `d` for DELETE. An empty `scope-database` makes a key table-only. Use `{"database":"sales","schema":"public","name":"orders"}` for table entries in a multi-database key. For a single database, use `schema.table` or an unqualified table name in `public`.
 
-The gateway creates a separate PostgreSQL login for each distinct grant set. PostgreSQL checks permissions on queries and transactions, including any SELECT privileges needed for `RETURNING` or for reading columns in a write statement. Scoped SQL requests accept one data statement at a time. Database-wide grants cover the tables present when the key is saved. Resave the key to include new tables. Queued commits use the permissions in effect when the commit request authenticates. [PostgreSQL privileges](https://www.postgresql.org/docs/current/ddl-priv.html)
+The gateway creates a separate PostgreSQL login for each distinct grant set. PostgreSQL checks permissions on queries and transactions, including any SELECT privileges needed for `RETURNING` or for reading columns in a write statement. Scoped SQL requests accept one data statement at a time. A key with only read access uses PostgreSQL read-only transactions. Inherited and partitioned tables require matching privileges on descendants for any operation that can reach them. Database-wide grants cover the tables present when the key is saved. Resave the key to include new tables or sequences used by new column defaults. Queued commits use the permissions in effect when the commit request authenticates. [PostgreSQL privileges](https://www.postgresql.org/docs/current/ddl-priv.html)
 
 Existing name-only assignments use `database` as a string or `databases` as an array and connect through the corresponding default login in `queryUrls`.
 
@@ -167,9 +172,10 @@ Errors generally use `{"success":false,"error":{"code":"…","message":"…"}}`.
 | `413 TRANSACTION_QUEUE_LIMIT_EXCEEDED` | The transaction exceeds its statement or byte limit. |
 | `429 TRANSACTION_LIMIT_EXCEEDED` | The process has reached its transaction storage limit. |
 | `400 INVALID_QUERY_TYPE` | The query type was neither `async` nor `sync`. |
-| `404 QUERY_NOT_FOUND` | The asynchronous result was consumed or the query ID does not belong to this key and database. |
+| `404 QUERY_NOT_FOUND` | The asynchronous query record is missing for this key and database. |
+| `409 QUERY_IN_PROGRESS`, `TRANSACTION_IN_PROGRESS` | The execution record is still active and cannot be deleted. |
 | `503 QUERY_QUEUE_FULL` | The process has reached the concurrent asynchronous-query limit. |
-| `503 QUERY_STORE_UNAVAILABLE` | The gateway could not save or retrieve the asynchronous query record. |
+| `503 QUERY_STORE_UNAVAILABLE` | The gateway could not save, retrieve, or delete the asynchronous query record. |
 | `503 QUERY_POOL_BUSY` | A checkout waited 400 ms and the selected PostgreSQL login pool was at capacity. |
 | `413 RESULT_LIMIT_EXCEEDED` | A transaction exceeded the result budget before commit. |
 | `504 EXECUTION_DEADLINE_EXCEEDED` | Execution exceeded its deadline before immediate SQL or a transaction commit was sent. |
@@ -178,4 +184,6 @@ Errors generally use `{"success":false,"error":{"code":"…","message":"…"}}`.
 | `503 QUERY_POOL_WAIT_TIMEOUT` | No verified PostgreSQL session became available within the 400 ms checkout deadline. |
 | `503 QUERY_DATABASE_UNAVAILABLE` | The requested database's dedicated connection could not be opened or verified. |
 
-PostgreSQL errors during SQL execution include the SQLSTATE in `pgCode` and structured fields for severity, schema, table, column, constraint, data type, and position where available. The `detail` and `hint` fields are null by default because PostgreSQL can include data values or internal context. Trusted deployments can enable them with `database.exposeErrorDetails`.
+Immediate PostgreSQL errors include the SQLSTATE in `pgCode` and structured fields for severity, schema, table, column, constraint, data type, and position where available. The `detail` and `hint` fields are null by default because PostgreSQL can include data values or internal context. Trusted deployments can enable them with `database.exposeErrorDetails`.
+
+Saved async query and transaction errors retain SQLSTATE, gateway code, and the failing statement identifier when available. Their messages omit PostgreSQL diagnostic text that may quote bound values.

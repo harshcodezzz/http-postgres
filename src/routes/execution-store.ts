@@ -7,10 +7,23 @@ type TransactionInput = {
   queries: { query: string; parameters: unknown[] }[];
   options: TransactionOptions;
 };
+type StoredTransactionInput = {
+  queries: { query: string }[];
+  options: TransactionOptions;
+};
 export type ExecutionOutcome = { status: number; payload: object };
 type FinalStatus = "committed" | "rejected" | "failed" | "unknown";
 const pruneBatchSize = 500;
 const executionIdPattern = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i;
+const terminalTransactionStatuses = "('committed', 'rejected', 'failed', 'unknown')";
+const transactionFinalized = `status IN ${terminalTransactionStatuses} OR deadline <= statement_timestamp()`;
+const finalTransactionStatus = `CASE
+  WHEN status IN ${terminalTransactionStatuses} THEN status
+  WHEN status = 'committing' THEN 'unknown'
+  ELSE 'failed'
+END`;
+const queryFinalized = "outcome IS NOT NULL OR deadline <= statement_timestamp()";
+type RemovalState = "removed" | "running";
 const saveTombstones = `
   UPDATE http_postgres_gateway.submission_keys AS submission
   SET removed_at = clock_timestamp(), final_status = removed.status
@@ -33,7 +46,7 @@ export interface SavedSubmission extends RemovedExecution {
 interface StoredTransaction {
   transactionId: string;
   status: string;
-  input: TransactionInput | string;
+  input: StoredTransactionInput | string;
   outcome: ExecutionOutcome | string | null;
   completedQueries: number;
   createdAt: Date;
@@ -41,7 +54,7 @@ interface StoredTransaction {
   expired: boolean;
 }
 
-function encodePayload(payload: TransactionInput | ExecutionOutcome) {
+function encodePayload(payload: StoredTransactionInput | ExecutionOutcome) {
   // JSONB strings containing base64 also work with non-UTF-8 databases and escaped NULs.
   return JSON.stringify(Buffer.from(JSON.stringify(payload), "utf8").toString("base64"));
 }
@@ -50,6 +63,44 @@ function decodePayload<T>(payload: T | string): T {
   return typeof payload === "string"
     ? JSON.parse(Buffer.from(payload, "base64").toString("utf8")) as T
     : payload;
+}
+
+function errorFields(outcome: ExecutionOutcome): Record<string, unknown> {
+  const error = "error" in outcome.payload ? outcome.payload.error : undefined;
+  return error && typeof error === "object" ? error as Record<string, unknown> : {};
+}
+
+function errorCode(value: unknown) {
+  return typeof value === "string" && /^[A-Z0-9_]{1,64}$/.test(value) ? value : undefined;
+}
+
+export function executionErrorCodes(outcome: ExecutionOutcome) {
+  const { code, pgCode } = errorFields(outcome);
+  return {
+    code: errorCode(code),
+    pgCode: typeof pgCode === "string" && /^[0-9A-Z]{5}$/.test(pgCode) ? pgCode : undefined,
+  };
+}
+
+function privateOutcome(outcome: ExecutionOutcome): ExecutionOutcome {
+  if (outcome.status < 400) return outcome;
+  // PostgreSQL diagnostics can quote input values, including bound parameters.
+  const { code, pgCode } = executionErrorCodes(outcome);
+  const { cause, queryId, queryIndex } = errorFields(outcome);
+  const message = code === "QUERY_OUTCOME_UNKNOWN" || code === "TRANSACTION_COMMIT_FAILED"
+    ? "The execution outcome could not be confirmed. Verify it before retrying."
+    : "Execution failed";
+  return {
+    status: outcome.status,
+    payload: {
+      success: false,
+      error: {
+        code: code ?? "QUERY_EXECUTION_ERROR", message, pgCode, cause: errorCode(cause),
+        queryId: typeof queryId === "string" && executionIdPattern.test(queryId) ? queryId : undefined,
+        queryIndex: Number.isSafeInteger(queryIndex) ? queryIndex : undefined,
+      },
+    },
+  };
 }
 
 function inputHash(input: object) {
@@ -176,6 +227,10 @@ export function createExecutionStore(pool: Pool) {
           CREATE INDEX transactions_retention_idx ON http_postgres_gateway.transactions (updated_at)
             WHERE status IN ('committed', 'rejected', 'failed', 'unknown');
         END IF;
+        IF pg_catalog.to_regclass('http_postgres_gateway.transactions_deadline_idx') IS NULL THEN
+          CREATE INDEX transactions_deadline_idx ON http_postgres_gateway.transactions (deadline)
+            WHERE status NOT IN ${terminalTransactionStatuses};
+        END IF;
         IF pg_catalog.to_regclass('http_postgres_gateway.submission_keys_retention_idx') IS NULL THEN
           CREATE INDEX submission_keys_retention_idx ON http_postgres_gateway.submission_keys (created_at);
         END IF;
@@ -198,7 +253,7 @@ export function createExecutionStore(pool: Pool) {
   }
 
   async function finishQuery(id: string, outcome: ExecutionOutcome) {
-    const payload = encodePayload(outcome);
+    const payload = encodePayload(privateOutcome(outcome));
     await retryFinalization(async () => {
       await pool.query(`
         UPDATE http_postgres_gateway.async_queries
@@ -208,29 +263,40 @@ export function createExecutionStore(pool: Pool) {
     });
   }
 
-  async function takeQuery(id: string, owner: string, oid: string) {
+  async function getQuery(id: string, owner: string, oid: string) {
     if (!executionIdPattern.test(id)) return;
     try {
       const { rows: [record] } = await pool.query<{ outcome: ExecutionOutcome | string | null; finalized: boolean }>(`
-        WITH consumed AS (
-          DELETE FROM http_postgres_gateway.async_queries
-          WHERE id = $1 AND owner = $2 AND database_oid = $3
-            AND (outcome IS NOT NULL OR deadline <= statement_timestamp())
-          RETURNING outcome
-        )
-        SELECT outcome, true AS finalized FROM consumed
-        UNION ALL
-        SELECT NULL, false
+        SELECT outcome, (${queryFinalized}) AS finalized
         FROM http_postgres_gateway.async_queries
         WHERE id = $1 AND owner = $2 AND database_oid = $3
-          AND outcome IS NULL AND deadline > statement_timestamp()
       `, [id, owner, oid]);
       if (record) {
         return {
           finalized: record.finalized,
-          outcome: record.outcome === null ? null : decodePayload(record.outcome),
+          outcome: record.outcome === null ? null : privateOutcome(decodePayload(record.outcome)),
         };
       }
+    } catch (error) {
+      if (!missingStorage(error)) throw error;
+    }
+  }
+
+  async function removeQuery(id: string, owner: string, oid: string) {
+    if (!executionIdPattern.test(id)) return;
+    try {
+      const { rows: [record] } = await pool.query<{ state: RemovalState }>(`
+        WITH removed AS (
+          DELETE FROM http_postgres_gateway.async_queries
+          WHERE id = $1 AND owner = $2 AND database_oid = $3 AND (${queryFinalized})
+          RETURNING id
+        )
+        SELECT 'removed' AS state FROM removed
+        UNION ALL
+        SELECT 'running' FROM http_postgres_gateway.async_queries
+        WHERE id = $1 AND owner = $2 AND database_oid = $3 AND NOT (${queryFinalized})
+      `, [id, owner, oid]);
+      return record?.state;
     } catch (error) {
       if (!missingStorage(error)) throw error;
     }
@@ -263,7 +329,8 @@ export function createExecutionStore(pool: Pool) {
     id: string, owner: string, database: string, oid: string, input: TransactionInput, key?: string,
   ) {
     await ensure();
-    const values = [id, owner, database, oid, encodePayload(input)];
+    const storedInput = { queries: input.queries.map(({ query }) => ({ query })), options: input.options };
+    const values = [id, owner, database, oid, encodePayload(storedInput)];
     if (key === undefined) {
       await pool.query(`
         INSERT INTO http_postgres_gateway.transactions (id, owner, database_name, database_oid, status, input)
@@ -299,12 +366,12 @@ export function createExecutionStore(pool: Pool) {
       SET status = $3, completed = GREATEST(completed, $4), updated_at = clock_timestamp(),
           prepared_outcome = COALESCE($5, prepared_outcome)
       WHERE id = $1 AND status = $2 AND deadline > clock_timestamp()
-    `, [id, previous, status, completed ?? null, outcome ? encodePayload(outcome) : null]);
+    `, [id, previous, status, completed ?? null, outcome ? encodePayload(privateOutcome(outcome)) : null]);
     if (result.rowCount !== 1) throw new Error("Transaction execution window expired");
   }
 
   async function finish(id: string, status: FinalStatus, outcome?: ExecutionOutcome) {
-    const payload = outcome ? encodePayload(outcome) : null;
+    const payload = outcome ? encodePayload(privateOutcome(outcome)) : null;
     await retryFinalization(async () => {
       const result = await pool.query(`
         UPDATE http_postgres_gateway.transactions
@@ -318,7 +385,7 @@ export function createExecutionStore(pool: Pool) {
         const { rows: [record] } = await pool.query<{ status: string }>(`
           SELECT status FROM http_postgres_gateway.transactions WHERE id = $1
         `, [id]);
-        // A previous attempt may have committed just before the first poll consumed it.
+        // A previous attempt may have finished just before the record was deleted.
         if (record && record.status !== status) throw new Error("The stored transaction could not be finalized");
       }
     });
@@ -331,7 +398,7 @@ export function createExecutionStore(pool: Pool) {
     try {
       const { rows } = await pool.query<StoredTransaction>(`
         SELECT id AS "transactionId", status, input,
-               CASE WHEN status IN ('committed', 'rejected', 'failed', 'unknown') THEN outcome END AS outcome,
+               CASE WHEN status IN ${terminalTransactionStatuses} THEN outcome END AS outcome,
                completed AS "completedQueries", created_at AS "createdAt", updated_at AS "updatedAt",
                deadline <= clock_timestamp() AS expired
         FROM http_postgres_gateway.transactions
@@ -339,10 +406,11 @@ export function createExecutionStore(pool: Pool) {
       `, [id, owner, oid]);
       const record = rows[0];
       if (record) {
+        const input = decodePayload(record.input);
         return {
           ...record,
-          input: decodePayload(record.input),
-          outcome: record.outcome === null ? null : decodePayload(record.outcome),
+          input: { options: input.options, queries: input.queries.map(({ query }) => ({ query })) },
+          outcome: record.outcome === null ? null : privateOutcome(decodePayload(record.outcome)),
         };
       }
     } catch (error) {
@@ -370,17 +438,23 @@ export function createExecutionStore(pool: Pool) {
   }
 
   async function remove(id: string, owner: string, oid: string) {
-    await ensure();
-    const result = await pool.query(`
-      WITH removed AS (
-        DELETE FROM http_postgres_gateway.transactions
-        WHERE id = $1 AND owner = $2 AND database_oid = $3
-          AND status IN ('committed', 'rejected', 'failed', 'unknown')
-        RETURNING id, owner, database_oid, status
-      ), tombstones AS (${saveTombstones})
-      SELECT id FROM removed
-    `, [id, owner, oid]);
-    return result.rowCount === 1;
+    if (!executionIdPattern.test(id)) return;
+    try {
+      const { rows: [record] } = await pool.query<{ state: RemovalState }>(`
+        WITH removed AS (
+          DELETE FROM http_postgres_gateway.transactions
+          WHERE id = $1 AND owner = $2 AND database_oid = $3 AND (${transactionFinalized})
+          RETURNING id, owner, database_oid, ${finalTransactionStatus} AS status
+        ), tombstones AS (${saveTombstones})
+        SELECT 'removed' AS state FROM removed
+        UNION ALL
+        SELECT 'running' FROM http_postgres_gateway.transactions
+        WHERE id = $1 AND owner = $2 AND database_oid = $3 AND NOT (${transactionFinalized})
+      `, [id, owner, oid]);
+      return record?.state;
+    } catch (error) {
+      if (!missingStorage(error)) throw error;
+    }
   }
 
   async function prune(retentionDays: number) {
@@ -392,14 +466,16 @@ export function createExecutionStore(pool: Pool) {
     const records = await pool.query(`
       WITH expired AS (
         SELECT id FROM http_postgres_gateway.transactions
-        WHERE status IN ('committed', 'rejected', 'failed', 'unknown')
-          AND updated_at <= statement_timestamp() - pg_catalog.make_interval(days => $1)
-        ORDER BY updated_at
+        WHERE (status IN ${terminalTransactionStatuses}
+            AND updated_at <= statement_timestamp() - pg_catalog.make_interval(days => $1))
+          OR (status NOT IN ${terminalTransactionStatuses}
+            AND deadline <= statement_timestamp() - pg_catalog.make_interval(days => $1))
+        ORDER BY CASE WHEN status IN ${terminalTransactionStatuses} THEN updated_at ELSE deadline END
         LIMIT $2 FOR UPDATE SKIP LOCKED
       ), removed AS (
         DELETE FROM http_postgres_gateway.transactions AS execution
         USING expired WHERE execution.id = expired.id
-        RETURNING execution.id, execution.owner, execution.database_oid, execution.status
+        RETURNING execution.id, execution.owner, execution.database_oid, ${finalTransactionStatus} AS status
       ), tombstones AS (${saveTombstones})
       SELECT id FROM removed
     `, [retentionDays, pruneBatchSize]);
@@ -432,7 +508,7 @@ export function createExecutionStore(pool: Pool) {
     return [records, keys, queries].some(({ rowCount }) => rowCount === pruneBatchSize);
   }
 
-  return { create, getSubmission, advance, finish, get, getRemoved, remove, prune, createQuery, finishQuery, takeQuery };
+  return { create, getSubmission, advance, finish, get, getRemoved, remove, prune, createQuery, finishQuery, getQuery, removeQuery };
 }
 
 export type ExecutionStore = ReturnType<typeof createExecutionStore>;

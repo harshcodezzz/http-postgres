@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Client, DatabaseError as PostgresError, Pool, type PoolClient } from "pg";
 import type { FastifyBaseLogger } from "fastify";
 import config from "../config/index.js";
-import { scopedQueryUrl, scopedRoleSafety, type QueryAccess } from "./query-access.js";
+import { scopedInheritanceSafety, scopedQueryUrl, scopedRoleSafety, type QueryAccess } from "./query-access.js";
 import { DatabaseError, getPostgresDatabaseOid } from "./pg-database.js";
 
 const connectionTimeoutMillis = 5_000;
@@ -524,7 +524,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
             WHERE other.oid OPERATOR(pg_catalog.<>) d.oid AND other.datallowconn
               AND pg_catalog.has_database_privilege(session_user, other.oid, 'CONNECT')
           )
-          ${access ? `AND (${scopedRoleSafety("session_user")})` : ""}
+          ${access ? `AND (${scopedRoleSafety("session_user")}) AND ${scopedInheritanceSafety("session_user")}` : ""}
           AS safe,
           activity.pid,
           EXTRACT(EPOCH FROM activity.backend_start)::pg_catalog.text AS "startedAt",
@@ -672,11 +672,11 @@ export function queryConnectionError(error: unknown) {
   };
 }
 
-export function queryExecutionError(error: unknown) {
+export function queryExecutionError(error: unknown, readOnlyRestricted = false) {
   const pgCode = error instanceof Error && "code" in error && typeof error.code === "string"
     ? error.code
     : undefined;
-  const forbidden = pgCode === "42501";
+  const forbidden = pgCode === "42501" || (readOnlyRestricted && pgCode === "25006");
   return {
     status: forbidden ? 403 : 400,
     error: {

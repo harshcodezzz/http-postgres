@@ -499,7 +499,11 @@ export async function verifyApiKey(
   if (record.accessScopes !== undefined) {
     const scope = Object.hasOwn(record.accessScopes, databaseName) ? record.accessScopes[databaseName] : undefined;
     if (!scope?.roleToken || !data.queryRoleSecret) return { valid: false, error: "DATABASE_SCOPE_UNBOUND" };
-    access = queryAccess(data.queryRoleSecret, scope.roleToken);
+    access = {
+      ...queryAccess(data.queryRoleSecret, scope.roleToken),
+      readOnly: scope.database.every((operation) => operation === "r") &&
+        (!scope.tables.length || scope.table.every((operation) => operation === "r")),
+    };
   }
 
   const now = Date.now();

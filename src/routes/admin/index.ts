@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import adminApiRoutes from "./admin-api.js";
 import adminDatabaseRoutes from "./admin-database.js";
 import { readAuditTail, readLogTail } from "../../utils/log-files.js";
+import type { QueryAnalytics } from "../../utils/query-analytics.js";
 
 const AUDIT_LOG_FILE = resolve(process.cwd(), "logs", "api-keys.log");
 const GATEWAY_LOG_FILE = resolve(process.cwd(), "logs", "current.log");
@@ -69,7 +70,7 @@ async function readRecentLogs(type: "audit" | "system", limit: number) {
   return readAuditTail(AUDIT_LOG_FILE, limit);
 }
 
-const adminRoutes: FastifyPluginAsync = async (fastify) => {
+const adminRoutes: FastifyPluginAsync<{ analytics?: QueryAnalytics }> = async (fastify, { analytics }) => {
   fastify.get("/", async () => {
     return {
       success: true,
@@ -81,6 +82,21 @@ const adminRoutes: FastifyPluginAsync = async (fastify) => {
   await fastify.register(adminDatabaseRoutes);
 
   fastify.get("/health", async () => checkHealth(fastify));
+
+  fastify.get<{ Querystring: { limit?: string } }>("/analytics", async (request, reply) => {
+    reply.header("Cache-Control", "no-store");
+    if (!analytics) return { success: true, enabled: false };
+    const limit = Math.min(Math.max(parseInt(request.query?.limit ?? "", 10) || 50, 1), 200);
+    try {
+      return { success: true, enabled: true, ...analytics.report(limit) };
+    } catch (error) {
+      request.log.error({ err: error }, "Could not read query analytics");
+      return reply.code(503).send({
+        success: false,
+        error: { code: "ANALYTICS_UNAVAILABLE", message: "Could not read query analytics" },
+      });
+    }
+  });
 
   fastify.get<{
     Querystring: { type?: "audit" | "system"; limit?: string };

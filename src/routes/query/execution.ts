@@ -72,6 +72,14 @@ export function watchExecution(
   };
 }
 
+export async function hasAssignedTransactionId(client: PoolClient) {
+  // Some PostgreSQL built-ins can allocate a write transaction ID even in READ ONLY mode.
+  const { rows: [state] } = await client.query<{ assigned: boolean }>(
+    "SELECT pg_catalog.txid_current_if_assigned() IS NOT NULL AS assigned",
+  );
+  return state.assigned;
+}
+
 const exactTextTypes = new Set([
   114, 3802, 199, 3807, // JSON and JSONB, including arrays
   1114, 1184, 1115, 1185, // timestamps and timestamp arrays

@@ -291,7 +291,7 @@ export async function getPostgresDatabaseDetails(
             THEN pg_catalog.pg_database_size(d.oid)
           END AS bytes
         FROM pg_catalog.pg_database d
-        WHERE ${byOid ? "d.oid = $1::pg_catalog.oid" : "d.datname = $1"} AND ($2 OR NOT d.datistemplate)
+        WHERE ${byOid ? "d.oid = $1::pg_catalog.oid" : "d.datname::pg_catalog.text = $1"} AND ($2 OR NOT d.datistemplate)
       )
       SELECT id, datname, server_version, collation_version, owner, encoding, lc_collate, lc_ctype, connection_limit, allow_connections,
         bytes::pg_catalog.text AS size_bytes,

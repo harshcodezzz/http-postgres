@@ -3,8 +3,9 @@ import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 import { DatabaseError as PostgresError, type PoolClient, type QueryResult } from "pg";
 import { isScopedStatement } from "../../utils/query-access.js";
 import { queryConnectionError, queryExecutionError } from "../../utils/query-pool.js";
+import type { QueryAnalytics } from "../../utils/query-analytics.js";
 import type { ExecutionOutcome, ExecutionStore } from "../execution-store.js";
-import { createResultBudget, ExecutionStopped, losslessTypes, watchExecution, type ResultStatement } from "./execution.js";
+import { createResultBudget, ExecutionStopped, hasAssignedTransactionId, losslessTypes, watchExecution, type ResultStatement } from "./execution.js";
 import { resultOptions, type ResultOptions } from "./options.js";
 
 interface QueryBody {
@@ -55,7 +56,7 @@ function send(reply: FastifyReply, { status, payload }: ExecutionOutcome) {
   return reply.code(status).send(payload);
 }
 
-const queryRoutes: FastifyPluginAsync<{ store: ExecutionStore }> = async (fastify, { store }) => {
+const queryRoutes: FastifyPluginAsync<{ store: ExecutionStore; analytics?: QueryAnalytics }> = async (fastify, { store, analytics }) => {
   const activeQueries = new Set<Promise<void>>();
   fastify.addHook("onClose", async () => {
     await Promise.allSettled(activeQueries);
@@ -91,10 +92,18 @@ const queryRoutes: FastifyPluginAsync<{ store: ExecutionStore }> = async (fastif
 
     let submitted = false;
     try {
+      if (queryAccess?.readOnly) {
+        await execution.run(() => client.query("BEGIN READ ONLY"));
+        // Establish the snapshot before user SQL can change the transaction mode.
+        await execution.run(() => client.query("SELECT 1"));
+      }
       const result = await execution.run(() => {
         submitted = true;
         return createResultBudget(execution).query(client, statement);
       });
+      if (queryAccess?.readOnly && await execution.run(() => hasAssignedTransactionId(client))) {
+        return failure(403, "INSUFFICIENT_PRIVILEGE", "Read-only API keys cannot perform writes");
+      }
       const durationMs = Date.now() - start;
       if (Array.isArray(result)) {
         return {
@@ -117,7 +126,7 @@ const queryRoutes: FastifyPluginAsync<{ store: ExecutionStore }> = async (fastif
         const { status, code, message } = execution.stopped;
         return failure(status, code, message);
       }
-      const { status, error } = queryExecutionError(err);
+      const { status, error } = queryExecutionError(err, queryAccess?.readOnly);
       return { status, payload: { success: false, error } };
     } finally {
       execution.close();
@@ -137,9 +146,6 @@ const queryRoutes: FastifyPluginAsync<{ store: ExecutionStore }> = async (fastif
     if (body.type !== undefined && body.type !== "sync" && body.type !== "async") {
       return send(reply, failure(400, "INVALID_QUERY_TYPE", "Use 'sync' or 'async' for 'type'"));
     }
-    if (queryAccess && !isScopedStatement(body.query)) {
-      return send(reply, failure(403, "INSUFFICIENT_PRIVILEGE", "Scoped API keys can run only data queries"));
-    }
 
     const parameters = body.parameters !== undefined ? body.parameters : body.params;
     if (parameters !== undefined && !Array.isArray(parameters)) {
@@ -148,6 +154,12 @@ const queryRoutes: FastifyPluginAsync<{ store: ExecutionStore }> = async (fastif
     const parsed = resultOptions.safeParse(body.options === undefined ? {} : body.options);
     if (!parsed.success) {
       return send(reply, failure(400, "INVALID_OPTIONS", "Result options must contain boolean flags"));
+    }
+
+    if (queryAccess && !isScopedStatement(body.query)) {
+      const outcome = failure(403, "INSUFFICIENT_PRIVILEGE", "Scoped API keys can run only data queries");
+      analytics?.record(apiKey.id, database, body.query, outcome);
+      return send(reply, outcome);
     }
 
     const options = parsed.data;
@@ -161,7 +173,11 @@ const queryRoutes: FastifyPluginAsync<{ store: ExecutionStore }> = async (fastif
       rowMode: options.arrayMode ? "array" : undefined,
       query_timeout: asyncQuery ? asyncExecutionDeadline : undefined,
     };
-    if (!asyncQuery) return send(reply, await executeQuery(context, statement, options, reply));
+    if (!asyncQuery) {
+      const outcome = await executeQuery(context, statement, options, reply);
+      analytics?.record(apiKey.id, database, statement.text, outcome);
+      return send(reply, outcome);
+    }
     if (activeQueries.size >= maxAsyncQueries) {
       return send(reply, failure(503, "QUERY_QUEUE_FULL", "Too many asynchronous queries are running"));
     }
@@ -173,6 +189,7 @@ const queryRoutes: FastifyPluginAsync<{ store: ExecutionStore }> = async (fastif
         log.error({ err, queryId }, "Asynchronous query execution could not be confirmed");
         return unknownOutcome("QUERY_RESULT_UNAVAILABLE");
       });
+      analytics?.record(context.owner, context.database, statement.text, outcome);
       await store.finishQuery(queryId, outcome);
     }, () => {}).catch((err) => {
       log.error({ err, queryId }, "Could not save asynchronous query outcome");
@@ -199,7 +216,7 @@ const queryRoutes: FastifyPluginAsync<{ store: ExecutionStore }> = async (fastif
     }
     try {
       const { apiKey, database, databaseOid } = request;
-      const record = await store.takeQuery(queryId, apiKey?.id ?? "", databaseOid);
+      const record = await store.getQuery(queryId, apiKey?.id ?? "", databaseOid);
       if (!record) return send(reply, failure(404, "QUERY_NOT_FOUND", "Query not found"));
       if (!record.finalized) return { success: true, queryId, database, status: "running", finalized: false };
       const outcome = record.outcome ?? unknownOutcome("QUERY_INTERRUPTED");
@@ -212,6 +229,20 @@ const queryRoutes: FastifyPluginAsync<{ store: ExecutionStore }> = async (fastif
       return send(reply, failure(503, "QUERY_STORE_UNAVAILABLE", "Could not retrieve asynchronous query"));
     }
   }
+
+  fastify.delete<{ Params: { id: string } }>("/:id", async (request, reply) => {
+    reply.header("Cache-Control", "no-store");
+    const { id: queryId } = request.params;
+    try {
+      const state = await store.removeQuery(queryId, request.apiKey?.id ?? "", request.databaseOid);
+      if (!state) return send(reply, failure(404, "QUERY_NOT_FOUND", "Query not found"));
+      if (state === "running") return send(reply, failure(409, "QUERY_IN_PROGRESS", "The query is still running"));
+      return { success: true, queryId };
+    } catch (err) {
+      request.log.error({ err, queryId }, "Could not delete asynchronous query");
+      return send(reply, failure(503, "QUERY_STORE_UNAVAILABLE", "Could not delete asynchronous query"));
+    }
+  });
 
   fastify.post("/", handleQuery);
   fastify.post("/run", handleQuery);

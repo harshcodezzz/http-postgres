@@ -13,9 +13,10 @@ const privileges: Record<CrudOperation, string> = {
 export interface QueryAccess {
   login: string;
   password: string;
+  readOnly: boolean;
 }
 
-export function queryAccess(secret: string, token: string): QueryAccess {
+export function queryAccess(secret: string, token: string) {
   const digest = (purpose: string) => createHmac("sha256", secret)
     .update(purpose).update(token).digest("base64url");
   return { login: `http_pg_${digest("login:")}`, password: digest("password:") };
@@ -39,37 +40,85 @@ function passwordVerifier(password: string): string {
   return `SCRAM-SHA-256$4096:${salt.toString("base64")}$${stored}:${key("Server Key").toString("base64")}`;
 }
 
+interface Relation {
+  oid: string;
+  schema: string;
+  name: string;
+}
+
+interface TableGrant extends Relation {
+  operations: CrudOperation[];
+}
+
+async function listInsertSequences(client: Client, grants: readonly TableGrant[]) {
+  const insertTables = grants.filter(({ operations }) => operations.includes("c")).map(({ oid }) => oid);
+  if (!insertTables.length) return [];
+  const { rows } = await client.query<Relation>(`
+    WITH sequences AS (
+      SELECT d.refobjid AS oid
+      FROM pg_catalog.pg_attrdef a
+      JOIN pg_catalog.pg_depend d ON d.objid = a.oid
+      WHERE a.adrelid = ANY($1::pg_catalog.oid[])
+        AND d.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass
+        AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+      UNION
+      SELECT d.objid
+      FROM pg_catalog.pg_depend d
+      WHERE d.refobjid = ANY($1::pg_catalog.oid[])
+        AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+        AND d.refclassid = d.classid AND d.deptype = 'i'
+    )
+    SELECT s.oid::text, n.nspname AS schema, s.relname AS name
+    FROM sequences
+    JOIN pg_catalog.pg_class s ON s.oid = sequences.oid AND s.relkind = 'S'
+    JOIN pg_catalog.pg_namespace n ON n.oid = s.relnamespace
+    ORDER BY s.oid
+  `, [insertTables]);
+  return rows;
+}
+
 async function grantAccess(
-  client: Client,
-  database: string,
-  role: string,
-  grants: Array<{ schema: string; name: string; operations: CrudOperation[] }>,
+  client: Client, database: string, role: string, grants: readonly TableGrant[], sequences: readonly Relation[],
 ) {
   await client.query(`GRANT CONNECT ON DATABASE ${quoteIdentifier(database)} TO ${role}`);
-  for (const schema of new Set(grants.map((table) => table.schema))) {
+  const schemas = new Set([...grants, ...sequences].map(({ schema }) => schema));
+  for (const schema of schemas) {
     await client.query(`GRANT USAGE ON SCHEMA ${quoteIdentifier(schema)} TO ${role}`);
   }
   for (const table of grants) {
     const qualified = `${quoteIdentifier(table.schema)}.${quoteIdentifier(table.name)}`;
     await client.query(`GRANT ${table.operations.map((op) => privileges[op]).join(", ")} ON TABLE ${qualified} TO ${role}`);
   }
-
-  const insertTables = grants.filter((table) => table.operations.includes("c"));
-  if (!insertTables.length) return;
-  const { rows: sequences } = await client.query<{ schema: string; name: string }>(`
-    SELECT DISTINCT n.nspname AS schema, s.relname AS name
-    FROM pg_catalog.pg_depend d
-    JOIN pg_catalog.pg_class s ON s.oid = d.objid AND s.relkind = 'S'
-    JOIN pg_catalog.pg_namespace n ON n.oid = s.relnamespace
-    WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.refclassid = d.classid
-      AND d.deptype IN ('a', 'i') AND d.refobjid IN (
-        SELECT pg_catalog.to_regclass(name)
-        FROM pg_catalog.unnest($1::text[]) AS tables(name)
-      )
-  `, [insertTables.map(({ schema, name }) => `${quoteIdentifier(schema)}.${quoteIdentifier(name)}`)]);
   for (const { schema, name } of sequences) {
     await client.query(`GRANT USAGE ON SEQUENCE ${quoteIdentifier(schema)}.${quoteIdentifier(name)} TO ${role}`);
   }
+}
+
+async function hasRequestedAccess(
+  client: Client, login: string, grants: readonly TableGrant[], sequences: readonly Relation[],
+) {
+  const permissions = grants.map(({ oid, operations }) => ({ oid, permissions: operations.map((op) => privileges[op]) }));
+  const { rows: [access] } = await client.query<{ granted: boolean }>(`
+    SELECT pg_catalog.has_database_privilege($1::pg_catalog.name, pg_catalog.current_database(), 'CONNECT')
+      AND NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.jsonb_to_recordset($2::jsonb) AS expected(oid pg_catalog.oid, permissions text[])
+        LEFT JOIN pg_catalog.pg_class c ON c.oid = expected.oid
+        CROSS JOIN LATERAL pg_catalog.unnest(expected.permissions) AS requested(privilege)
+        WHERE c.oid IS NULL
+          OR NOT pg_catalog.has_schema_privilege($1::pg_catalog.name, c.relnamespace, 'USAGE')
+          OR NOT pg_catalog.has_table_privilege($1::pg_catalog.name, c.oid, requested.privilege)
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.unnest($3::pg_catalog.oid[]) AS expected(oid)
+        LEFT JOIN pg_catalog.pg_class c ON c.oid = expected.oid
+        WHERE c.oid IS NULL
+          OR NOT pg_catalog.has_schema_privilege($1::pg_catalog.name, c.relnamespace, 'USAGE')
+          OR NOT pg_catalog.has_sequence_privilege($1::pg_catalog.name, c.oid, 'USAGE')
+      ) AS granted
+  `, [login, JSON.stringify(permissions), sequences.map(({ oid }) => oid)]);
+  return access.granted;
 }
 
 export async function provisionQueryAccess(
@@ -108,7 +157,8 @@ export async function provisionQueryAccess(
         ? [...new Set([...policy.database, ...policy.table])].sort()
         : policy.database,
     })).filter(({ operations }) => operations.length);
-    const roleToken = createHash("sha256").update(JSON.stringify([oid, grants])).digest("hex");
+    const sequences = await listInsertSequences(client, grants);
+    const roleToken = createHash("sha256").update(JSON.stringify([oid, grants, sequences])).digest("hex");
     const { login, password } = queryAccess(secret, roleToken);
     const role = quoteIdentifier(login);
 
@@ -117,16 +167,29 @@ export async function provisionQueryAccess(
     const { rowCount } = await client.query("SELECT 1 FROM pg_catalog.pg_roles WHERE rolname::text = $1", [login]);
     if (!rowCount) {
       await client.query(`CREATE ROLE ${role} LOGIN NOINHERIT PASSWORD ${escapeLiteral(passwordVerifier(password))}`);
-      await grantAccess(client, database, role, grants);
+      await grantAccess(client, database, role, grants, sequences);
     }
-    const { rows: [access] } = await client.query<{ safe: boolean }>(`
+    if (!await hasRequestedAccess(client, login, grants, sequences)) {
+      throw new DatabaseError(
+        "The PostgreSQL administrator could not grant all requested database, schema, table, or sequence privileges",
+        "INSUFFICIENT_PRIVILEGE",
+      );
+    }
+    const { rows: [access] } = await client.query<{ safe: boolean; inheritanceSafe: boolean }>(`
       SELECT (${scopedRoleSafety("$1::pg_catalog.name")})
-      AND NOT EXISTS (
-        SELECT 1 FROM pg_catalog.pg_database d
-        WHERE d.datname <> pg_catalog.current_database() AND d.datallowconn
-          AND pg_catalog.has_database_privilege($1::pg_catalog.name, d.oid, 'CONNECT')
-      ) AS safe
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_catalog.pg_database d
+          WHERE d.datname <> pg_catalog.current_database() AND d.datallowconn
+            AND pg_catalog.has_database_privilege($1::pg_catalog.name, d.oid, 'CONNECT')
+        ) AS safe,
+        ${scopedInheritanceSafety("$1::pg_catalog.name")} AS "inheritanceSafe"
     `, [login]);
+    if (!access.inheritanceSafe) {
+      throw new DatabaseError(
+        "An allowed parent table reaches descendants outside the requested privileges",
+        "UNSAFE_DATABASE_SCOPE",
+      );
+    }
     if (!access.safe) {
       throw new DatabaseError(
         "Remove PUBLIC access to other databases and any PUBLIC application object privileges inherited by the scoped login",
@@ -138,9 +201,26 @@ export async function provisionQueryAccess(
   });
 }
 
+type SqlRole = "session_user" | "$1::pg_catalog.name";
+
+export function scopedInheritanceSafety(role: SqlRole) {
+  // PostgreSQL checks a parent's ACL when a statement expands to descendants.
+  // Checking every immediate edge also covers deeper inheritance and partition trees.
+  return `NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_inherits i
+    JOIN pg_catalog.pg_class parent ON parent.oid OPERATOR(pg_catalog.=) i.inhparent
+    JOIN pg_catalog.pg_class child ON child.oid OPERATOR(pg_catalog.=) i.inhrelid
+    CROSS JOIN (VALUES ('SELECT'), ('UPDATE'), ('DELETE'), ('INSERT')) AS required(privilege)
+    WHERE parent.relkind IN ('r', 'p', 'f') AND child.relkind IN ('r', 'p', 'f')
+      AND (required.privilege OPERATOR(pg_catalog.<>) 'INSERT' OR child.relispartition)
+      AND pg_catalog.has_table_privilege(${role}, parent.oid, required.privilege)
+      AND NOT pg_catalog.has_table_privilege(${role}, child.oid, required.privilege)
+  )`;
+}
+
 // PostgreSQL ACLs are additive. Reject PUBLIC access paths to application objects
 // that would otherwise sit outside the grants created for the policy role.
-export function scopedRoleSafety(role: "session_user" | "$1::pg_catalog.name") {
+export function scopedRoleSafety(role: SqlRole) {
   return `
   NOT pg_catalog.has_database_privilege(${role}, pg_catalog.current_database(), 'CREATE')
   AND NOT EXISTS (
