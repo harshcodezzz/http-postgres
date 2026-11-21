@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { Pool } from "pg";
 import config from "../config/index.js";
 import { crudList, type DatabaseAccess, type TableName } from "../config/query-privileges.js";
-import { isolateQueryAccess, provisionQueryAccess, queryAccess, type QueryAccess } from "./query-access.js";
+import { deprovisionQueryAccess, isolateQueryAccess, provisionQueryAccess, queryAccess, type QueryAccess } from "./query-access.js";
 import { appendAuditLine } from "./log-files.js";
 import {
   JsonDB,
@@ -621,6 +621,16 @@ export async function revokeApiKey(
 
   if (revokedRecord) {
     const rec = revokedRecord as ApiKeyRecord;
+    if (rec.accessScopes) {
+      const secret = (await db.read<DataStore>()).queryRoleSecret;
+      if (secret) {
+        await Promise.allSettled(
+          Object.entries(rec.accessScopes).map(([database, scope]) =>
+            deprovisionQueryAccess(database, scope.roleToken, secret, getApiKeyPool())
+          )
+        );
+      }
+    }
     await writeAuditLog(
       {
         timestamp: new Date().toISOString(),
@@ -680,6 +690,7 @@ export async function updateApiKeyScope(
   }
 
   let updatedRecord: ApiKeyRecord | null = null;
+  const previousScopes = record.accessScopes;
 
   const accessScopes = await provisionScopes(targets, bindings, db, record.id, options.pgPool);
 
@@ -731,6 +742,19 @@ export async function updateApiKeyScope(
       "API key not found or is not active",
       "KEY_NOT_FOUND",
     );
+  }
+
+  if (previousScopes) {
+    const secret = (await db.read<DataStore>()).queryRoleSecret;
+    if (secret) {
+      const currentTokens = new Set(Object.values(accessScopes ?? {}).map((s) => s.roleToken));
+      const removed = Object.entries(previousScopes).filter(([, s]) => !currentTokens.has(s.roleToken));
+      await Promise.allSettled(
+        removed.map(([database, scope]) =>
+          deprovisionQueryAccess(database, scope.roleToken, secret, options.pgPool ?? getApiKeyPool())
+        )
+      );
+    }
   }
 
   const rec = updatedRecord as ApiKeyRecord;
@@ -795,6 +819,16 @@ export async function deleteApiKey(
 
   if (deletedRecord) {
     const rec = deletedRecord as ApiKeyRecord;
+    if (rec.accessScopes) {
+      const secret = (await db.read<DataStore>()).queryRoleSecret;
+      if (secret) {
+        await Promise.allSettled(
+          Object.entries(rec.accessScopes).map(([database, scope]) =>
+            deprovisionQueryAccess(database, scope.roleToken, secret, getApiKeyPool())
+          )
+        );
+      }
+    }
     await writeAuditLog(
       {
         timestamp: new Date().toISOString(),

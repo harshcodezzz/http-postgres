@@ -24,13 +24,19 @@ export function queryAccess(secret: string, token: string) {
 
 export function scopedQueryUrl(database: string, access: QueryAccess): string {
   const url = databaseUrl(database);
-  url.username = "";
-  url.password = "";
-  for (const parameter of ["username", "options", "sslcert", "sslkey"]) {
-    url.searchParams.delete(parameter);
-  }
+  url.searchParams.delete("username");
+  url.searchParams.delete("options");
+  url.searchParams.delete("sslcert");
+  url.searchParams.delete("sslkey");
   url.searchParams.set("user", access.login);
   url.searchParams.set("password", access.password);
+  if (url.hostname) {
+    url.username = access.login;
+    url.password = access.password;
+  } else {
+    url.username = "";
+    url.password = "";
+  }
   return url.toString();
 }
 
@@ -157,6 +163,9 @@ async function provisionLogin(
     await client.query(`CREATE ROLE ${role} LOGIN NOINHERIT PASSWORD ${escapeLiteral(passwordVerifier(password))}`);
     await grantAccess(client, database, role, grants, sequences);
   }
+  await client.query(`REVOKE pg_read_all_stats FROM ${role}`).catch(() => {});
+  await client.query(`REVOKE pg_read_all_data FROM ${role}`).catch(() => {});
+  await client.query(`REVOKE pg_stat_scan_tables FROM ${role}`).catch(() => {});
   if (!await hasRequestedAccess(client, login, grants, sequences)) {
     throw new DatabaseError(
       "The PostgreSQL administrator could not grant all requested database, schema, table, or sequence privileges",
@@ -254,6 +263,28 @@ export async function isolateQueryAccess(
   });
 }
 
+export async function deprovisionQueryAccess(
+  database: string,
+  roleToken: string,
+  secret: string,
+  adminPool?: Pool,
+): Promise<void> {
+  const { login } = queryAccess(secret, roleToken);
+  const role = quoteIdentifier(login);
+  try {
+    await withPostgresDatabase(database, async (client) => {
+      await client.query("SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE usename = $1", [login]).catch(() => {});
+      await client.query(`DROP OWNED BY ${role}`).catch(() => {});
+      await client.query(`DROP ROLE IF EXISTS ${role}`).catch(() => {});
+    });
+  } catch {
+    if (adminPool) {
+      await adminPool.query("SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE usename = $1", [login]).catch(() => {});
+      await adminPool.query(`DROP ROLE IF EXISTS ${role}`).catch(() => {});
+    }
+  }
+}
+
 type SqlRole = "session_user" | "$1::pg_catalog.name";
 
 export function scopedInheritanceSafety(role: SqlRole) {
@@ -276,6 +307,10 @@ export function scopedInheritanceSafety(role: SqlRole) {
 export function scopedRoleSafety(role: SqlRole) {
   return `
   NOT pg_catalog.has_database_privilege(${role}, pg_catalog.current_database(), 'CREATE')
+  AND NOT pg_catalog.pg_has_role(${role}, 'pg_read_all_stats', 'USAGE')
+  AND NOT pg_catalog.pg_has_role(${role}, 'pg_read_all_stats', 'MEMBER')
+  AND NOT pg_catalog.pg_has_role(${role}, 'pg_read_all_data', 'USAGE')
+  AND NOT pg_catalog.pg_has_role(${role}, 'pg_stat_scan_tables', 'USAGE')
   AND NOT EXISTS (
     SELECT 1 FROM pg_catalog.pg_auth_members m
     JOIN pg_catalog.pg_roles r ON r.oid = m.member

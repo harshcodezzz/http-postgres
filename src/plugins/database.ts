@@ -21,7 +21,16 @@ const databasePlugin: FastifyPluginAsync = async (app) => {
   });
 
   pool.on("error", (error) => {
-    app.log.error({ err: error }, "Unexpected PostgreSQL pool error");
+    const sanitized = error instanceof Error ? {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+      ...("code" in error && typeof error.code === "string" && { code: error.code }),
+      ...("severity" in error && { severity: (error as { severity?: unknown }).severity }),
+      ...("detail" in error && { detail: (error as { detail?: unknown }).detail }),
+      ...("hint" in error && { hint: (error as { hint?: unknown }).hint }),
+    } : { message: String(error) };
+    app.log.error({ err: sanitized }, "Unexpected PostgreSQL pool error");
   });
 
   try {

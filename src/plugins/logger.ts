@@ -45,6 +45,9 @@ export function createGatewayLogger() {
             message: error.message,
             stack: error.stack,
             ...("code" in error && typeof error.code === "string" && { code: error.code }),
+            ...("severity" in error && { severity: (error as { severity?: unknown }).severity }),
+            ...("detail" in error && { detail: (error as { detail?: unknown }).detail }),
+            ...("hint" in error && { hint: (error as { hint?: unknown }).hint }),
           };
         },
         responseTime(milliseconds: unknown) {
@@ -65,6 +68,12 @@ export function createGatewayLogger() {
           "req.headers.authorization",
           "database.url",
           "redis.url",
+          "client",
+          "*.client",
+          "secretKey",
+          "*.secretKey",
+          "processID",
+          "*.processID",
         ],
         censor: "[REDACTED]",
       },

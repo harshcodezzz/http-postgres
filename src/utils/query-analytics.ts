@@ -57,7 +57,7 @@ export function createQueryAnalytics(directory: string, log: FastifyBaseLogger) 
     const connection = new DatabaseSync(file);
     try {
       connection.exec(`
-        PRAGMA busy_timeout = 0;
+        PRAGMA busy_timeout = 5000;
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous = NORMAL;
         CREATE TABLE IF NOT EXISTS key_usage (
@@ -88,7 +88,7 @@ export function createQueryAnalytics(directory: string, log: FastifyBaseLogger) 
   }
 
   function flush() {
-    if (!usage.size) return;
+    if (!usage.size && !failures.length) return;
     const db = openDatabase();
     const increment = db.prepare(`
       INSERT INTO key_usage VALUES (?, ?, ?, ?)
@@ -179,15 +179,19 @@ export function createQueryAnalytics(directory: string, log: FastifyBaseLogger) 
   async function close() {
     clearInterval(timer);
     try {
-      while (usage.size) {
+      while (usage.size > 0 || failures.length > 0) {
         try {
           flush();
+          break;
         } catch (error) {
           const code = error && typeof error === "object" && "errcode" in error ? error.errcode : undefined;
-          if (typeof code !== "number" || ((code & 255) !== 5 && (code & 255) !== 6)) throw error;
-          if (!storageFailed) log.warn({ err: error }, "Waiting for the analytics writer before shutdown");
-          storageFailed = true;
-          await delay(50);
+          if (typeof code === "number" && ((code & 255) === 5 || (code & 255) === 6)) {
+            if (!storageFailed) log.warn({ err: error }, "Waiting for the analytics writer before shutdown");
+            storageFailed = true;
+            await delay(50);
+            continue;
+          }
+          throw error;
         }
       }
     } finally {

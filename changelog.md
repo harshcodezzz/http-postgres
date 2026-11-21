@@ -13,6 +13,15 @@
 
 ### Fixed
 
+- Provisioned unique PostgreSQL login roles per API key to prevent keys with identical scopes from inspecting each other's SQL queries and literal values in `pg_stat_activity`, and deprovisioned roles on key deletion, revocation, or scope rotation.
+- Released stale query connection slots and recovered monitoring when PostgreSQL restarts mid-query instead of leaking slot budgets with `503 QUERY_CONNECTION_LIMIT`.
+- Strictly separated database name lookup from OID lookup in admin database endpoints, preventing numeric database names from resolving as OIDs and modifying unintended databases.
+- Blocked `pg_logical_emit_message` and other administrative/replication functions during read-only query and transaction execution to prevent unauthorized WAL emissions.
+- Enforced full read-only query guards and rejected large-object mutations (`lo_create`, `lo_from_bytea`, etc.) for transactions submitted with `options.readOnly: true`, regardless of API key write capabilities.
+- Preserved provisioned username and password authentication credentials when connecting via Unix-socket database URLs.
+- Hardened SQLite analytics database flushing and shutdown handling with `busy_timeout` configuration and lock retries that continue until buffered metrics and failed queries are persisted.
+- Sorted recent analytics failure queries by event timestamp descending (`occurred_at DESC, id DESC`) rather than buffer flush order.
+- Sanitized administrative database pool error logs and added logger redaction paths to prevent leaking internal PostgreSQL client properties, backend process IDs, and cancellation secret keys.
 - Enforced table scopes across inheritance and partition trees, and rolled back writes attempted through read-only keys.
 - Rejected API key provisioning when requested PostgreSQL grants are incomplete. Resaving a key now refreshes grants for replacement sequences used by column defaults.
 - Required exact database name matches when looking up a database in admin routes, preventing overlong names from selecting a truncated match.

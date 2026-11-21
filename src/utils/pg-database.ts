@@ -262,13 +262,13 @@ export async function getPostgresDatabaseDetails(
   databaseName: string,
   pool?: Pool,
   includeTemplates = false,
-  by: "name" | "id" | "auto" = "auto",
+  by: "name" | "id" = "name",
 ): Promise<PostgresDatabaseDetails | null> {
-  if (!isPostgresIdentifier(databaseName)) return null;
-  const oid = by !== "name" && /^[0-9]{1,10}$/.test(databaseName) && Number(databaseName) <= 4_294_967_295
-    ? databaseName
-    : null;
-  if (by === "id" && oid === null) return null;
+  if (by === "id") {
+    if (!/^[0-9]{1,10}$/.test(databaseName) || Number(databaseName) > 4_294_967_295) return null;
+  } else {
+    if (!isPostgresIdentifier(databaseName)) return null;
+  }
 
   const pg = pool ?? getDatabasePool();
 
@@ -302,16 +302,15 @@ export async function getPostgresDatabaseDetails(
             THEN pg_catalog.pg_database_size(d.oid)
           END AS bytes
         FROM pg_catalog.pg_database d
-        WHERE (d.datname::pg_catalog.text = $1 OR d.oid = $3::pg_catalog.oid)
+        WHERE ${by === "id" ? "d.oid = $1::pg_catalog.oid" : "d.datname::pg_catalog.text = $1"}
           AND ($2 OR NOT d.datistemplate)
-        ORDER BY (d.datname::pg_catalog.text = $1) DESC NULLS LAST
         LIMIT 1
       )
       SELECT id, datname, server_version, collation_version, owner, encoding, lc_collate, lc_ctype, connection_limit, allow_connections,
         bytes::pg_catalog.text AS size_bytes,
         pg_catalog.pg_size_pretty(bytes) AS size_pretty
       FROM details`,
-      [by === "id" ? null : databaseName, includeTemplates, oid],
+      [databaseName, includeTemplates],
     );
 
     if (res.rowCount === 0 || !res.rows[0]) {

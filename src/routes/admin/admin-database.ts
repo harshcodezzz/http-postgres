@@ -203,7 +203,7 @@ const adminDatabaseRoutes: FastifyPluginAsync = async (fastify) => {
       if (by !== undefined && by !== "id" && by !== "name") {
         throw new DatabaseError("Use 'id' or 'name' for the by query parameter", "INVALID_PARAMETER_VALUE");
       }
-      const details = await getPostgresDatabaseDetails(id, fastify.db, includeTemplates, by);
+      const details = await getPostgresDatabaseDetails(id, fastify.db, includeTemplates, by === "id" ? "id" : "name");
 
       if (!details) {
         return reply.code(404).send({
@@ -315,10 +315,11 @@ const adminDatabaseRoutes: FastifyPluginAsync = async (fastify) => {
   });
 
   function databaseTarget(request: FastifyRequest<{ Body: Record<string, unknown> }>) {
-    const by = request.body?.database == null && request.body?.id != null ? "id" : "name";
-    const target = request.body?.database ?? request.body?.id ?? request.headers["x-database"] ?? request.body?.name;
+    const hasExplicitId = request.body?.id != null && request.body?.database == null && request.headers["x-database"] == null && request.body?.name == null;
+    const by = hasExplicitId ? ("id" as const) : ("name" as const);
+    const target = (by === "id" ? request.body?.id : (request.body?.database ?? request.headers["x-database"] ?? request.body?.name)) as string | undefined;
     if (typeof target !== "string" || !target) {
-      throw new DatabaseError("A database name or ID is required", "INVALID_DATABASE_NAME");
+      throw new DatabaseError(by === "id" ? "A database ID is required" : "A database name is required", "INVALID_DATABASE_NAME");
     }
     return { target, by } as const;
   }

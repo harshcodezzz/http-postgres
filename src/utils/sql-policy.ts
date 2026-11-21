@@ -3,6 +3,27 @@ const restrictedReadOnlyFunctions = new Set([
   "pg_logical_emit_message",
   // These built-ins can execute SQL supplied as a value, outside the visible statement.
   "query_to_xml", "query_to_xmlschema", "query_to_xml_and_xmlschema", "ts_stat",
+  // Replication and admin functions
+  "pg_create_logical_replication_slot",
+  "pg_create_physical_replication_slot",
+  "pg_drop_replication_slot",
+  "pg_replication_slot_advance",
+  "pg_log_backend_memory_contexts",
+  "pg_rotate_logfile",
+  "pg_reload_conf",
+  "pg_notify",
+  "pg_cancel_backend",
+  "pg_terminate_backend",
+  // Large object mutations
+  "lo_create",
+  "lo_creat",
+  "lo_from_bytea",
+  "lo_import",
+  "lo_put",
+  "lo_truncate",
+  "lo_unlink",
+  "lo_open",
+  "lo_write",
 ]);
 
 function skipTrivia(sql: string, start: number): number {

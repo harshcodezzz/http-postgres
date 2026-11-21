@@ -265,7 +265,7 @@ const transactionRoutes: FastifyPluginAsync<{ store: ExecutionStore; analytics?:
         return connection;
       }));
       client = acquired;
-      const options = access?.readOnly ? { ...transaction.options, readOnly: true } : transaction.options;
+      const options = readOnly ? { ...transaction.options, readOnly: true } : transaction.options;
       await execution.run(() => acquired.query(beginStatement(options)));
       execution.check();
       // Establish the snapshot before user SQL can try to change isolation or enable writes.
@@ -285,7 +285,7 @@ const transactionRoutes: FastifyPluginAsync<{ store: ExecutionStore; analytics?:
         const result = await execution.run(() => resultBudget.query(acquired, statement)) as QueryResult;
         if (readOnly && await execution.run(() => hasAssignedTransactionId(acquired))) {
           transaction.status = "pending";
-          return recordFailure(failure(403, "INSUFFICIENT_PRIVILEGE", "Read-only API keys cannot perform writes"));
+          return recordFailure(failure(403, "INSUFFICIENT_PRIVILEGE", "Read-only transactions cannot perform writes"));
         }
         const { queryId } = queued;
         results.push({ ...(immediate ? { queryIndex: results.length } : { queryId }), ...formatQueryResult(result, transaction.options.fullResults) });
