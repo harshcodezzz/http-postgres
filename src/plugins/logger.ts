@@ -38,6 +38,15 @@ export function createGatewayLogger() {
       level: process.env.LOG_LEVEL ?? "info",
       timestamp: pino.stdTimeFunctions.isoTime,
       serializers: {
+        err(error: unknown) {
+          if (!(error instanceof Error)) return pino.stdSerializers.err(error as Error);
+          return {
+            type: error.name,
+            message: error.message,
+            stack: error.stack,
+            ...("code" in error && typeof error.code === "string" && { code: error.code }),
+          };
+        },
         responseTime(milliseconds: unknown) {
           return typeof milliseconds === "number" ? milliseconds.toFixed(3) : milliseconds;
         },

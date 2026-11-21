@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 import config from "../../config/index.js";
 import { DatabaseError as PostgresError, type PoolClient, type QueryResult } from "pg";
-import { isScopedStatement } from "../../utils/query-access.js";
+import { isReadOnlySqlAllowed, isScopedStatement } from "../../utils/sql-policy.js";
 import { queryConnectionError, queryExecutionError } from "../../utils/query-pool.js";
 import type { QueryAnalytics } from "../../utils/query-analytics.js";
 import { createResultBudget, hasAssignedTransactionId, losslessTypes, watchExecution, type ResultStatement } from "../query/execution.js";
@@ -228,6 +228,15 @@ const transactionRoutes: FastifyPluginAsync<{ store: ExecutionStore; analytics?:
     if (access?.readOnly && transaction.options.readOnly === false) {
       return failure(403, "INSUFFICIENT_PRIVILEGE", "This key requires a read-only transaction");
     }
+    const readOnly = access?.readOnly === true || transaction.options.readOnly === true;
+    if (readOnly) {
+      const blocked = [...transaction.queries.values()].find(({ query }) => !isReadOnlySqlAllowed(query));
+      if (blocked) {
+        const outcome = failure(403, "INSUFFICIENT_PRIVILEGE", "This function is unavailable to read-only queries");
+        analytics?.record(transaction.owner, transaction.database, blocked.query, outcome);
+        return outcome;
+      }
+    }
     const execution = watchExecution(reply, 60_000, fastify.queryPools);
     let storeFailed = false;
     async function saveProgress(operation: Promise<void>) {
@@ -274,7 +283,7 @@ const transactionRoutes: FastifyPluginAsync<{ store: ExecutionStore; analytics?:
           rowMode: transaction.options.arrayMode ? "array" : undefined,
         };
         const result = await execution.run(() => resultBudget.query(acquired, statement)) as QueryResult;
-        if (access?.readOnly && await execution.run(() => hasAssignedTransactionId(acquired))) {
+        if (readOnly && await execution.run(() => hasAssignedTransactionId(acquired))) {
           transaction.status = "pending";
           return recordFailure(failure(403, "INSUFFICIENT_PRIVILEGE", "Read-only API keys cannot perform writes"));
         }
@@ -287,7 +296,7 @@ const transactionRoutes: FastifyPluginAsync<{ store: ExecutionStore; analytics?:
       execution.check();
       const outcome = respond(200, { success: true, transactionId: transaction.transactionId, results });
       if (progress) await saveProgress(progress.committing(outcome));
-      const command = access?.readOnly ? "ROLLBACK" : "COMMIT";
+      const command = readOnly ? "ROLLBACK" : "COMMIT";
       const result = await execution.run(() => {
         commitSent = command === "COMMIT";
         return acquired.query(command);
@@ -340,7 +349,7 @@ const transactionRoutes: FastifyPluginAsync<{ store: ExecutionStore; analytics?:
       }
       if (activeQuery) {
         const { queryId } = activeQuery;
-        const result = queryExecutionError(error, access?.readOnly);
+        const result = queryExecutionError(error, readOnly);
         return recordFailure(respond(result.status, {
           success: false, error: { ...result.error, ...(immediate ? { queryIndex: Number(queryId) } : { queryId }) },
         }));

@@ -138,6 +138,10 @@ export function isValidDatabaseName(name: unknown): name is string {
   return /^[a-zA-Z_][a-zA-Z0-9_-]{0,62}$/.test(name);
 }
 
+function isPostgresIdentifier(value: string): boolean {
+  return value.length > 0 && !value.includes("\0") && Buffer.byteLength(value) <= 63;
+}
+
 /**
  * Checks whether a database exists in PostgreSQL using parameterized query.
  */
@@ -152,7 +156,7 @@ export async function getPostgresDatabaseOid(
   databaseName: string,
   pool?: Pick<Pool, "query">,
 ): Promise<string | undefined> {
-  if (!isValidDatabaseName(databaseName)) {
+  if (!isPostgresIdentifier(databaseName)) {
     return undefined;
   }
 
@@ -160,7 +164,7 @@ export async function getPostgresDatabaseOid(
 
   try {
     const { rows } = await pg.query<{ oid: string }>(
-      "SELECT oid::text AS oid FROM pg_catalog.pg_database WHERE datname = $1 AND NOT datistemplate",
+      "SELECT oid::text AS oid FROM pg_catalog.pg_database WHERE datname::pg_catalog.text = $1 AND NOT datistemplate",
       [databaseName],
     );
     return rows[0]?.oid;
@@ -193,8 +197,11 @@ export async function listPostgresDatabases(pool?: Pool, includeTemplates = fals
 }
 
 export function databaseUrl(name: string): URL {
-  const url = new URL(config.database.url);
-  url.pathname = encodeURIComponent(name);
+  const source = config.database.url;
+  const url = source.startsWith("/") ? new URL("postgresql:///") : new URL(source);
+  if (source.startsWith("/")) url.searchParams.set("host", source.split(" ")[0]);
+  if (url.protocol === "socket:") url.searchParams.set("db", name);
+  else url.pathname = encodeURIComponent(name);
   url.searchParams.delete("dbname");
   url.searchParams.delete("database");
   return url;
@@ -255,9 +262,13 @@ export async function getPostgresDatabaseDetails(
   databaseName: string,
   pool?: Pool,
   includeTemplates = false,
+  by: "name" | "id" | "auto" = "auto",
 ): Promise<PostgresDatabaseDetails | null> {
-  const byOid = /^[0-9]{1,10}$/.test(databaseName) && Number(databaseName) <= 4_294_967_295;
-  if (!databaseName || databaseName.includes("\0")) return null;
+  if (!isPostgresIdentifier(databaseName)) return null;
+  const oid = by !== "name" && /^[0-9]{1,10}$/.test(databaseName) && Number(databaseName) <= 4_294_967_295
+    ? databaseName
+    : null;
+  if (by === "id" && oid === null) return null;
 
   const pg = pool ?? getDatabasePool();
 
@@ -291,13 +302,16 @@ export async function getPostgresDatabaseDetails(
             THEN pg_catalog.pg_database_size(d.oid)
           END AS bytes
         FROM pg_catalog.pg_database d
-        WHERE ${byOid ? "d.oid = $1::pg_catalog.oid" : "d.datname::pg_catalog.text = $1"} AND ($2 OR NOT d.datistemplate)
+        WHERE (d.datname::pg_catalog.text = $1 OR d.oid = $3::pg_catalog.oid)
+          AND ($2 OR NOT d.datistemplate)
+        ORDER BY (d.datname::pg_catalog.text = $1) DESC NULLS LAST
+        LIMIT 1
       )
       SELECT id, datname, server_version, collation_version, owner, encoding, lc_collate, lc_ctype, connection_limit, allow_connections,
         bytes::pg_catalog.text AS size_bytes,
         pg_catalog.pg_size_pretty(bytes) AS size_pretty
       FROM details`,
-      [databaseName, includeTemplates],
+      [by === "id" ? null : databaseName, includeTemplates, oid],
     );
 
     if (res.rowCount === 0 || !res.rows[0]) {
@@ -352,7 +366,7 @@ export async function refreshPostgresDatabaseVersion(database: PostgresDatabaseD
   } catch (err) {
     throw toDatabaseError(err, `Failed to refresh the collation version for '${database.name}'`) ?? err;
   }
-  return getPostgresDatabaseDetails(database.id, pool);
+  return getPostgresDatabaseDetails(database.id, pool, false, "id");
 }
 
 export interface CreatePostgresDatabaseOptions {
@@ -521,7 +535,7 @@ export async function alterPostgresDatabase(
   jsondb?: JsonDB,
   expectedOid?: string,
 ): Promise<{ database: string; renamed: boolean }> {
-  if (!isValidDatabaseName(databaseName)) {
+  if (!isPostgresIdentifier(databaseName)) {
     throw new DatabaseError(
       `Invalid database name: '${databaseName}'`,
       "INVALID_DATABASE_NAME",

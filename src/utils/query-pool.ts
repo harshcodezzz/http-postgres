@@ -10,6 +10,19 @@ const checkoutTimeoutMillis = 400;
 const growthIntervalMillis = 50;
 const statementTimeoutMillis = 30_000;
 const queryTimeoutMillis = 35_000;
+// Only a verified address and PostgreSQL system identifier may release a slot
+// from a previous postmaster. An unrelated observer still fails closed.
+const observerIdentitySql = `CASE
+  WHEN pg_catalog.has_function_privilege('pg_catalog.pg_control_system()', 'EXECUTE')
+  THEN pg_catalog.json_build_array(
+    (pg_catalog.pg_control_system()).system_identifier::pg_catalog.text,
+    pg_catalog.inet_server_addr(),
+    pg_catalog.current_setting('port'),
+    pg_catalog.pg_is_in_recovery(),
+    CASE WHEN pg_catalog.has_function_privilege('pg_catalog.pg_control_checkpoint()', 'EXECUTE')
+      THEN (pg_catalog.pg_control_checkpoint()).timeline_id END
+  )::pg_catalog.text
+END`;
 let queryConnections = 0;
 
 interface BackendSession {
@@ -18,6 +31,7 @@ interface BackendSession {
   startedAt: string | null;
   applicationName: string;
   serverStartedAt: string;
+  observerIdentity: string | null;
   idle: boolean;
   ownerId?: string;
 }
@@ -125,6 +139,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
         const sessions = [...closingBackends.keys()];
         const { rows } = await adminDb.query<{
           serverStartedAt: string;
+          observerIdentity: string | null;
           pid: number | null;
           oid: string | null;
           startedAt: string | null;
@@ -132,6 +147,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
           applicationName: string | null;
         }>(`
           SELECT EXTRACT(EPOCH FROM pg_catalog.pg_postmaster_start_time())::pg_catalog.text AS "serverStartedAt",
+                 ${observerIdentitySql} AS "observerIdentity",
                  activity.pid, activity.datid::pg_catalog.text AS oid, activity.state,
                  EXTRACT(EPOCH FROM activity.backend_start)::pg_catalog.text AS "startedAt",
                  activity.application_name AS "applicationName"
@@ -140,11 +156,20 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
         `, [sessions.map(({ pid }) => pid)]);
         if (closed) return;
         const observedServer = rows[0]?.serverStartedAt;
+        const observedIdentity = rows[0]?.observerIdentity;
         if (!observedServer) throw new Error("PostgreSQL did not identify the monitoring server");
         const byPid = new Map(rows.map((row) => [row.pid, row]));
         for (const session of sessions) {
           if (session.serverStartedAt !== observedServer) {
-            serverMismatch = true;
+            if (observedIdentity && observedIdentity === session.observerIdentity &&
+                Number(observedServer) > Number(session.serverStartedAt)) {
+              if (closingBackends.delete(session)) {
+                queryConnections--;
+                wakePools();
+              }
+            } else {
+              serverMismatch = true;
+            }
             continue;
           }
           const current = byPid.get(session.pid);
@@ -407,18 +432,19 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
     });
   }
 
-  async function observeServer(session: Omit<BackendSession, "idle">, opening: boolean) {
-    const { rows: [observer] } = await adminDb.query<{ verified: boolean }>(`
+  async function observeServer(session: Omit<BackendSession, "idle" | "observerIdentity">, opening: boolean) {
+    const { rows: [observer] } = await adminDb.query<{ verified: boolean; identity: string | null }>(`
       SELECT EXTRACT(EPOCH FROM pg_catalog.pg_postmaster_start_time())::pg_catalog.text = $4 AND EXISTS (
         SELECT 1 FROM pg_catalog.pg_stat_activity
         WHERE pid = $1 AND datid = $2::pg_catalog.oid
           AND ($3::pg_catalog.text IS NULL OR application_name = $3)
           AND (backend_start IS NULL OR EXTRACT(EPOCH FROM backend_start)::pg_catalog.text = $5)
-      ) AS verified
+      ) AS verified, CASE WHEN $3::pg_catalog.text IS NOT NULL THEN ${observerIdentitySql} END AS identity
     `, [session.pid, session.oid, opening ? session.applicationName : null, session.serverStartedAt, session.startedAt]);
     if (!observer?.verified) {
       throw new DatabaseError("The query backend is not on the administrative PostgreSQL server", "QUERY_DATABASE_UNAVAILABLE");
     }
+    return observer.identity;
   }
 
   async function connect(
@@ -503,7 +529,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
       const previous = backends.get(client);
       const sessionName = previous?.applicationName ?? `http-postgres-${randomUUID()}`;
       queryDispatched(client);
-      const [{ rows: [target] }] = await Promise.all([client.query<Omit<BackendSession, "idle"> & {
+      const [{ rows: [target] }] = await Promise.all([client.query<Omit<BackendSession, "idle" | "observerIdentity"> & {
         name: string;
         login: string;
         safe: boolean;
@@ -550,8 +576,8 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
         }
         return previous;
       }
-      await observeServer(target, true);
-      const session = { ...target, idle: client.getTransactionStatus() === "I" };
+      const observerIdentity = await observeServer(target, true);
+      const session = { ...target, observerIdentity, idle: client.getTransactionStatus() === "I" };
       // ReadyForQuery distinguishes closed transactions from in-flight or open work.
       client.connection.on("readyForQuery", () => { session.idle = client.getTransactionStatus() === "I"; });
       backends.set(client, session);

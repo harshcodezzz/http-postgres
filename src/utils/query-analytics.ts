@@ -77,6 +77,7 @@ export function createQueryAnalytics(directory: string, log: FastifyBaseLogger) 
           pg_code TEXT,
           occurred_at TEXT NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS failed_queries_recent_idx ON failed_queries (occurred_at DESC, id DESC);
       `);
       database = connection;
       return database;
@@ -169,7 +170,7 @@ export function createQueryAnalytics(directory: string, log: FastifyBaseLogger) 
         SELECT key_id AS keyId, database_name AS database, sql AS query, truncated,
                status, code, pg_code AS pgCode, occurred_at AS occurredAt
         FROM failed_queries
-        ORDER BY id DESC LIMIT ?
+        ORDER BY occurred_at DESC, id DESC LIMIT ?
       `).all(limit).map((row) => ({ ...row, truncated: row.truncated === 1 }));
       return { ...totals, keys, recentFailures };
     });
@@ -178,9 +179,16 @@ export function createQueryAnalytics(directory: string, log: FastifyBaseLogger) 
   async function close() {
     clearInterval(timer);
     try {
-      for (const waitMs of [0, 50, 250]) {
-        if (waitMs) await delay(waitMs);
-        if (flushSafely()) return;
+      while (usage.size) {
+        try {
+          flush();
+        } catch (error) {
+          const code = error && typeof error === "object" && "errcode" in error ? error.errcode : undefined;
+          if (typeof code !== "number" || ((code & 255) !== 5 && (code & 255) !== 6)) throw error;
+          if (!storageFailed) log.warn({ err: error }, "Waiting for the analytics writer before shutdown");
+          storageFailed = true;
+          await delay(50);
+        }
       }
     } finally {
       database?.close();

@@ -2,7 +2,7 @@ import { createHash, createHmac, pbkdf2Sync, randomBytes } from "node:crypto";
 import { escapeLiteral, type Client, type Pool } from "pg";
 import type { CrudOperation, DatabaseAccess } from "../config/query-privileges.js";
 import {
-  DatabaseError, databaseUrl, getPostgresDatabaseOid, listPostgresTables,
+  DatabaseError, databaseUrl, listPostgresTables,
   quoteIdentifier, withPostgresDatabase,
 } from "./pg-database.js";
 
@@ -24,11 +24,13 @@ export function queryAccess(secret: string, token: string) {
 
 export function scopedQueryUrl(database: string, access: QueryAccess): string {
   const url = databaseUrl(database);
-  url.username = access.login;
-  url.password = access.password;
-  for (const parameter of ["user", "username", "password", "options", "sslcert", "sslkey"]) {
+  url.username = "";
+  url.password = "";
+  for (const parameter of ["username", "options", "sslcert", "sslkey"]) {
     url.searchParams.delete(parameter);
   }
+  url.searchParams.set("user", access.login);
+  url.searchParams.set("password", access.password);
   return url.toString();
 }
 
@@ -121,26 +123,78 @@ async function hasRequestedAccess(
   return access.granted;
 }
 
-export async function provisionQueryAccess(
-  database: string,
-  oid: string,
-  policy: Omit<DatabaseAccess, "roleToken">,
-  secret: string,
-  adminPool: Pool,
-): Promise<DatabaseAccess> {
+async function withRoleProvisioning<T>(
+  database: string, oid: string, adminPool: Pool, operation: (client: Client) => Promise<T>,
+) {
   const { rows: [admin] } = await adminPool.query<{ started: string }>(
     "SELECT EXTRACT(EPOCH FROM pg_catalog.pg_postmaster_start_time())::text AS started",
   );
   return withPostgresDatabase(database, async (client) => {
     await client.query("BEGIN");
     await client.query("SET LOCAL search_path = pg_catalog");
-    const { rows: [target] } = await client.query<{ started: string }>(
-      "SELECT EXTRACT(EPOCH FROM pg_catalog.pg_postmaster_start_time())::text AS started",
-    );
-    if (target.started !== admin.started || await getPostgresDatabaseOid(database, client) !== oid) {
+    const { rows: [target] } = await client.query<{ started: string; oid: string }>(`
+      SELECT EXTRACT(EPOCH FROM pg_catalog.pg_postmaster_start_time())::text AS started, oid::text AS oid
+      FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database() AND NOT datistemplate
+    `);
+    if (!target || target.started !== admin.started || target.oid !== oid) {
       throw new DatabaseError("The database changed during API key setup", "DATABASE_SCOPE_CHANGED");
     }
+    const result = await operation(client);
+    await client.query("COMMIT");
+    return result;
+  });
+}
 
+async function provisionLogin(
+  client: Client, database: string, token: string, secret: string,
+  grants: readonly TableGrant[], sequences: readonly Relation[],
+) {
+  const { login, password } = queryAccess(secret, token);
+  const role = quoteIdentifier(login);
+  await client.query("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1, 0))", [login]);
+  const { rowCount } = await client.query("SELECT 1 FROM pg_catalog.pg_roles WHERE rolname::text = $1", [login]);
+  if (!rowCount) {
+    await client.query(`CREATE ROLE ${role} LOGIN NOINHERIT PASSWORD ${escapeLiteral(passwordVerifier(password))}`);
+    await grantAccess(client, database, role, grants, sequences);
+  }
+  if (!await hasRequestedAccess(client, login, grants, sequences)) {
+    throw new DatabaseError(
+      "The PostgreSQL administrator could not grant all requested database, schema, table, or sequence privileges",
+      "INSUFFICIENT_PRIVILEGE",
+    );
+  }
+  const { rows: [access] } = await client.query<{ safe: boolean; inheritanceSafe: boolean }>(`
+    SELECT (${scopedRoleSafety("$1::pg_catalog.name")})
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_database d
+        WHERE d.datname <> pg_catalog.current_database() AND d.datallowconn
+          AND pg_catalog.has_database_privilege($1::pg_catalog.name, d.oid, 'CONNECT')
+      ) AS safe,
+      ${scopedInheritanceSafety("$1::pg_catalog.name")} AS "inheritanceSafe"
+  `, [login]);
+  if (!access.inheritanceSafe) {
+    throw new DatabaseError(
+      "An allowed parent table reaches descendants outside the requested privileges",
+      "UNSAFE_DATABASE_SCOPE",
+    );
+  }
+  if (!access.safe) {
+    throw new DatabaseError(
+      "Remove PUBLIC access to other databases and any PUBLIC application object privileges inherited by the scoped login",
+      "UNSAFE_DATABASE_SCOPE",
+    );
+  }
+}
+
+export async function provisionQueryAccess(
+  database: string,
+  oid: string,
+  policy: Pick<DatabaseAccess, "database" | "table" | "tables">,
+  secret: string,
+  adminPool: Pool,
+  owner: string,
+): Promise<DatabaseAccess> {
+  return withRoleProvisioning(database, oid, adminPool, async (client) => {
     const tables = await listPostgresTables(client);
     const tableKey = (table: { schema: string; name: string }) => JSON.stringify([table.schema, table.name]);
     const selected = new Set(policy.tables.map(tableKey));
@@ -158,46 +212,45 @@ export async function provisionQueryAccess(
         : policy.database,
     })).filter(({ operations }) => operations.length);
     const sequences = await listInsertSequences(client, grants);
-    const roleToken = createHash("sha256").update(JSON.stringify([oid, grants, sequences])).digest("hex");
-    const { login, password } = queryAccess(secret, roleToken);
-    const role = quoteIdentifier(login);
+    const roleToken = createHash("sha256").update(JSON.stringify([owner, oid, grants, sequences])).digest("hex");
+    await provisionLogin(client, database, roleToken, secret, grants, sequences);
+    return { ...policy, roleToken, roleOwner: owner };
+  });
+}
 
-    // A policy is immutable once provisioned. Serialize identical role creation across gateway processes.
-    await client.query("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1, 0))", [login]);
-    const { rowCount } = await client.query("SELECT 1 FROM pg_catalog.pg_roles WHERE rolname::text = $1", [login]);
-    if (!rowCount) {
-      await client.query(`CREATE ROLE ${role} LOGIN NOINHERIT PASSWORD ${escapeLiteral(passwordVerifier(password))}`);
-      await grantAccess(client, database, role, grants, sequences);
+export async function isolateQueryAccess(
+  database: string, oid: string, scope: DatabaseAccess, secret: string, adminPool: Pool, owner: string,
+): Promise<DatabaseAccess> {
+  return withRoleProvisioning(database, oid, adminPool, async (client) => {
+    const original = queryAccess(secret, scope.roleToken).login;
+    // Copy effective direct grants by OID so a migration cannot include newly added tables.
+    const { rows: [role] } = await client.query<{ oid: string; allowed: boolean }>(`
+      SELECT oid::text, pg_catalog.has_database_privilege(oid, pg_catalog.current_database(), 'CONNECT') AS allowed
+      FROM pg_catalog.pg_roles WHERE rolname::text = $1
+    `, [original]);
+    if (!role?.allowed) {
+      throw new DatabaseError("The previous database scope needs to be resaved", "DATABASE_SCOPE_UNBOUND");
     }
-    if (!await hasRequestedAccess(client, login, grants, sequences)) {
-      throw new DatabaseError(
-        "The PostgreSQL administrator could not grant all requested database, schema, table, or sequence privileges",
-        "INSUFFICIENT_PRIVILEGE",
-      );
-    }
-    const { rows: [access] } = await client.query<{ safe: boolean; inheritanceSafe: boolean }>(`
-      SELECT (${scopedRoleSafety("$1::pg_catalog.name")})
-        AND NOT EXISTS (
-          SELECT 1 FROM pg_catalog.pg_database d
-          WHERE d.datname <> pg_catalog.current_database() AND d.datallowconn
-            AND pg_catalog.has_database_privilege($1::pg_catalog.name, d.oid, 'CONNECT')
-        ) AS safe,
-        ${scopedInheritanceSafety("$1::pg_catalog.name")} AS "inheritanceSafe"
-    `, [login]);
-    if (!access.inheritanceSafe) {
-      throw new DatabaseError(
-        "An allowed parent table reaches descendants outside the requested privileges",
-        "UNSAFE_DATABASE_SCOPE",
-      );
-    }
-    if (!access.safe) {
-      throw new DatabaseError(
-        "Remove PUBLIC access to other databases and any PUBLIC application object privileges inherited by the scoped login",
-        "UNSAFE_DATABASE_SCOPE",
-      );
-    }
-    await client.query("COMMIT");
-    return { ...policy, roleToken };
+    const { rows } = await client.query<Relation & { kind: string; granted: string[] }>(`
+      SELECT c.oid::text, n.nspname AS schema, c.relname AS name, c.relkind AS kind,
+             pg_catalog.array_agg(DISTINCT acl.privilege_type) AS granted
+      FROM pg_catalog.pg_class c
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+      CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) AS acl
+      WHERE c.relkind IN ('r', 'p', 'S') AND acl.grantee = $1::pg_catalog.oid
+        AND pg_catalog.has_schema_privilege($1::pg_catalog.oid, n.oid, 'USAGE')
+      GROUP BY c.oid, n.nspname
+      ORDER BY c.oid
+    `, [role.oid]);
+    const operations = Object.keys(privileges) as CrudOperation[];
+    const grants: TableGrant[] = rows.filter(({ kind }) => kind !== "S").map((table) => ({
+      oid: table.oid, schema: table.schema, name: table.name,
+      operations: operations.filter((op) => table.granted.includes(privileges[op])),
+    })).filter((table) => table.operations.length > 0);
+    const sequences = rows.filter(({ kind, granted }) => kind === "S" && granted.includes("USAGE"));
+    const roleToken = createHash("sha256").update(JSON.stringify([owner, oid, scope.roleToken])).digest("hex");
+    await provisionLogin(client, database, roleToken, secret, grants, sequences);
+    return { ...scope, roleToken, roleOwner: owner };
   });
 }
 
@@ -267,36 +320,4 @@ export function scopedRoleSafety(role: SqlRole) {
     WHERE pg_catalog.has_server_privilege(${role}, s.oid, 'USAGE')
   )
 `;
-}
-
-const scopedCommands = new Set(["SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "WITH", "TABLE", "VALUES"]);
-
-export function isScopedStatement(sql: string): boolean {
-  // Skip SQL whitespace and comments before reading the complete first identifier.
-  let start = 0;
-  while (start < sql.length) {
-    const prefix = sql.slice(start);
-    const whitespace = /^[ \t\n\r\f]+/.exec(prefix);
-    if (whitespace) {
-      start += whitespace[0].length;
-    } else if (prefix.startsWith("--")) {
-      const line = /[\n\r]/.exec(prefix);
-      if (!line) return false;
-      start += line.index + 1;
-    } else if (prefix.startsWith("/*")) {
-      let depth = 1;
-      start += 2;
-      while (start < sql.length && depth) {
-        const pair = sql.slice(start, start + 2);
-        if (pair === "/*") depth++;
-        if (pair === "*/") depth--;
-        start += pair === "/*" || pair === "*/" ? 2 : 1;
-      }
-      if (depth) return false;
-    } else {
-      const keyword = /^[a-z0-9_$\u0080-\uffff]+/i.exec(prefix)?.[0];
-      return keyword !== undefined && scopedCommands.has(keyword.toUpperCase());
-    }
-  }
-  return false;
 }

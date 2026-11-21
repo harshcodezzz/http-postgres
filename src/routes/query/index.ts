@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 import { DatabaseError as PostgresError, type PoolClient, type QueryResult } from "pg";
-import { isScopedStatement } from "../../utils/query-access.js";
+import { isReadOnlySqlAllowed, isScopedStatement } from "../../utils/sql-policy.js";
 import { queryConnectionError, queryExecutionError } from "../../utils/query-pool.js";
 import type { QueryAnalytics } from "../../utils/query-analytics.js";
 import type { ExecutionOutcome, ExecutionStore } from "../execution-store.js";
@@ -158,6 +158,12 @@ const queryRoutes: FastifyPluginAsync<{ store: ExecutionStore; analytics?: Query
 
     if (queryAccess && !isScopedStatement(body.query)) {
       const outcome = failure(403, "INSUFFICIENT_PRIVILEGE", "Scoped API keys can run only data queries");
+      analytics?.record(apiKey.id, database, body.query, outcome);
+      return send(reply, outcome);
+    }
+
+    if (queryAccess?.readOnly && !isReadOnlySqlAllowed(body.query)) {
+      const outcome = failure(403, "INSUFFICIENT_PRIVILEGE", "This function is unavailable to read-only queries");
       analytics?.record(apiKey.id, database, body.query, outcome);
       return send(reply, outcome);
     }

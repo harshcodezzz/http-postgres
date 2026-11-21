@@ -1,16 +1,4 @@
 {
-  "dependencies": {
-    "@fastify/compress": "^9.3.0",
-    "dotenv": "^18.0.10",
-    "fastify": "^5.12.8",
-    "fastify-plugin": "^6.0.1",
-    "ioredis": "^6.0.0",
-    "pg": "^8.23.1",
-    "pino": "^10.4.0",
-    "pino-roll": "^4.0.0",
-    "yaml": "^2.9.1",
-    "zod": "^4.6.7"
-  },
   "name": "http-postgres",
   "version": "1.5.0",
   "engines": {
@@ -29,6 +17,18 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@fastify/compress": "^9.3.0",
+    "dotenv": "^18.0.10",
+    "fastify": "^5.12.8",
+    "fastify-plugin": "^6.0.1",
+    "ioredis": "^6.0.0",
+    "pg": "^8.23.1",
+    "pino": "^10.4.0",
+    "pino-roll": "^4.0.0",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.7"
   },
   "keywords": [],
   "author": "",

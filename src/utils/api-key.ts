@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { Pool } from "pg";
 import config from "../config/index.js";
 import { crudList, type DatabaseAccess, type TableName } from "../config/query-privileges.js";
-import { provisionQueryAccess, queryAccess, type QueryAccess } from "./query-access.js";
+import { isolateQueryAccess, provisionQueryAccess, queryAccess, type QueryAccess } from "./query-access.js";
 import { appendAuditLine } from "./log-files.js";
 import {
   JsonDB,
@@ -69,6 +69,7 @@ export class ApiKeyError extends Error {
 const API_KEY_LOG_FILE = resolve(process.cwd(), "logs", "api-keys.log");
 
 const pendingLastUsedWrites = new Set<string>();
+const pendingScopeMigrations = new Map<string, Promise<DatabaseAccess | undefined>>();
 
 let sharedPgPool: Pool | null = null;
 
@@ -135,6 +136,7 @@ export interface VerifyApiKeyResult {
 
 export interface VerifyApiKeyOptions {
   db?: JsonDB;
+  pgPool?: Pool;
   auditLogPath?: string;
 }
 
@@ -242,6 +244,7 @@ async function provisionScopes(
   targets: ReturnType<typeof parseDatabaseTargets>,
   bindings: [string, string][],
   db: JsonDB,
+  owner: string,
   pgPool?: Pool,
 ) {
   const { policies } = targets;
@@ -256,7 +259,7 @@ async function provisionScopes(
   for (const [database, oid] of bindings) {
     const policy = policies.get(database);
     if (!policy) throw new Error("Missing database scope");
-    const scope = await provisionQueryAccess(database, oid, policy, secret, pgPool ?? getApiKeyPool());
+    const scope = await provisionQueryAccess(database, oid, policy, secret, pgPool ?? getApiKeyPool(), owner);
     scopes.push([database, scope]);
   }
   return Object.fromEntries(scopes);
@@ -323,12 +326,12 @@ export async function createApiKey(
     bindings.push([database, oid]);
   }
 
-  const accessScopes = await provisionScopes(targets, bindings, db, options.pgPool);
+  const id = randomBytes(12).toString("hex");
+  const accessScopes = await provisionScopes(targets, bindings, db, id, options.pgPool);
   const secret = randomBytes(24).toString("base64url");
   const apiKey = `KEY_${environment}_${secret}`;
   const keyHash = hashApiKeySecret(secret);
   const keyPrefix = maskApiKey(apiKey);
-  const id = randomBytes(12).toString("hex");
 
   const record: ApiKeyRecord = {
     id,
@@ -367,6 +370,37 @@ export async function createApiKey(
   );
 
   return { apiKey, record };
+}
+
+function migrateSharedScope(
+  db: JsonDB, keyHash: string, record: ApiKeyRecord, database: string, oid: string,
+  scope: DatabaseAccess, secret: string, pool?: Pool,
+) {
+  const migrationKey = JSON.stringify([db.filePath, record.id, oid, scope.roleToken]);
+  const pending = pendingScopeMigrations.get(migrationKey);
+  if (pending) return pending;
+
+  const migration = (async () => {
+    const isolated = await isolateQueryAccess(database, oid, scope, secret, pool ?? getApiKeyPool(), record.id);
+    const data = await db.update<DataStore>((current) => {
+      const latest = current.apiKeys?.[keyHash];
+      if (latest?.status !== "active" || latest.databaseOids?.[database] !== oid ||
+          latest.accessScopes?.[database]?.roleToken !== scope.roleToken) return current;
+      return {
+        ...current,
+        apiKeys: {
+          ...current.apiKeys,
+          [keyHash]: { ...latest, accessScopes: { ...latest.accessScopes, [database]: isolated } },
+        },
+      };
+    });
+    const latest = data.apiKeys?.[keyHash];
+    if (latest?.status !== "active" || latest.databaseOids?.[database] !== oid) return;
+    const updated = latest.accessScopes?.[database];
+    if (updated?.roleOwner === record.id) return updated;
+  })().finally(() => pendingScopeMigrations.delete(migrationKey));
+  pendingScopeMigrations.set(migrationKey, migration);
+  return migration;
 }
 
 /**
@@ -497,8 +531,20 @@ export async function verifyApiKey(
   if (record.databaseScopes !== undefined) return { valid: false, error: "DATABASE_SCOPE_UNBOUND" };
   let access: QueryAccess | undefined;
   if (record.accessScopes !== undefined) {
-    const scope = Object.hasOwn(record.accessScopes, databaseName) ? record.accessScopes[databaseName] : undefined;
+    let scope = Object.hasOwn(record.accessScopes, databaseName) ? record.accessScopes[databaseName] : undefined;
     if (!scope?.roleToken || !data.queryRoleSecret) return { valid: false, error: "DATABASE_SCOPE_UNBOUND" };
+    if (scope.roleOwner !== record.id) {
+      try {
+        const pool = dbOrOptions instanceof JsonDB ? undefined : dbOrOptions?.pgPool;
+        scope = await migrateSharedScope(db, keyHash, record, databaseName, databaseOid, scope, data.queryRoleSecret, pool);
+      } catch (error) {
+        if (error instanceof DatabaseError && error.code === "DATABASE_SCOPE_UNBOUND") {
+          return { valid: false, error: "DATABASE_SCOPE_UNBOUND" };
+        }
+        throw error;
+      }
+      if (!scope) return { valid: false, error: "DATABASE_SCOPE_UNBOUND" };
+    }
     access = {
       ...queryAccess(data.queryRoleSecret, scope.roleToken),
       readOnly: scope.database.every((operation) => operation === "r") &&
@@ -635,7 +681,7 @@ export async function updateApiKeyScope(
 
   let updatedRecord: ApiKeyRecord | null = null;
 
-  const accessScopes = await provisionScopes(targets, bindings, db, options.pgPool);
+  const accessScopes = await provisionScopes(targets, bindings, db, record.id, options.pgPool);
 
   await db.update((current) => {
     const apiKeys = { ...(current.apiKeys ?? {}) };

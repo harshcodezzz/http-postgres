@@ -195,16 +195,22 @@ const adminDatabaseRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get("/database", (_request, reply) => listDatabases(reply, true));
   fastify.get("/databases", (_request, reply) => listDatabases(reply, false));
 
-  const getDatabase = async (dbName: string, reply: FastifyReply, includeTemplates: boolean) => {
+  type DatabaseLookup = { Params: { id: string }; Querystring: { by?: string } };
+  const getDatabase = async (request: FastifyRequest<DatabaseLookup>, reply: FastifyReply, includeTemplates: boolean) => {
+    const { id } = request.params;
     try {
-      const details = await getPostgresDatabaseDetails(dbName, fastify.db, includeTemplates);
+      const { by } = request.query;
+      if (by !== undefined && by !== "id" && by !== "name") {
+        throw new DatabaseError("Use 'id' or 'name' for the by query parameter", "INVALID_PARAMETER_VALUE");
+      }
+      const details = await getPostgresDatabaseDetails(id, fastify.db, includeTemplates, by);
 
       if (!details) {
         return reply.code(404).send({
           success: false,
           error: {
             code: "DATABASE_NOT_FOUND",
-            message: `Database '${dbName}' not found`,
+            message: `Database '${id}' not found`,
           },
         });
       }
@@ -223,8 +229,8 @@ const adminDatabaseRoutes: FastifyPluginAsync = async (fastify) => {
       );
     }
   };
-  fastify.get<{ Params: { id: string } }>("/database/:id", (request, reply) => getDatabase(request.params.id, reply, true));
-  fastify.get<{ Params: { id: string } }>("/databases/:id", (request, reply) => getDatabase(request.params.id, reply, false));
+  fastify.get<DatabaseLookup>("/database/:id", (request, reply) => getDatabase(request, reply, true));
+  fastify.get<DatabaseLookup>("/databases/:id", (request, reply) => getDatabase(request, reply, false));
 
   const createHandler = async (request: FastifyRequest<{ Body: Record<string, unknown> }>, reply: FastifyReply) => {
     const body = (request.body && typeof request.body === "object" ? request.body : {}) as Record<string, unknown>;
@@ -309,11 +315,12 @@ const adminDatabaseRoutes: FastifyPluginAsync = async (fastify) => {
   });
 
   function databaseTarget(request: FastifyRequest<{ Body: Record<string, unknown> }>) {
+    const by = request.body?.database == null && request.body?.id != null ? "id" : "name";
     const target = request.body?.database ?? request.body?.id ?? request.headers["x-database"] ?? request.body?.name;
     if (typeof target !== "string" || !target) {
       throw new DatabaseError("A database name or ID is required", "INVALID_DATABASE_NAME");
     }
-    return target;
+    return { target, by } as const;
   }
 
   fastify.put<{ Body: Record<string, unknown> }>("/database", async (request, reply) => {
@@ -321,8 +328,8 @@ const adminDatabaseRoutes: FastifyPluginAsync = async (fastify) => {
       if (request.body?.version !== undefined && request.body.version !== "collation") {
         throw new DatabaseError("Use version 'collation' to refresh the database collation version", "DATABASE_VERSION_UNSUPPORTED");
       }
-      const target = databaseTarget(request);
-      const database = await getPostgresDatabaseDetails(target, fastify.db);
+      const { target, by } = databaseTarget(request);
+      const database = await getPostgresDatabaseDetails(target, fastify.db, false, by);
       if (!database) throw new DatabaseError(`Database '${target}' not found`, "DATABASE_NOT_FOUND");
       const updated = await fastify.queryPools.withMaintenance(
         database.name, () => refreshPostgresDatabaseVersion(database, fastify.db),
@@ -344,8 +351,8 @@ const adminDatabaseRoutes: FastifyPluginAsync = async (fastify) => {
 
     try {
       const pathName = request.params.name;
-      const target = pathName ?? databaseTarget(request);
-      const details = pathName ? null : await getPostgresDatabaseDetails(target, fastify.db);
+      const { target, by } = pathName ? { target: pathName, by: "name" as const } : databaseTarget(request);
+      const details = pathName ? null : await getPostgresDatabaseDetails(target, fastify.db, false, by);
       if (!pathName && !details) throw new DatabaseError(`Database '${target}' not found`, "DATABASE_NOT_FOUND");
       const dbName = details?.name ?? target;
       const newName = parseOptionalString(pathName ? getField(body, "newName", "name") : body.newName, "newName");

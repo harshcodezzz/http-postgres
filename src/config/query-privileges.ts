@@ -17,4 +17,5 @@ export interface DatabaseAccess {
   tables: TableName[];
   table: CrudOperation[];
   roleToken: string;
+  roleOwner?: string;
 }

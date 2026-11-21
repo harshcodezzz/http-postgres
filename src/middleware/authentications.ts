@@ -87,7 +87,7 @@ const authPlugin: FastifyPluginAsync = async (fastify) => {
       });
     }
 
-    const result = await verifyApiKey(database, apiKey, fastify.jsondb);
+    const result = await verifyApiKey(database, apiKey, { db: fastify.jsondb, pgPool: fastify.db });
 
     if (!result.valid || !result.record || !result.databaseOid) {
       const rebindRequired = result.error === "DATABASE_SCOPE_UNBOUND";
