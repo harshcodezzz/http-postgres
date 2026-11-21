@@ -98,8 +98,7 @@ const queryRoutes: FastifyPluginAsync<{ store: ExecutionStore; analytics?: Query
         await execution.run(() => client.query("SELECT 1"));
       }
       const result = await execution.run(() => {
-        submitted = true;
-        return createResultBudget(execution).query(client, statement);
+        return createResultBudget(execution).query(client, statement, () => { submitted = true; });
       });
       if (queryAccess?.readOnly && await execution.run(() => hasAssignedTransactionId(client))) {
         return failure(403, "INSUFFICIENT_PRIVILEGE", "Read-only API keys cannot perform writes");

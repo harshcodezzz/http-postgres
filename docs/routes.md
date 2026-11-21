@@ -137,6 +137,8 @@ Only failed SQL is stored in analytics, with the SQLSTATE and gateway error code
 
 ## API-key database and table scopes
 
+When key creation supplies `database` or `databases` without `scope-database`, `scope-table`, or `tables`, the new key receives create, read, update, and delete access to every current user table in each assigned database. Resave the scope after adding tables so their grants are included.
+
 Send the database names in `database` and the database-wide operations in `scope-database`. Use `tables` and `scope-table` to add operations for selected tables. In this example, the key can read all current user tables in `sales` and insert into `public.orders`.
 
 ```json

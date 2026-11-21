@@ -150,7 +150,9 @@ export function createResultBudget(execution: ReturnType<typeof watchExecution>)
     }
   }
   return {
-    async query(client: PoolClient, statement: ResultStatement): Promise<QueryResult | QueryResult[]> {
+    async query(
+      client: PoolClient, statement: ResultStatement, onDispatch?: () => void,
+    ): Promise<QueryResult | QueryResult[]> {
       if (!reserved) {
         if (reservedResultBytes + maxResultBytes > maxConcurrentResultBytes) {
           throw new ExecutionStopped(503, "RESULT_MEMORY_BUSY", "Result memory capacity is temporarily exhausted");
@@ -197,6 +199,7 @@ export function createResultBudget(execution: ReturnType<typeof watchExecution>)
           // The driver reads the timeout from the submitted Query instance.
           if (statement.query_timeout !== undefined) Object.assign(query, { query_timeout: statement.query_timeout });
           client.query(query);
+          onDispatch?.();
         });
       } finally {
         client.connection.removeListener("copyInResponse", rejectCopy);

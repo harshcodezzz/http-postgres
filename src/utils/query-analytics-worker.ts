@@ -240,5 +240,6 @@ port.on("message", (request: Request) => {
     port.postMessage({ type: "response", id: request.id, result: { spooled: hasPending() } });
   }).catch((error) => {
     port.postMessage({ type: "log", level: "error", message: "Analytics worker operation failed", error: String(error) });
+    port.postMessage({ type: "response", id: request.id, error: String(error) });
   });
 });

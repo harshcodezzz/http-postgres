@@ -214,9 +214,20 @@ export function createQueryAnalytics(directory: string, log: FastifyBaseLogger, 
     closed = true;
     clearInterval(timer);
     clearTimeout(restartTimer);
-    const result = await send("close", { deadlineMs: 5_000 }, takeBatch());
-    if (result.spooled) log.warn("Buffered query analytics were spooled during shutdown");
-    await worker?.terminate();
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      const result = await Promise.race([
+        send("close", { deadlineMs: 5_000 }, takeBatch()),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("Analytics worker shutdown timed out")), 6_000);
+          timeout.unref();
+        }),
+      ]);
+      if (result.spooled) log.warn("Buffered query analytics were spooled during shutdown");
+    } finally {
+      clearTimeout(timeout);
+      await worker?.terminate();
+    }
   }
 
   return { record, report, close };

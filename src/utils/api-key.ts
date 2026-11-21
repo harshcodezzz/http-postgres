@@ -290,7 +290,7 @@ export async function writeAuditLog(
   await appendAuditLine(logPath, JSON.stringify({ ...entry, database }) + "\n");
 }
 
-function parseDatabaseTargets(input: ApiKeyScopeInput) {
+function parseDatabaseTargets(input: ApiKeyScopeInput, defaultToFullCrud = false) {
   const { database, databases, tables, "scope-database": databaseScope, "scope-table": tableScope } = input;
   if (database !== undefined && databases !== undefined) {
     throw new ApiKeyError("Use either 'database' or 'databases'", "INVALID_DATABASE_SCOPE");
@@ -301,7 +301,19 @@ function parseDatabaseTargets(input: ApiKeyScopeInput) {
   if (names.length === 0) {
     throw new ApiKeyError("Provide a nonempty array of database names", "INVALID_DATABASE_SCOPE");
   }
-  if (!Array.isArray(database) && tables === undefined && databaseScope === undefined && tableScope === undefined) {
+  const scopeOmitted = tables === undefined && databaseScope === undefined && tableScope === undefined;
+  if (scopeOmitted && defaultToFullCrud) {
+    const operations = crudList.parse(["c", "r", "u", "d"]);
+    return {
+      names,
+      policies: new Map(names.map((name) => [name, {
+        database: operations,
+        tables: [] as TableName[],
+        table: [],
+      }])),
+    };
+  }
+  if (!Array.isArray(database) && scopeOmitted) {
     return { names };
   }
 
@@ -385,7 +397,7 @@ export async function createApiKey(
     );
   }
 
-  const targets = parseDatabaseTargets(options);
+  const targets = parseDatabaseTargets(options, true);
   const db = options.db ?? new JsonDB();
   const auditPath = options.auditLogPath ?? API_KEY_LOG_FILE;
 
