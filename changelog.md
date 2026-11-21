@@ -32,6 +32,7 @@
 - Enabled rate limiting in the shipped configuration, added pre-write and `SQLITE_FULL` analytics pruning with physical-file accounting, removed SQL comments with tokenizer-based literal redaction, made analytics batches transactionally idempotent, and held result-memory reservations through response delivery.
 - Bounded analytics worker shutdown even when fallback spooling fails, and distinguished pre-dispatch result-memory rejection from unknown PostgreSQL query outcomes.
 - Defaulted newly created database-assigned API keys to CRUD access across all current user tables when no database or table scope fields are supplied.
+- Returned pre-dispatch execution limits with their specific status and code, including `503 RESULT_MEMORY_BUSY`, instead of mapping them to a generic query error.
 - Enforced table scopes across inheritance and partition trees, and rolled back writes attempted through read-only keys.
 - Rejected API key provisioning when requested PostgreSQL grants are incomplete. Resaving a key now refreshes grants for replacement sequences used by column defaults.
 - Required exact database name matches when looking up a database in admin routes, preventing overlong names from selecting a truncated match.

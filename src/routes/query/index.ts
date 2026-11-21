@@ -121,8 +121,8 @@ const queryRoutes: FastifyPluginAsync<{ store: ExecutionStore; analytics?: Query
       if (submitted && (interruption || !(err instanceof PostgresError) || err.severity !== "ERROR")) {
         return unknownOutcome(interruption?.code ?? "QUERY_RESULT_UNAVAILABLE");
       }
-      if (execution.stopped) {
-        const { status, code, message } = execution.stopped;
+      if (interruption) {
+        const { status, code, message } = interruption;
         return failure(status, code, message);
       }
       const { status, error } = queryExecutionError(err, queryAccess?.readOnly);
