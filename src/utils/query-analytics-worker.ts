@@ -10,19 +10,23 @@ interface FailedQuery {
 }
 interface Batch { usage: Array<[string, Usage]>; failures: FailedQuery[] }
 type Request =
-  | { type: "flush"; batch: Batch }
-  | { type: "report"; id: number; batch: Batch; limit: number }
-  | { type: "close"; id: number; batch: Batch; deadlineMs: number };
+  | { type: "flush"; id: string; batch: Batch }
+  | { type: "report"; id: string; limit: number }
+  | { type: "close"; id: string; batch: Batch; deadlineMs: number };
 
 if (!parentPort) throw new Error("Analytics worker requires a parent port");
 const port = parentPort;
 const directory = workerData.directory as string;
 const databaseFile = join(directory, "analytics.sqlite");
 const spoolFile = join(directory, "analytics-pending.json");
+const retentionDays = workerData.retentionDays as number;
+const maxStorageBytes = workerData.maxStorageBytes as number;
 let database: DatabaseSync | undefined;
 let pending: Batch = { usage: [], failures: [] };
 let operations = Promise.resolve();
 const maxBufferedFailures = 256;
+const pendingAcks = new Set<string>();
+let lastMaintenance = 0;
 
 function hasPending() {
   return pending.usage.length > 0 || pending.failures.length > 0;
@@ -64,8 +68,30 @@ function openDatabase() {
     CREATE INDEX IF NOT EXISTS failed_queries_recent_idx
       ON failed_queries (occurred_at DESC, id DESC);
   `);
+  const pageSize = Number((connection.prepare("PRAGMA page_size").get() as { page_size: number }).page_size);
+  connection.exec(`PRAGMA journal_size_limit = ${Math.min(4_194_304, Math.floor(maxStorageBytes / 8))}`);
+  connection.exec(`PRAGMA max_page_count = ${Math.max(1, Math.floor(maxStorageBytes / pageSize))}`);
   database = connection;
   return connection;
+}
+
+function maintainStorage(db: DatabaseSync) {
+  if (Date.now() - lastMaintenance < 60_000) return;
+  lastMaintenance = Date.now();
+  const cutoff = new Date(Date.now() - retentionDays * 86_400_000).toISOString();
+  db.prepare(`DELETE FROM failed_queries WHERE id IN (
+    SELECT id FROM failed_queries WHERE occurred_at < ? ORDER BY id LIMIT 1000
+  )`).run(cutoff);
+  const pageSize = Number((db.prepare("PRAGMA page_size").get() as { page_size: number }).page_size);
+  for (let batch = 0; batch < 32; batch++) {
+    const pages = Number((db.prepare("PRAGMA page_count").get() as { page_count: number }).page_count);
+    const free = Number((db.prepare("PRAGMA freelist_count").get() as { freelist_count: number }).freelist_count);
+    if ((pages - free) * pageSize <= maxStorageBytes * 0.9) break;
+    const removed = db.prepare(`DELETE FROM failed_queries WHERE id IN (
+      SELECT id FROM failed_queries ORDER BY occurred_at, id LIMIT 1000
+    )`).run().changes;
+    if (!removed) break;
+  }
 }
 
 function flushPending() {
@@ -96,6 +122,11 @@ function flushPending() {
     }
     db.exec("COMMIT");
     pending = { usage: [], failures: [] };
+    for (const id of pendingAcks) port.postMessage({ type: "ack", id });
+    pendingAcks.clear();
+    try { maintainStorage(db); } catch (error) {
+      port.postMessage({ type: "log", level: "warn", message: "Could not prune query analytics", error: String(error) });
+    }
     try { unlinkSync(spoolFile); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
@@ -149,17 +180,20 @@ try {
 }
 
 const retryTimer = setInterval(() => {
-  if (!hasPending()) return;
   operations = operations.then(() => {
-    try { flushPending(); } catch {}
+    try {
+      if (hasPending()) flushPending();
+      else maintainStorage(openDatabase());
+    } catch {}
   });
 }, 1_000);
 retryTimer.unref();
 
 port.on("message", (request: Request) => {
   operations = operations.then(async () => {
-    appendBatch(request.batch);
     if (request.type === "flush") {
+      appendBatch(request.batch);
+      pendingAcks.add(request.id);
       try { flushPending(); } catch (error) {
         port.postMessage({ type: "log", level: "warn", message: "Could not write query analytics", error: String(error) });
       }
@@ -173,6 +207,7 @@ port.on("message", (request: Request) => {
       }
       return;
     }
+    appendBatch(request.batch);
     const deadline = performance.now() + request.deadlineMs;
     while (hasPending() && performance.now() < deadline) {
       try { flushPending(); } catch { await new Promise((resolve) => setTimeout(resolve, 50)); }

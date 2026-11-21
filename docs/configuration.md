@@ -36,10 +36,13 @@ The table lists loader defaults. Explicit values in [gateway.yaml](../gateway.ya
 | `ratelimit.enabled` | `true` | Enable the per-IP and per-key request limits. |
 | `ratelimit.requestPerMinute` | `1000` | Requests per authenticated API key in a 60-second window. |
 | `ratelimit.requestPerMinutePerIp` | `1000` | Requests per IP in a 60-second window. Applies before authentication. |
-| `ratelimit.whitelistedIPs` | `[]` | Exact client IP strings exempt from the per-IP limit. Replace the example placeholders in the supplied file with real addresses or `[]`. |
+| `ratelimit.whitelistedIPs` | `[]` | IPv4 or IPv6 addresses and CIDR ranges exempt from the per-IP limit, such as `192.0.2.10`, `10.0.0.0/8`, `2001:db8::1`, or `2001:db8::/32`. |
 | `transactions.retentionDays` | `30` | Days to keep uncollected async query outcomes, finalized transaction records, and idempotency tombstones. Set to `0` to disable age-based cleanup. |
 | `analytics.enabled` | `true` | Collect query counts, per-key usage, and failed SQL. |
 | `analytics.directory` | `./data/analytics` | Directory containing `analytics.sqlite`. |
+| `analytics.retentionDays` | `30` | Maximum age of failed-query records. Usage counters remain cumulative. |
+| `analytics.maxStorageBytes` | `67108864` | SQLite page quota in bytes. Oldest failure records are deleted in batches as live storage approaches the quota. Minimum 1 MiB. |
+| `analytics.storeFullSql` | `false` | Store complete failed SQL when enabled. The default replaces string, dollar-quoted, and numeric literals before persistence. |
 
 When Redis rate limiting is enabled, the Redis user needs permission to run `EVAL`, `INCR`, `TTL`, and `EXPIRE` on the rate-limit keys.
 

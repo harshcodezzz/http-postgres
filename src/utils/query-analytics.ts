@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { Worker } from "node:worker_threads";
 import type { FastifyBaseLogger } from "fastify";
@@ -5,54 +6,79 @@ import { executionErrorCodes, type ExecutionOutcome } from "../routes/execution-
 
 const maxBufferedFailures = 256;
 const maxSqlLength = 8_192;
-
 interface Usage { totalQueries: number; failedQueries: number; lastUsedAt: string }
-interface FailedQuery {
-  keyId: string; database: string; query: string; truncated: boolean; status: number;
-  code?: string; pgCode?: string; occurredAt: string;
-}
+interface FailedQuery { keyId: string; database: string; query: string; truncated: boolean; status: number; code?: string; pgCode?: string; occurredAt: string }
 interface Batch { usage: Array<[string, Usage]>; failures: FailedQuery[] }
+interface AnalyticsOptions { retentionDays: number; maxStorageBytes: number; storeFullSql: boolean }
 interface PendingRequest { resolve: (value: any) => void; reject: (error: Error) => void }
 
-export function createQueryAnalytics(directory: string, log: FastifyBaseLogger) {
+function redactSqlLiterals(sql: string) {
+  return sql.replace(/(?:[eE])?'(?:''|\\.|[^'])*'|\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$[\s\S]*?\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$|\b(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\b/g, "?");
+}
+
+export function createQueryAnalytics(directory: string, log: FastifyBaseLogger, options: AnalyticsOptions) {
   const usage = new Map<string, Usage>();
   const failures: FailedQuery[] = [];
-  const worker = new Worker(new URL("./query-analytics-worker.js", import.meta.url), {
-    workerData: { directory: resolve(directory) },
-    execArgv: process.execArgv.filter((argument) => !argument.startsWith("--input-type")),
-  });
-  const requests = new Map<number, PendingRequest>();
-  let requestId = 0;
+  const requests = new Map<string, PendingRequest>();
+  let worker: Worker | undefined;
+  let workerOnline = false;
+  let inFlight: { id: string; batch: Batch; promise: Promise<void> } | undefined;
+  let resolveInFlight: (() => void) | undefined;
+  let restartTimer: NodeJS.Timeout | undefined;
+  let restartDelay = 100;
   let closed = false;
-  let workerExited = false;
   let bufferFull = false;
 
-  worker.on("message", (message: any) => {
-    if (message.type === "log") {
-      const details = { analyticsWorkerError: message.error };
-      if (message.level === "error") log.error(details, message.message);
-      else log.warn(details, message.message);
-      return;
-    }
-    const pending = requests.get(message.id);
-    if (!pending) return;
-    requests.delete(message.id);
-    if (message.error) pending.reject(new Error(message.error));
-    else pending.resolve(message.result);
-  });
-  worker.on("error", (error) => {
-    const failure = error instanceof Error ? error : new Error(String(error));
-    log.error({ err: failure }, "Query analytics worker failed");
-    for (const pending of requests.values()) pending.reject(failure);
-    requests.clear();
-  });
-  worker.on("exit", (code) => {
-    workerExited = true;
-    if (closed && code === 0) return;
-    const error = new Error(`Query analytics worker exited with code ${code}`);
-    for (const pending of requests.values()) pending.reject(error);
-    requests.clear();
-  });
+  function spawnWorker() {
+    if (closed || worker) return;
+    const instance = new Worker(new URL("./query-analytics-worker.js", import.meta.url), {
+      workerData: { directory: resolve(directory), ...options },
+      execArgv: process.execArgv.filter((argument) => !argument.startsWith("--input-type")),
+    });
+    worker = instance;
+    instance.on("online", () => {
+      workerOnline = true;
+      restartDelay = 100;
+      if (inFlight) instance.postMessage({ type: "flush", id: inFlight.id, batch: inFlight.batch });
+    });
+    instance.on("message", (message: any) => {
+      if (message.type === "log") {
+        const details = { analyticsWorkerError: message.error };
+        if (message.level === "error") log.error(details, message.message);
+        else log.warn(details, message.message);
+        return;
+      }
+      if (message.type === "ack" && inFlight?.id === message.id) {
+        inFlight = undefined;
+        resolveInFlight?.();
+        resolveInFlight = undefined;
+        flush();
+        return;
+      }
+      const pending = requests.get(message.id);
+      if (!pending) return;
+      requests.delete(message.id);
+      if (message.error) pending.reject(new Error(message.error));
+      else pending.resolve(message.result);
+    });
+    instance.on("error", (error) => log.error({ err: error }, "Query analytics worker failed"));
+    instance.on("exit", (code) => {
+      if (worker === instance) {
+        worker = undefined;
+        workerOnline = false;
+      }
+      const error = new Error(`Query analytics worker exited with code ${code}`);
+      for (const pending of requests.values()) pending.reject(error);
+      requests.clear();
+      if (!closed) {
+        log.warn({ code }, "Restarting query analytics worker");
+        restartTimer = setTimeout(spawnWorker, restartDelay);
+        restartTimer.unref();
+        restartDelay = Math.min(restartDelay * 2, 10_000);
+      }
+    });
+  }
+  spawnWorker();
 
   function takeBatch(): Batch {
     const batch = { usage: [...usage.entries()], failures: failures.splice(0) };
@@ -61,20 +87,36 @@ export function createQueryAnalytics(directory: string, log: FastifyBaseLogger) 
     return batch;
   }
 
-  function send(type: "report" | "close", extra: Record<string, unknown>) {
-    const id = ++requestId;
-    return new Promise<any>((resolve, reject) => {
-      if (workerExited) return reject(new Error("Query analytics worker is unavailable"));
-      requests.set(id, { resolve, reject });
-      worker.postMessage({ type, id, batch: takeBatch(), ...extra });
-    });
-  }
-
   function flush() {
-    if (closed || (!usage.size && !failures.length)) return;
-    worker.postMessage({ type: "flush", batch: takeBatch() });
+    if (closed || inFlight || (!usage.size && !failures.length)) return;
+    const id = randomUUID();
+    let resolve!: () => void;
+    const promise = new Promise<void>((done) => { resolve = done; });
+    resolveInFlight = resolve;
+    inFlight = { id, batch: takeBatch(), promise };
+    if (workerOnline) worker?.postMessage({ type: "flush", id, batch: inFlight.batch });
   }
   const timer = setInterval(flush, 1_000).unref();
+
+  async function waitForFlush(timeoutMs: number) {
+    flush();
+    const pending = inFlight?.promise;
+    if (!pending) return;
+    await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Analytics flush timed out")), timeoutMs).unref()),
+    ]);
+  }
+
+  function send(type: "report" | "close", extra: Record<string, unknown>, batch?: Batch) {
+    const id = randomUUID();
+    return new Promise<any>((resolve, reject) => {
+      if (!worker) return reject(new Error("Query analytics worker is unavailable"));
+      if (requests.size >= 8) return reject(new Error("Query analytics worker request queue is full"));
+      requests.set(id, { resolve, reject });
+      worker.postMessage({ type, id, ...(batch && { batch }), ...extra });
+    });
+  }
 
   function record(keyId: string, database: string, sql: string, outcome?: ExecutionOutcome) {
     if (closed) return;
@@ -86,30 +128,30 @@ export function createQueryAnalytics(directory: string, log: FastifyBaseLogger) 
     if (occurredAt > counts.lastUsedAt) counts.lastUsedAt = occurredAt;
     usage.set(keyId, counts);
     if (!failed) return;
-    if (failures.length >= maxBufferedFailures) flush();
     if (failures.length >= maxBufferedFailures) {
       if (!bufferFull) log.warn("Query analytics failure buffer is full");
       bufferFull = true;
       return;
     }
-    failures.push({
-      keyId, database, query: sql.slice(0, maxSqlLength), truncated: sql.length > maxSqlLength,
-      status: outcome.status, ...executionErrorCodes(outcome), occurredAt,
-    });
+    const storedSql = options.storeFullSql ? sql : redactSqlLiterals(sql);
+    failures.push({ keyId, database, query: storedSql.slice(0, maxSqlLength), truncated: storedSql.length > maxSqlLength,
+      status: outcome.status, ...executionErrorCodes(outcome), occurredAt });
   }
 
   async function report(limit: number) {
     if (closed) throw new Error("Query analytics is closed");
+    await waitForFlush(1_000);
     return send("report", { limit });
   }
 
   async function close() {
     if (closed) return;
-    clearInterval(timer);
-    const result = await send("close", { deadlineMs: 5_000 });
     closed = true;
+    clearInterval(timer);
+    clearTimeout(restartTimer);
+    const result = await send("close", { deadlineMs: 5_000 }, takeBatch());
     if (result.spooled) log.warn("Buffered query analytics were spooled during shutdown");
-    await worker.terminate();
+    await worker?.terminate();
   }
 
   return { record, report, close };

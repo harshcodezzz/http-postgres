@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { isIP } from "node:net";
 import { resolve } from "node:path";
 import { config as loadEnv } from "dotenv";
 import YAML from "yaml";
@@ -6,6 +7,18 @@ import { z } from "zod";
 import { databaseName } from "./query-privileges.js";
 
 loadEnv({ quiet: true });
+
+const ipWhitelistEntry = z.string().refine((entry) => {
+  const separator = entry.lastIndexOf("/");
+  const address = separator < 0 ? entry : entry.slice(0, separator);
+  const version = isIP(address);
+  if (!version) return false;
+  if (separator < 0) return true;
+  const prefix = entry.slice(separator + 1);
+  if (!/^\d+$/.test(prefix)) return false;
+  const bits = Number(prefix);
+  return bits >= 0 && bits <= (version === 4 ? 32 : 128);
+}, "Use an IPv4 or IPv6 address, optionally followed by a valid CIDR prefix");
 
 const configSchema = z
   .object({
@@ -43,7 +56,7 @@ const configSchema = z
         enabled: z.boolean().default(true),
         requestPerMinute: z.number().int().positive().default(1000),
         requestPerMinutePerIp: z.number().int().positive().default(1000),
-        whitelistedIPs: z.array(z.string()).default([]),
+        whitelistedIPs: z.array(ipWhitelistEntry).default([]),
       })
       .prefault({}),
 
@@ -55,6 +68,9 @@ const configSchema = z
       .object({
         enabled: z.boolean().default(true),
         directory: z.string().default("./data/analytics"),
+        retentionDays: z.number().int().min(1).max(3650).default(30),
+        maxStorageBytes: z.number().int().min(1_048_576).default(67_108_864),
+        storeFullSql: z.boolean().default(false),
       })
       .prefault({}),
   })

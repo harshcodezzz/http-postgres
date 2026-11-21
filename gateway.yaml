@@ -22,10 +22,11 @@ ratelimit:
   enabled: false
   requestPerMinute: 1000
   requestPerMinutePerIp: 1000
-  whitelistedIPs:
-    - "[IP_ADDRESS]"
-    - "[IP_ADDRESS]"
+  whitelistedIPs: []
 
 analytics:
   enabled: true
   directory: "./data/analytics"
+  retentionDays: 30
+  maxStorageBytes: 67108864
+  storeFullSql: false

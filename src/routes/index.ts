@@ -9,7 +9,9 @@ import { createQueryPools } from "../utils/query-pool.js";
 
 export async function registerRoutes(app: FastifyInstance) {
   const executionStore = createExecutionStore(app.db);
-  const analytics = config.analytics.enabled ? createQueryAnalytics(config.analytics.directory, app.log) : undefined;
+  const analytics = config.analytics.enabled
+    ? createQueryAnalytics(config.analytics.directory, app.log, config.analytics)
+    : undefined;
   if (analytics) app.addHook("onClose", () => analytics.close());
   const queryPools = createQueryPools(app.db, app.databaseAdminRoles, app.log);
   app.decorate("queryPools", queryPools);

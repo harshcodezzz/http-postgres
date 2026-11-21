@@ -107,15 +107,19 @@ export const losslessTypes: CustomTypesConfig = {
 
 export type ResultStatement = QueryConfig & { rowMode?: "array"; queryMode?: "extended"; query_timeout?: number };
 
+const maxResultBytes = 8 * 1024 * 1024;
+const maxBackendMessageBytes = 8 * 1024 * 1024;
+const maxConcurrentResultBytes = 64 * 1024 * 1024;
+let reservedResultBytes = 0;
+
 export function createResultBudget(execution: ReturnType<typeof watchExecution>) {
-  const maxBytes = 8 * 1024 * 1024;
   const maxRows = 50_000;
   let bytes = 0;
   let rows = 0;
   function charge(value: unknown) {
     execution.check();
     bytes += Buffer.byteLength(JSON.stringify(value)) + 64;
-    if (bytes > maxBytes || rows > maxRows) {
+    if (bytes > maxResultBytes || rows > maxRows) {
       const error = new ExecutionStopped(413, "RESULT_LIMIT_EXCEEDED", "The query result exceeds its size limit");
       execution.stop(error);
       throw error;
@@ -123,11 +127,25 @@ export function createResultBudget(execution: ReturnType<typeof watchExecution>)
   }
   return {
     async query(client: PoolClient, statement: ResultStatement): Promise<QueryResult | QueryResult[]> {
+      if (reservedResultBytes + maxResultBytes > maxConcurrentResultBytes) {
+        throw new ExecutionStopped(503, "RESULT_MEMORY_BUSY", "Result memory capacity is temporarily exhausted");
+      }
+      reservedResultBytes += maxResultBytes;
       const rejectCopy = () => execution.stop(new ExecutionStopped(
         400, "COPY_STREAM_UNSUPPORTED", "COPY FROM STDIN and COPY TO STDOUT are unsupported",
       ));
+      const rejectLargeMessage = (message: { name?: string; length?: number; fields?: unknown[] }) => {
+        if (message.name !== "dataRow" || typeof message.length !== "number" || message.length <= maxBackendMessageBytes) return;
+        // pg emits this hook before it applies type parsers. Discard the raw
+        // fields so an oversized value cannot expand further during decoding.
+        if (message.fields) message.fields.length = 0;
+        execution.stop(new ExecutionStopped(
+          413, "RESULT_MESSAGE_LIMIT_EXCEEDED", "A PostgreSQL result message exceeds the size limit",
+        ));
+      };
       client.connection.on("copyInResponse", rejectCopy);
       client.connection.on("copyOutResponse", rejectCopy);
+      client.connection.on("message", rejectLargeMessage);
       try {
         return await new Promise((resolve, reject) => {
           const query = new Query(statement, (error, result) => {
@@ -149,8 +167,10 @@ export function createResultBudget(execution: ReturnType<typeof watchExecution>)
           client.query(query);
         });
       } finally {
+        reservedResultBytes -= maxResultBytes;
         client.connection.removeListener("copyInResponse", rejectCopy);
         client.connection.removeListener("copyOutResponse", rejectCopy);
+        client.connection.removeListener("message", rejectLargeMessage);
       }
     },
   };
