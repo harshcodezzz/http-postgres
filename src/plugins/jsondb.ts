@@ -38,12 +38,24 @@ export interface ApiKeyRecord {
   lastUsedAt?: string;
 }
 
+export interface PendingRoleCleanup {
+  id: string;
+  keyId: string;
+  database: string;
+  roleToken: string;
+  createdAt: string;
+  attempts: number;
+  lastAttemptAt?: string;
+  lastError?: string;
+}
+
 export interface DataStore {
   admin?: {
     hash: string;
   };
   apiKeys?: Record<string, ApiKeyRecord>;
   queryRoleSecret?: string;
+  pendingRoleCleanups?: Record<string, PendingRoleCleanup>;
   [key: string]: unknown;
 }
 

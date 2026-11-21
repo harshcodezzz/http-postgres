@@ -161,7 +161,10 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
         const byPid = new Map(rows.map((row) => [row.pid, row]));
         for (const session of sessions) {
           if (session.serverStartedAt !== observedServer) {
-            if (Number(observedServer) > Number(session.serverStartedAt)) {
+            const sameServer = observedIdentity !== null &&
+              session.observerIdentity !== null &&
+              observedIdentity === session.observerIdentity;
+            if (sameServer && Number(observedServer) > Number(session.serverStartedAt)) {
               if (closingBackends.delete(session)) {
                 queryConnections--;
                 wakePools();

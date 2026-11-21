@@ -273,15 +273,14 @@ export async function deprovisionQueryAccess(
   const role = quoteIdentifier(login);
   try {
     await withPostgresDatabase(database, async (client) => {
-      await client.query("SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE usename = $1", [login]).catch(() => {});
-      await client.query(`DROP OWNED BY ${role}`).catch(() => {});
-      await client.query(`DROP ROLE IF EXISTS ${role}`).catch(() => {});
+      await client.query("SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE usename = $1", [login]);
+      await client.query(`DROP OWNED BY ${role}`);
+      await client.query(`DROP ROLE IF EXISTS ${role}`);
     });
-  } catch {
-    if (adminPool) {
-      await adminPool.query("SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE usename = $1", [login]).catch(() => {});
-      await adminPool.query(`DROP ROLE IF EXISTS ${role}`).catch(() => {});
-    }
+  } catch (error) {
+    if (!adminPool) throw error;
+    await adminPool.query("SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE usename = $1", [login]);
+    await adminPool.query(`DROP ROLE IF EXISTS ${role}`);
   }
 }
 

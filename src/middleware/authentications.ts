@@ -9,6 +9,38 @@ import type { DataStore, JsonDB } from "../plugins/jsondb.js";
 
 export { hashPassword, verifyPassword };
 
+const maxConcurrentAdminVerifications = 2;
+const maxQueuedAdminVerifications = 8;
+let activeAdminVerifications = 0;
+const adminVerificationWaiters: Array<(release: () => void) => void> = [];
+
+function releaseAdminVerification() {
+  const next = adminVerificationWaiters.shift();
+  if (next) {
+    next(releaseAdminVerification);
+  } else {
+    activeAdminVerifications--;
+  }
+}
+
+function acquireAdminVerification(): Promise<(() => void) | undefined> {
+  if (activeAdminVerifications < maxConcurrentAdminVerifications) {
+    activeAdminVerifications++;
+    return Promise.resolve(releaseAdminVerification);
+  }
+  if (adminVerificationWaiters.length >= maxQueuedAdminVerifications) {
+    return Promise.resolve(undefined);
+  }
+  return new Promise((resolve) => adminVerificationWaiters.push(resolve));
+}
+
+export class AdminVerificationBusyError extends Error {
+  constructor() {
+    super("Admin password verification capacity is exhausted");
+    this.name = "AdminVerificationBusyError";
+  }
+}
+
 export async function verifyAdminPassword(
   adminPassword: string,
   jsondb: JsonDB,
@@ -16,7 +48,13 @@ export async function verifyAdminPassword(
   const data = await jsondb.read<DataStore>();
   const storedHash = data.admin?.hash;
   if (!storedHash) return false;
-  return verifyPassword(adminPassword, storedHash);
+  const release = await acquireAdminVerification();
+  if (!release) throw new AdminVerificationBusyError();
+  try {
+    return await verifyPassword(adminPassword, storedHash);
+  } finally {
+    release();
+  }
 }
 
 const authPlugin: FastifyPluginAsync = async (fastify) => {
@@ -35,7 +73,20 @@ const authPlugin: FastifyPluginAsync = async (fastify) => {
 
     if (isAdminRoute) {
       if (typeof admin === "string") {
-        const matches = await verifyAdminPassword(admin, fastify.jsondb);
+        let matches: boolean;
+        try {
+          matches = await verifyAdminPassword(admin, fastify.jsondb);
+        } catch (error) {
+          if (!(error instanceof AdminVerificationBusyError)) throw error;
+          reply.header("Retry-After", "1");
+          return reply.code(503).send({
+            success: false,
+            error: {
+              code: "ADMIN_AUTH_BUSY",
+              message: "Admin authentication is temporarily busy",
+            },
+          });
+        }
 
         if (matches) {
           request.admin = true;

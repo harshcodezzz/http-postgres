@@ -3,7 +3,9 @@ import {
   createApiKey,
   deleteApiKey,
   getApiKeyById,
+  getRoleCleanupStatus,
   listApiKeys,
+  retryPendingRoleCleanups,
   updateApiKeyScope,
   ApiKeyError,
   type ApiKeyEnvironment,
@@ -29,13 +31,27 @@ function scopeErrorStatus(error: ApiKeyError | DatabaseError): number {
 
 const adminApiRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get("/keys", async () => {
-    const keys = await listApiKeys(fastify.jsondb);
+    const [keys, roleCleanup] = await Promise.all([
+      listApiKeys(fastify.jsondb),
+      getRoleCleanupStatus(fastify.jsondb),
+    ]);
     return {
       success: true,
       count: keys.length,
       keys,
+      roleCleanup,
     };
   });
+
+  fastify.get("/keys/cleanup", async () => ({
+    success: true,
+    roleCleanup: await getRoleCleanupStatus(fastify.jsondb),
+  }));
+
+  fastify.post("/keys/cleanup/retry", async () => ({
+    success: true,
+    roleCleanup: await retryPendingRoleCleanups(fastify.jsondb, fastify.db),
+  }));
 
   fastify.get<{ Params: { id: string } }>("/keys/:id", async (request, reply) => {
     const key = await getApiKeyById(request.params.id, fastify.jsondb);
@@ -158,6 +174,7 @@ const adminApiRoutes: FastifyPluginAsync = async (fastify) => {
     return {
       success: true,
       message: isHard ? "API key permanently deleted" : "API key revoked",
+      roleCleanup: await getRoleCleanupStatus(fastify.jsondb),
     };
   });
 };

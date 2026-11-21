@@ -1,12 +1,13 @@
 import config from "./config/index.js";
 import bootstrap from "./utils/bootstrap.js";
 import { buildApp } from "./app.js";
-import { closeApiKeyPool } from "./utils/api-key.js";
+import { closeApiKeyPool, startRoleCleanupWorker } from "./utils/api-key.js";
 
 async function start() {
   const app = await buildApp();
 
   await bootstrap(app.jsondb);
+  const stopRoleCleanup = startRoleCleanupWorker(app.jsondb, app.db, app.log);
 
   let isShuttingDown = false;
 
@@ -20,6 +21,7 @@ async function start() {
     app.log.info(`Received ${signal}, starting graceful shutdown...`);
 
     try {
+      await stopRoleCleanup();
       await app.close();
       await closeApiKeyPool();
       console.log("Server closed gracefully");
