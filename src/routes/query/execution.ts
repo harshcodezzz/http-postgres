@@ -14,6 +14,7 @@ export function watchExecution(
   let client: PoolClient | undefined;
   let stopped: ExecutionStopped | undefined;
   let released = false;
+  const closeCleanups: Array<() => void> = [];
   const abort = new AbortController();
   let notifyStop!: (error: ExecutionStopped) => void;
   const interruption = new Promise<ExecutionStopped>((resolve) => { notifyStop = resolve; });
@@ -48,6 +49,26 @@ export function watchExecution(
   function wait<T>(operation: Promise<T>): Promise<T> {
     return Promise.race([operation, interruption.then((error) => { throw error; })]);
   }
+  function deferResponseCleanup(cleanup: () => void) {
+    if (!reply) {
+      closeCleanups.push(cleanup);
+      return;
+    }
+    if (reply.raw.writableFinished || reply.raw.destroyed) {
+      cleanup();
+      return;
+    }
+    let completed = false;
+    const finish = () => {
+      if (completed) return;
+      completed = true;
+      reply.raw.removeListener("finish", finish);
+      reply.raw.removeListener("close", finish);
+      cleanup();
+    };
+    reply.raw.once("finish", finish);
+    reply.raw.once("close", finish);
+  }
   return {
     signal: abort.signal,
     stop,
@@ -58,6 +79,7 @@ export function watchExecution(
       if (client) pools.queryDispatched(client);
       return wait(operation());
     },
+    deferResponseCleanup,
     get stopped() { return stopped; },
     attach(connection: PoolClient) {
       client = connection;
@@ -67,6 +89,7 @@ export function watchExecution(
     close() {
       clearTimeout(timer);
       reply?.raw.removeListener("close", disconnected);
+      for (const cleanup of closeCleanups.splice(0)) cleanup();
       release();
     },
   };
@@ -116,6 +139,7 @@ export function createResultBudget(execution: ReturnType<typeof watchExecution>)
   const maxRows = 50_000;
   let bytes = 0;
   let rows = 0;
+  let reserved = false;
   function charge(value: unknown) {
     execution.check();
     bytes += Buffer.byteLength(JSON.stringify(value)) + 64;
@@ -127,10 +151,18 @@ export function createResultBudget(execution: ReturnType<typeof watchExecution>)
   }
   return {
     async query(client: PoolClient, statement: ResultStatement): Promise<QueryResult | QueryResult[]> {
-      if (reservedResultBytes + maxResultBytes > maxConcurrentResultBytes) {
-        throw new ExecutionStopped(503, "RESULT_MEMORY_BUSY", "Result memory capacity is temporarily exhausted");
+      if (!reserved) {
+        if (reservedResultBytes + maxResultBytes > maxConcurrentResultBytes) {
+          throw new ExecutionStopped(503, "RESULT_MEMORY_BUSY", "Result memory capacity is temporarily exhausted");
+        }
+        reserved = true;
+        reservedResultBytes += maxResultBytes;
+        execution.deferResponseCleanup(() => {
+          if (!reserved) return;
+          reserved = false;
+          reservedResultBytes -= maxResultBytes;
+        });
       }
-      reservedResultBytes += maxResultBytes;
       const rejectCopy = () => execution.stop(new ExecutionStopped(
         400, "COPY_STREAM_UNSUPPORTED", "COPY FROM STDIN and COPY TO STDOUT are unsupported",
       ));
@@ -167,7 +199,6 @@ export function createResultBudget(execution: ReturnType<typeof watchExecution>)
           client.query(query);
         });
       } finally {
-        reservedResultBytes -= maxResultBytes;
         client.connection.removeListener("copyInResponse", rejectCopy);
         client.connection.removeListener("copyOutResponse", rejectCopy);
         client.connection.removeListener("message", rejectLargeMessage);

@@ -13,7 +13,72 @@ interface AnalyticsOptions { retentionDays: number; maxStorageBytes: number; sto
 interface PendingRequest { resolve: (value: any) => void; reject: (error: Error) => void }
 
 function redactSqlLiterals(sql: string) {
-  return sql.replace(/(?:[eE])?'(?:''|\\.|[^'])*'|\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$[\s\S]*?\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$|\b(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\b/g, "?");
+  let output = "";
+  let index = 0;
+  const identifier = (value: string | undefined) => value !== undefined && /[A-Za-z0-9_$\u0080-\uffff]/.test(value);
+  while (index < sql.length) {
+    if (sql.startsWith("--", index)) {
+      const end = sql.slice(index + 2).search(/[\r\n]/);
+      index = end < 0 ? sql.length : index + 2 + end;
+      output += " ";
+      continue;
+    }
+    if (sql.startsWith("/*", index)) {
+      let depth = 1;
+      index += 2;
+      while (index < sql.length && depth) {
+        if (sql.startsWith("/*", index)) { depth++; index += 2; }
+        else if (sql.startsWith("*/", index)) { depth--; index += 2; }
+        else index++;
+      }
+      output += " ";
+      continue;
+    }
+    if (sql[index] === "'") {
+      index++;
+      while (index < sql.length) {
+        if (sql[index] === "\\") { index += 2; continue; }
+        if (sql[index] === "'") {
+          if (sql[index + 1] === "'") { index += 2; continue; }
+          index++;
+          break;
+        }
+        index++;
+      }
+      output += "?";
+      continue;
+    }
+    if (sql[index] === "$") {
+      const tag = /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(index))?.[0];
+      if (tag) {
+        const end = sql.indexOf(tag, index + tag.length);
+        index = end < 0 ? sql.length : end + tag.length;
+        output += "?";
+        continue;
+      }
+    }
+    const number = /^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/.exec(sql.slice(index))?.[0];
+    if (number && !identifier(sql[index - 1]) && !identifier(sql[index + number.length])) {
+      output += "?";
+      index += number.length;
+      continue;
+    }
+    if (sql[index] === '"') {
+      const start = index++;
+      while (index < sql.length) {
+        if (sql[index] === '"') {
+          index++;
+          if (sql[index] === '"') { index++; continue; }
+          break;
+        }
+        index++;
+      }
+      output += sql.slice(start, index);
+      continue;
+    }
+    output += sql[index++];
+  }
+  return output.trim();
 }
 
 export function createQueryAnalytics(directory: string, log: FastifyBaseLogger, options: AnalyticsOptions) {

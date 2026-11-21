@@ -41,8 +41,8 @@ The table lists loader defaults. Explicit values in [gateway.yaml](../gateway.ya
 | `analytics.enabled` | `true` | Collect query counts, per-key usage, and failed SQL. |
 | `analytics.directory` | `./data/analytics` | Directory containing `analytics.sqlite`. |
 | `analytics.retentionDays` | `30` | Maximum age of failed-query records. Usage counters remain cumulative. |
-| `analytics.maxStorageBytes` | `67108864` | SQLite page quota in bytes. Oldest failure records are deleted in batches as live storage approaches the quota. Minimum 1 MiB. |
-| `analytics.storeFullSql` | `false` | Store complete failed SQL when enabled. The default replaces string, dollar-quoted, and numeric literals before persistence. |
+| `analytics.maxStorageBytes` | `67108864` | Analytics storage quota in bytes. Database, WAL, shared-memory, and spool sizes are considered when pruning, and SQLite database pages are capped below the total allowance. Minimum 1 MiB. |
+| `analytics.storeFullSql` | `false` | Store complete failed SQL when enabled. By default, a PostgreSQL-aware best-effort sanitizer removes comments and replaces string, dollar-quoted, and numeric literals. Do not treat analytics redaction as a substitute for parameterized SQL or access controls. |
 
 When Redis rate limiting is enabled, the Redis user needs permission to run `EVAL`, `INCR`, `TTL`, and `EXPIRE` on the rate-limit keys.
 

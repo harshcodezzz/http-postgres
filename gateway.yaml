@@ -19,7 +19,7 @@ redis:
   url: "${REDIS_URL:-redis://127.0.0.1:6379}"
 
 ratelimit:
-  enabled: false
+  enabled: true
   requestPerMinute: 1000
   requestPerMinutePerIp: 1000
   whitelistedIPs: []
