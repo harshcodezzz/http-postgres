@@ -88,7 +88,7 @@ const adminRoutes: FastifyPluginAsync<{ analytics?: QueryAnalytics }> = async (f
     if (!analytics) return { success: true, enabled: false };
     const limit = Math.min(Math.max(parseInt(request.query?.limit ?? "", 10) || 50, 1), 200);
     try {
-      return { success: true, enabled: true, ...analytics.report(limit) };
+      return { success: true, enabled: true, ...await analytics.report(limit) };
     } catch (error) {
       request.log.error({ err: error }, "Could not read query analytics");
       return reply.code(503).send({

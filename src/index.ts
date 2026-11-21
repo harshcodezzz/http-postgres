@@ -21,7 +21,18 @@ async function start() {
     app.log.info(`Received ${signal}, starting graceful shutdown...`);
 
     try {
-      await stopRoleCleanup();
+      // Stop accepting new work before draining background cleanup. Keep the
+      // PostgreSQL pool alive until the cleanup finishes or the grace period ends.
+      app.server.close();
+      let cleanupTimedOut = false;
+      await Promise.race([
+        stopRoleCleanup(),
+        new Promise<void>((resolve) => setTimeout(() => {
+          cleanupTimedOut = true;
+          resolve();
+        }, 5_000).unref()),
+      ]);
+      if (cleanupTimedOut) app.log.warn("Role cleanup exceeded the shutdown grace period");
       await app.close();
       await closeApiKeyPool();
       console.log("Server closed gracefully");

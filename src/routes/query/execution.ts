@@ -90,6 +90,14 @@ export const losslessTypes: CustomTypesConfig = {
     if (format !== "binary" && exactTextTypes.has(oid)) return (value: string) => value;
     // Parse numeric[] as text[] to preserve the shape and exact decimal strings.
     if (format !== "binary" && (oid as number) === 1231) return types.getTypeParser(1009 as typeof oid, format);
+    if (format !== "binary" && ((oid as number) === 1021 || (oid as number) === 1022)) {
+      const parseTextArray = types.getTypeParser(1009 as typeof oid, format) as (value: string) => Array<string | null>;
+      return (value: string) => parseTextArray(value).map((item) => {
+        if (item === null) return null;
+        const number = Number(item);
+        return Number.isFinite(number) ? number : item;
+      });
+    }
     if (format !== "binary" && (oid === 700 || oid === 701)) {
       return (value: string) => Number.isFinite(Number(value)) ? Number(value) : value;
     }
