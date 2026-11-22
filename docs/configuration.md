@@ -12,7 +12,59 @@ YAML string values can reference an environment variable as `${NAME}` or supply 
 | --- | --- |
 | `DATABASE_URL` | PostgreSQL connection string referenced by the supplied YAML. The local fallback is `postgresql://postgres:postgres@127.0.0.1:5432/postgres`. |
 | `REDIS_URL` | Redis connection string referenced by the supplied YAML. The local fallback is `redis://127.0.0.1:6379`. |
-| `LOG_LEVEL` | Pino level for gateway logging. Defaults to `info`. The stdout and file transport targets are configured at `info`. |
+| `LOG_LEVEL` | Minimum Pino level produced by the gateway. Defaults to `info`. Stdout receives messages at this level and above; rotating failure files accept only `error` and `fatal` messages. |
+
+## Complete configuration file
+
+The shipped [gateway.yaml](../gateway.yaml) declares every supported option. The example below uses the values supplied by the repository; some pool values are intentionally higher than the loader defaults listed in the reference table.
+
+```yaml
+version: 1
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+database:
+  url: "${DATABASE_URL:-postgresql://postgres:postgres@127.0.0.1:5432/postgres}"
+  exposeErrorDetails: false
+  queryUrls: {}
+  pool:
+    min: 2
+    queryMin: 2
+    max: 50
+    maxGlobalQueries: 100
+
+redis:
+  enabled: true
+  mode: external
+  url: "${REDIS_URL:-redis://127.0.0.1:6379}"
+
+ratelimit:
+  enabled: true
+  requestPerMinute: 1000
+  requestPerMinutePerIp: 1000
+  whitelistedIPs: []
+
+transactions:
+  retentionDays: 30
+
+analytics:
+  enabled: true
+  directory: "./data/analytics"
+  retentionDays: 30
+  maxStorageBytes: 67108864
+  storeFullSql: false
+```
+
+To configure default query logins, replace the empty map with database-name-to-URL entries. Each URL must include the target database:
+
+```yaml
+database:
+  queryUrls:
+    reporting: "${REPORTING_QUERY_URL}"
+    warehouse: "${WAREHOUSE_QUERY_URL}"
+```
 
 ## YAML settings
 
@@ -20,12 +72,12 @@ The table lists loader defaults. Explicit values in [gateway.yaml](../gateway.ya
 
 | Setting | Default | Behavior |
 | --- | --- | --- |
-| `version` | Required | Positive integer. The supplied file uses `1`. |
+| `version` | Required | Positive integer identifying the configuration format. The supplied file uses `1`. |
 | `server.host` | `0.0.0.0` | Listen address. Use `127.0.0.1` for loopback-only access. |
 | `server.port` | `8080` | Listen port from 1 to 65535. |
 | `database.url` | Required | Administrative PostgreSQL connection string. The gateway checks it at startup. |
 | `database.exposeErrorDetails` | `false` | Exposes PostgreSQL detail and hint text to authenticated query callers when enabled. |
-| `database.queryUrls` | `{}` | Maps database names to the default query login URLs used by keys that list database names only. |
+| `database.queryUrls` | `{}` | Map of database names to default query-login URLs used by name-only keys. Keys must match `^[a-zA-Z_][a-zA-Z0-9_-]{0,62}$`; every value must be a non-empty connection string. |
 | `database.pool.min` | `2` | Minimum size of the administrative pool, zero or greater. |
 | `database.pool.queryMin` | `1` | Number of connections the gateway prewarms and replenishes per configured default query login. Set to `0` to open them on demand. The minimum cannot exceed the per-pool maximum and prewarming shares the global budget. |
 | `database.pool.max` | `20` | Maximum size of the administrative pool and of each query pool. A database has a separate pool for its default login and each scoped login. The minimum cannot exceed the maximum. |
@@ -37,12 +89,26 @@ The table lists loader defaults. Explicit values in [gateway.yaml](../gateway.ya
 | `ratelimit.requestPerMinute` | `1000` | Requests per authenticated API key in a 60-second window. |
 | `ratelimit.requestPerMinutePerIp` | `1000` | Requests per IP in a 60-second window. Applies before authentication. |
 | `ratelimit.whitelistedIPs` | `[]` | IPv4 or IPv6 addresses and CIDR ranges exempt from the per-IP limit, such as `192.0.2.10`, `10.0.0.0/8`, `2001:db8::1`, or `2001:db8::/32`. |
-| `transactions.retentionDays` | `30` | Days to keep uncollected async query outcomes, finalized transaction records, and idempotency tombstones. Set to `0` to disable age-based cleanup. |
+| `transactions.retentionDays` | `30` | Days to keep uncollected async query outcomes, finalized transaction records, and idempotency tombstones. Accepts integers from `0` through `365000`; `0` disables age-based cleanup. |
 | `analytics.enabled` | `true` | Collect query counts, per-key usage, and failed SQL. |
 | `analytics.directory` | `./data/analytics` | Directory containing `analytics.sqlite`. |
-| `analytics.retentionDays` | `30` | Maximum age of failed-query records. Usage counters remain cumulative. |
+| `analytics.retentionDays` | `30` | Maximum age of failed-query records, from `1` through `3650` days. Usage counters remain cumulative. |
 | `analytics.maxStorageBytes` | `67108864` | Analytics storage quota in bytes. Database, WAL, shared-memory, and spool sizes are considered when pruning, and SQLite database pages are capped below the total allowance. Minimum 1 MiB. |
 | `analytics.storeFullSql` | `false` | Store complete failed SQL when enabled. By default, a PostgreSQL-aware best-effort sanitizer removes comments and replaces string, dollar-quoted, and numeric literals. Do not treat analytics redaction as a substitute for parameterized SQL or access controls. |
+
+### Validation rules
+
+The gateway validates the complete file before opening network connections:
+
+- `server.port` must be an integer from `1` through `65535`.
+- `database.pool.min` and `database.pool.queryMin` must be zero or greater and cannot exceed `database.pool.max`.
+- `database.pool.max` and `database.pool.maxGlobalQueries` must be positive integers.
+- `redis.mode` accepts only `external` or `managed`; `redis.url` is required whenever Redis is enabled.
+- Both rate-limit counts must be positive integers. Whitelist entries must be valid IPv4 or IPv6 addresses with an optional valid CIDR prefix.
+- `analytics.maxStorageBytes` must be at least `1048576` bytes (1 MiB).
+- Unknown object keys are currently ignored by the schema. Do not rely on that behavior: misspelled settings will not configure the gateway.
+
+All paths are resolved by the component that consumes them. Start the process from the intended project or deployment root so `gateway.yaml`, `data/`, `logs/`, and relative analytics paths resolve consistently.
 
 When Redis rate limiting is enabled, the Redis user needs permission to run `EVAL`, `INCR`, `TTL`, and `EXPIRE` on the rate-limit keys.
 
@@ -83,6 +149,117 @@ Poll authenticated `GET /admin/health` on each gateway process. Its `services.qu
 
 Restore the administrative connection and its ability to inspect sessions on the PostgreSQL server that owns the interrupted backends. For `server_mismatch`, check that the admin and query URLs or proxies still target the same server. The gateway retries verification and releases slots as it confirms that sessions exited or reset. If the gateway must move to a replacement server, drain traffic and confirm that its old PostgreSQL sessions have ended or that the old server is offline before restarting the gateway against the replacement.
 
+## How analytics works
+
+Analytics is optional, local observability for query usage and failures. When `analytics.enabled` is `true`, the gateway starts a worker thread that owns a SQLite database in `analytics.directory`. Query execution does not wait for a SQLite write on every request: the main thread updates an in-memory buffer, and the worker normally flushes it within one second.
+
+When analytics is disabled, the worker is not started, analytics files are not opened, and `GET /admin/analytics` returns `{"success":true,"enabled":false}`.
+
+### What is counted
+
+Analytics maintains cumulative usage per API-key record ID:
+
+- `totalQueries` counts attempted query executions.
+- `failedQueries` counts attempts whose recorded HTTP outcome status is `400` or greater.
+- `lastUsedAt` is the latest recorded execution timestamp for that key ID.
+- Gateway-wide totals are calculated by summing the per-key counters when a report is requested.
+
+An immediate or asynchronous `/query` execution counts once. A transaction counts each statement that is attempted: successfully completed statements are counted individually, and the statement that fails is counted as a failure. Statements skipped after a transaction failure are not counted. Authentication, polling, result retrieval, deletion, health checks, admin operations, and idempotent replays do not increment query counters.
+
+The counters are associated with the immutable API-key record ID, not the raw key. Revoking or permanently deleting an API key does not remove its historical analytics row. Usage counters are cumulative and are not removed by `analytics.retentionDays`; there is currently no analytics-reset endpoint.
+
+### What is stored for failures
+
+Successful SQL text is never stored. For a failed attempt, the gateway can store:
+
+- API-key record ID and database name;
+- HTTP status, gateway error code, and PostgreSQL SQLSTATE when available;
+- occurrence timestamp;
+- SQL text, limited to 8,192 characters, plus a `truncated` flag.
+
+Bound parameter values are never included in analytics. With the default `storeFullSql: false`, a PostgreSQL-aware best-effort sanitizer removes line and block comments and replaces string literals, dollar-quoted bodies, and standalone numeric literals with `?`. Quoted identifiers and the remaining SQL structure are preserved. With `storeFullSql: true`, the original SQL string is retained, but bound parameters are still omitted.
+
+Redaction is a risk-reduction measure, not a data-loss-prevention boundary. Identifiers, operators, function names, and literals the sanitizer does not recognize can remain visible. Use placeholders for sensitive values, restrict access to the analytics directory and admin API, and leave full-SQL storage disabled unless it is explicitly required.
+
+The in-memory failure-detail buffer holds at most 256 entries. When it is full, the gateway continues updating cumulative usage and failure counters but drops additional failure-detail rows until the buffer drains, and writes a warning to the logger.
+
+### Storage and flushing
+
+The worker stores data in `analytics.sqlite` using SQLite WAL mode. It creates the analytics directory with owner-only permissions and the database file with mode `0600` where the operating system honors POSIX modes.
+
+Normal flow:
+
+1. A route reports a completed attempt to the in-memory analytics buffer.
+2. At most one batch is in flight from the main thread at a time.
+3. The one-second flush sends the batch to the worker.
+4. The worker writes usage counters, failure rows, and a processed-batch marker in one SQLite transaction.
+5. The batch marker makes a retry idempotent if the worker restarts after committing but before acknowledging the batch.
+
+If the worker exits unexpectedly, the gateway restarts it with exponential backoff from 100 milliseconds up to 10 seconds and resubmits the unacknowledged batch. During graceful shutdown, the gateway gives the worker a bounded opportunity to flush. If SQLite remains unavailable, pending analytics can be written to `analytics-pending.json` in the same directory and loaded on the next startup. Analytics failures are logged but do not change the SQL execution result returned to the client.
+
+Calling `GET /admin/analytics` first asks the current buffer to flush, waiting up to one second, and then reads a consistent report from the worker. If the worker is unavailable, the route returns `503 ANALYTICS_UNAVAILABLE`.
+
+### Retention and storage quota
+
+`analytics.retentionDays` applies only to individual failed-query rows. Old failure details are deleted in bounded batches during periodic maintenance. Per-key and gateway-wide counters remain cumulative.
+
+`analytics.maxStorageBytes` accounts for:
+
+- `analytics.sqlite`;
+- its `-wal` and `-shm` files;
+- `analytics-pending.json` when present.
+
+Maintenance normally runs no more than once per minute and runs early when physical storage reaches 75% of the configured quota. It removes expired failures first, then the oldest remaining failure rows in bounded batches when space is still high. SQLite database pages are capped below the total quota so WAL, shared-memory, and spool files retain headroom. During emergency spooling, buffered failure details may be dropped to fit the quota; cumulative usage data is prioritized.
+
+The quota is a safety bound, not an exact steady-state file size. SQLite page reuse, WAL checkpoints, filesystem allocation, and concurrent processes can produce temporary differences between logical and physical usage.
+
+### Reading analytics
+
+Send the administrator password in `x-admin`:
+
+```sh
+curl --fail-with-body \
+  'http://localhost:8080/admin/analytics?limit=50' \
+  -H 'x-admin: <admin-password>'
+```
+
+`limit` controls only `recentFailures`; it defaults to `50`, has a minimum effective value of `1`, and is capped at `200`. The per-key `keys` array always contains all cumulative key rows, ordered by total query count and then key ID.
+
+```json
+{
+  "success": true,
+  "enabled": true,
+  "totalQueries": 128,
+  "failedQueries": 3,
+  "keys": [
+    {
+      "keyId": "a60b9666e0176392c5a2941b",
+      "totalQueries": 128,
+      "failedQueries": 3,
+      "lastUsedAt": "2026-11-22T09:56:35.427Z"
+    }
+  ],
+  "recentFailures": [
+    {
+      "keyId": "a60b9666e0176392c5a2941b",
+      "database": "reporting",
+      "query": "SELECT * FROM public.orders WHERE id = ?",
+      "truncated": false,
+      "status": 400,
+      "code": "QUERY_EXECUTION_ERROR",
+      "pgCode": "42P01",
+      "occurredAt": "2026-11-22T09:55:00.000Z"
+    }
+  ]
+}
+```
+
+Analytics does not currently report latency percentiles, rows processed, connection-pool utilization, client IPs, HTTP request counts, or per-database success totals. Use gateway logs, `/admin/health`, and external metrics for those signals.
+
+### Multiple gateway processes
+
+Processes on the same host may share an analytics directory only when the underlying local filesystem provides correct SQLite locking. A network filesystem is not automatically safe. Separate directories are the simpler isolation model, but each process then reports only its own counters and reports must be aggregated externally.
+
 ## Rebind existing API keys
 
 Use `GET /admin/keys` to find the record ID of an active key that returns `API_KEY_SCOPE_REBIND_REQUIRED`. Verify that every intended database name refers to the correct PostgreSQL database. Then send `PATCH /admin/keys/:id` with the admin password in `x-admin` and the key's complete database assignment in the JSON body.
@@ -99,8 +276,8 @@ The update refreshes the PostgreSQL identity bindings and preserves the key's re
 | `data/data.json` | Local JsonDB file with the admin password hash, API key records, and the credential seed for scoped PostgreSQL roles. Keep this file to retain credentials across restarts. |
 | `data/data.json.lock` | SQLite lock file used to serialize JsonDB writers. The operating system releases the lock on process exit. |
 | `data/analytics/analytics.sqlite` | Cumulative query counts by API key and failed SQL records. |
-| `logs/gateway.*.log` | Gateway logs, rotated daily or at the configured `20m` size threshold. |
-| `logs/current.log` | Symlink to the active gateway log. |
+| `logs/failed.*.log` | Error-level gateway failures, rotated daily or at the configured `20m` size threshold. Routine informational logs are written only to stdout. |
+| `logs/current.log` | Symlink to the active failure log. |
 | `logs/api-keys.log` | Active API key audit events. Rotates at 5 MiB. |
 | `logs/api-keys.log.1` | Previous audit log generation. |
 
@@ -108,4 +285,4 @@ Fastify's request completion logs print `responseTime` in milliseconds as a JSON
 
 The gateway stores batch SQL, progress, and outcomes in `http_postgres_gateway.transactions`. It stores async query outcomes in `http_postgres_gateway.async_queries`. Both tables live in the administrative database. The administrative role must own the storage schema and its tables. A DBA can provision the schema with `CREATE SCHEMA http_postgres_gateway AUTHORIZATION gateway_admin`. If the schema is missing, the gateway needs database-level `CREATE` to provision it. Keep the schema private to the administrative role. Query and transaction records can be read repeatedly. Clients can delete finalized records explicitly, and age-based cleanup prunes them after the configured retention period. For executions that exceed their deadline without a stored outcome, the retention period starts at that deadline. Removing a keyed transaction record starts a separate retention window for its idempotency tombstone. For receipts whose records were removed before tombstones included the removal timestamp, cleanup uses the original submission time. Inputs and outcomes use base64-encoded JSON strings in JSONB columns, with older JSONB objects still readable. Deferred transaction queues remain process-local. New batch inputs omit bound values. Older receipts can contain original inputs until they are deleted or pruned. Async results still contain any values returned by the SQL itself.
 
-Analytics buffers writes for up to one second under normal operation and flushes on graceful shutdown. Use a shared analytics directory on a local filesystem with SQLite locking support for gateway processes on the same host. Separate directories maintain separate counters.
+See [How analytics works](#how-analytics-works) for buffering, failure redaction, worker recovery, retention, quotas, and multi-process behavior.

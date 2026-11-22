@@ -6,6 +6,10 @@
 
 - Preserved pre-dispatch execution-limit errors in transaction commits, including `503 RESULT_MEMORY_BUSY`, instead of converting them to `400 QUERY_EXECUTION_ERROR`. Asynchronous transaction batches now classify these capacity failures as `failed` rather than `rejected`.
 
+### Changed
+
+- Persist only error-level gateway failures in rotating `logs/failed.*.log` files. Routine informational logs remain available on stdout, and API-key audit logs remain separate.
+
 ## 1.6.0 - 2026-11-22
 
 ### Added

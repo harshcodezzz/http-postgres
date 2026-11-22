@@ -46,7 +46,7 @@ The runtime artifact needs `dist/`, production dependencies, `package.json`, and
 | Admin hash, API-key records, scoped-role secret | `data/data.json` | Required; encrypt and back up consistently |
 | Async and batch execution records | PostgreSQL `http_postgres_gateway` schema | Include in normal PostgreSQL backups |
 | Analytics | `data/analytics/analytics.sqlite` by default | Optional, according to observability retention requirements |
-| Logs and API-key audit trail | `logs/` | Ship or retain according to audit policy |
+| Failure logs and API-key audit trail | `logs/` | Ship or retain according to audit policy; routine informational logs are emitted only to stdout |
 | Queued transactions before commit | Process memory | Not recoverable; clients must recreate them |
 | Rate-limit counters | Redis or process memory | Normally ephemeral |
 

@@ -6,6 +6,7 @@ server:
 
 database:
   url: "${DATABASE_URL:-postgresql://postgres:postgres@127.0.0.1:5432/postgres}"
+  exposeErrorDetails: false
   queryUrls: {}
   pool:
     min: 2
@@ -24,9 +25,17 @@ ratelimit:
   requestPerMinutePerIp: 1000
   whitelistedIPs: []
 
-analytics:
-  enabled: true
-  directory: "./data/analytics"
+transactions:
   retentionDays: 30
+
+analytics:
+  # Counts completed query attempts by API-key ID and stores details only for failures.
+  enabled: true
+  # Contains analytics.sqlite and the emergency shutdown spool.
+  directory: "./data/analytics"
+  # Applies to failed-query details; cumulative per-key counters are retained.
+  retentionDays: 30
+  # Quota covers the SQLite database, WAL/SHM files, and shutdown spool.
   maxStorageBytes: 67108864
+  # false removes comments and replaces common SQL literals before storage.
   storeFullSql: false

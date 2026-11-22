@@ -17,9 +17,9 @@ export function createGatewayLogger() {
       },
       {
         target: "pino-roll",
-        level: "info",
+        level: "error",
         options: {
-          file: resolve(logDirectory, "gateway.log"),
+          file: resolve(logDirectory, "failed.log"),
           frequency: "daily",
           size: "20m",
           mkdir: true,
