@@ -5,7 +5,7 @@ import config from "../config/index.js";
 import { scopedInheritanceSafety, scopedQueryUrl, scopedRoleSafety, type QueryAccess } from "./query-access.js";
 import { DatabaseError, getPostgresDatabaseOid } from "./pg-database.js";
 
-const connectionTimeoutMillis = 5_000;
+const connectionTimeoutMillis = 10_000;
 const checkoutTimeoutMillis = 5_000;
 const growthIntervalMillis = 0;
 const maxConcurrentOpenings = 4;
@@ -431,18 +431,21 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
   }
 
   async function observeServer(session: Omit<BackendSession, "idle" | "observerIdentity">, opening: boolean) {
-    const { rows: [observer] } = await adminDb.query<{ verified: boolean; identity: string | null }>(`
-      SELECT EXTRACT(EPOCH FROM pg_catalog.pg_postmaster_start_time())::pg_catalog.text = $4 AND EXISTS (
-        SELECT 1 FROM pg_catalog.pg_stat_activity
-        WHERE pid = $1 AND datid = $2::pg_catalog.oid
-          AND ($3::pg_catalog.text IS NULL OR application_name = $3)
-          AND (backend_start IS NULL OR EXTRACT(EPOCH FROM backend_start)::pg_catalog.text = $5)
-      ) AS verified, CASE WHEN $3::pg_catalog.text IS NOT NULL THEN ${observerIdentitySql} END AS identity
-    `, [session.pid, session.oid, opening ? session.applicationName : null, session.serverStartedAt, session.startedAt]);
-    if (!observer?.verified) {
-      throw new DatabaseError("The query backend is not on the administrative PostgreSQL server", "QUERY_DATABASE_UNAVAILABLE");
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const { rows: [observer] } = await adminDb.query<{ verified: boolean; identity: string | null }>(`
+        SELECT EXTRACT(EPOCH FROM pg_catalog.pg_postmaster_start_time())::pg_catalog.text = $4 AND EXISTS (
+          SELECT 1 FROM pg_catalog.pg_stat_activity
+          WHERE pid = $1 AND datid = $2::pg_catalog.oid
+            AND ($3::pg_catalog.text IS NULL OR application_name = $3)
+            AND (backend_start IS NULL OR EXTRACT(EPOCH FROM backend_start)::pg_catalog.text = $5)
+        ) AS verified, CASE WHEN $3::pg_catalog.text IS NOT NULL THEN ${observerIdentitySql} END AS identity
+      `, [session.pid, session.oid, opening ? session.applicationName : null, session.serverStartedAt, session.startedAt]);
+      if (observer?.verified) {
+        return observer.identity;
+      }
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    return observer.identity;
+    throw new DatabaseError("The query backend is not on the administrative PostgreSQL server", "QUERY_DATABASE_UNAVAILABLE");
   }
 
   async function connect(

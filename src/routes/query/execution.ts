@@ -1,6 +1,7 @@
 import type { FastifyReply } from "fastify";
 import { Query, types, type CustomTypesConfig, type PoolClient, type QueryConfig, type QueryResult } from "pg";
 import type { QueryPools } from "../../utils/query-pool.js";
+import config from "../../config/index.js";
 
 export class ExecutionStopped extends Error {
   constructor(readonly status: number, readonly code: string, message: string) {
@@ -132,8 +133,84 @@ export type ResultStatement = QueryConfig & { rowMode?: "array"; queryMode?: "ex
 
 const maxResultBytes = 8 * 1024 * 1024;
 const maxBackendMessageBytes = 8 * 1024 * 1024;
-const maxConcurrentResultBytes = 64 * 1024 * 1024;
+const maxConcurrentResultBytes = Math.max(
+  512 * 1024 * 1024,
+  (config.database?.pool?.maxGlobalQueries || 50) * maxResultBytes,
+);
 let reservedResultBytes = 0;
+const memoryWaiters = new Set<() => void>();
+
+function wakeMemoryWaiters() {
+  for (const waiter of memoryWaiters) {
+    if (reservedResultBytes + maxResultBytes <= maxConcurrentResultBytes) {
+      waiter();
+    } else {
+      break;
+    }
+  }
+}
+
+async function acquireResultMemory(
+  execution: ReturnType<typeof watchExecution>,
+  timeoutMs = 5_000,
+): Promise<void> {
+  execution.check();
+  if (reservedResultBytes + maxResultBytes <= maxConcurrentResultBytes) {
+    reservedResultBytes += maxResultBytes;
+    return;
+  }
+
+  const deadline = performance.now() + timeoutMs;
+  while (reservedResultBytes + maxResultBytes > maxConcurrentResultBytes) {
+    execution.check();
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) {
+      throw new ExecutionStopped(
+        503,
+        "RESULT_MEMORY_BUSY",
+        "Result memory capacity is temporarily exhausted",
+      );
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      let timer: NodeJS.Timeout | undefined;
+      const onWake = () => {
+        cleanup();
+        resolve();
+      };
+      const onAbort = () => {
+        cleanup();
+        reject(
+          execution.stopped ??
+            new ExecutionStopped(
+              503,
+              "RESULT_MEMORY_BUSY",
+              "Result memory capacity is temporarily exhausted",
+            ),
+        );
+      };
+      const cleanup = () => {
+        memoryWaiters.delete(onWake);
+        if (timer) clearTimeout(timer);
+        execution.signal.removeEventListener("abort", onAbort);
+      };
+
+      memoryWaiters.add(onWake);
+      execution.signal.addEventListener("abort", onAbort, { once: true });
+      timer = setTimeout(() => {
+        cleanup();
+        resolve();
+      }, Math.min(remaining, 500)).unref();
+    });
+  }
+
+  reservedResultBytes += maxResultBytes;
+}
+
+function releaseResultMemory() {
+  reservedResultBytes = Math.max(0, reservedResultBytes - maxResultBytes);
+  wakeMemoryWaiters();
+}
 
 export function createResultBudget(execution: ReturnType<typeof watchExecution>) {
   const maxRows = 50_000;
@@ -154,15 +231,12 @@ export function createResultBudget(execution: ReturnType<typeof watchExecution>)
       client: PoolClient, statement: ResultStatement, onDispatch?: () => void,
     ): Promise<QueryResult | QueryResult[]> {
       if (!reserved) {
-        if (reservedResultBytes + maxResultBytes > maxConcurrentResultBytes) {
-          throw new ExecutionStopped(503, "RESULT_MEMORY_BUSY", "Result memory capacity is temporarily exhausted");
-        }
+        await acquireResultMemory(execution);
         reserved = true;
-        reservedResultBytes += maxResultBytes;
         execution.deferResponseCleanup(() => {
           if (!reserved) return;
           reserved = false;
-          reservedResultBytes -= maxResultBytes;
+          releaseResultMemory();
         });
       }
       const rejectCopy = () => execution.stop(new ExecutionStopped(
