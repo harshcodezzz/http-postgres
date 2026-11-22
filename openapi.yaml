@@ -1,0 +1,3768 @@
+openapi: 3.1.0
+info:
+  title: HTTP Postgres Gateway API
+  version: 1.6.0
+  description: |-
+    A production-grade, high-performance HTTP gateway for PostgreSQL clusters.
+
+    ### Core Capabilities
+    - **Database & Table CRUD Access Control**: Granular permission scopes (`c`, `r`, `u`, `d`) provisioned into isolated PostgreSQL roles per API key.
+    - **Synchronous & Asynchronous Query Execution**: Immediate execution with request timeouts (35s) or background execution (5m statement timeout) with state polling.
+    - **Queued Interactive & Atomic Batch Transactions**: Multi-statement transactional workflows with native PostgreSQL isolation levels (`read uncommitted`, `read committed`, `repeatable read`, `serializable`), read-only modes, and deferrable attributes.
+    - **Robust Idempotency**: Submission deduplication via `Idempotency-Key` with canonical input fingerprinting, status replay, and persistent tombstones.
+    - **Lossless Precision Serialization**: Exact decimal strings for `numeric[]`, raw JSON/JSONB text, date/time/interval text retention, and non-finite float string encodings.
+    - **Connection Prewarming & Adaptive Health Monitoring**: Process-wide query slot budgets, connection verification via `pg_stat_activity`, and automated session reset with `DISCARD ALL`.
+    - **Database & Cluster Administration**: Complete management of databases, collation version refreshes (PostgreSQL 15+), table introspection, audit logging, and query analytics.
+  license:
+    name: ISC
+    identifier: ISC
+servers:
+  - url: /
+    description: Current host server (relative URL)
+  - url: "{protocol}://{host}:{port}"
+    description: Configurable HTTP Postgres gateway server
+    variables:
+      protocol:
+        enum:
+          - http
+          - https
+        default: http
+      host:
+        default: 127.0.0.1
+        description: Gateway server host or domain
+      port:
+        default: "8080"
+        description: Gateway server listening port
+tags:
+  - name: Health
+    description: Public health check and liveness endpoints exempt from authentication and rate limits.
+  - name: Admin Diagnostics
+    description: Administrative service identification, subsystem health checks, connection capacity metrics, audit logs, and query analytics.
+  - name: API Key Management
+    description: Provisioning, scope management, revocation, deletion, and role cleanup for database- and table-scoped API keys.
+  - name: Database Administration
+    description: "PostgreSQL cluster catalog management: database creation, alteration, deletion, collation version refreshes, and table listing."
+  - name: SQL Query Execution
+    description: Execution of immediate synchronous queries and submission of background asynchronous queries.
+  - name: Asynchronous Query Management
+    description: Polling, outcome retrieval, and lifecycle management for background asynchronous queries.
+  - name: Transaction Management
+    description: In-memory queued interactive transactions and single-request atomic batch transactions with idempotency tracking.
+components:
+  securitySchemes:
+    AdminAuth:
+      type: apiKey
+      in: header
+      name: x-admin
+      description: Administrative password configured at gateway bootstrap. Required for all `/admin/*` operations.
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: Primary database-scoped API key header. Starts with `KEY_LIVE_` or `KEY_TEST_`.
+    AuthorizationHeader:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: Alternative raw API key header. Send the raw key string directly without a `Bearer` prefix.
+  parameters:
+    DatabaseHeaderRequired:
+      name: x-database
+      in: header
+      required: true
+      description: Target PostgreSQL database name. The caller's API key must be granted privileges on this database.
+      schema:
+        type: string
+        pattern: ^[a-zA-Z_][a-zA-Z0-9_-]{0,62}$
+        example: gateway_demo
+    DatabaseHeaderOptional:
+      name: x-database
+      in: header
+      required: false
+      description: Target PostgreSQL database name. Required for `/admin/table` and accepted as a fallback target for database maintenance routes.
+      schema:
+        type: string
+        pattern: ^[a-zA-Z_][a-zA-Z0-9_-]{0,62}$
+        example: gateway_demo
+    DbNameHeader:
+      name: x-db-name
+      in: header
+      required: false
+      description: Alternative header for target PostgreSQL database name. Used if `x-database` is omitted.
+      schema:
+        type: string
+        pattern: ^[a-zA-Z_][a-zA-Z0-9_-]{0,62}$
+        example: gateway_demo
+    TransactionIdHeader:
+      name: transaction-id
+      in: header
+      required: false
+      description: Unique transaction identifier (UUIDv4) for interactive or batch transactions.
+      schema:
+        type: string
+        format: uuid
+        example: c79ef201-9a43-4c90-9c23-7fa54d9c72e1
+    XTransactionIdHeader:
+      name: x-transaction-id
+      in: header
+      required: false
+      description: "Alias for `transaction-id`. Precedence: `transaction-id` ?? `x-transaction-id`."
+      schema:
+        type: string
+        format: uuid
+        example: c79ef201-9a43-4c90-9c23-7fa54d9c72e1
+    QueryIdHeader:
+      name: query-id
+      in: header
+      required: false
+      description: Statement query identifier (UUIDv4 or numeric string) within a transaction or for an async query.
+      schema:
+        type: string
+        example: 9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d
+    XQueryIdHeader:
+      name: x-query-id
+      in: header
+      required: false
+      description: "Alias for `query-id`. Precedence: `query-id` ?? `x-query-id` ?? `?queryId=...`."
+      schema:
+        type: string
+        example: 9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d
+    QueryIdQueryParam:
+      name: queryId
+      in: query
+      required: false
+      description: Query statement identifier when polling asynchronous queries or queued transaction lookups via query parameter.
+      schema:
+        type: string
+        example: 9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: "Client-supplied idempotency key (1 to 128 characters: letters, numbers, '.', '_', '~', or '-'). Retrying a batch transaction with the same key and identical normalized queries and options returns the existing execution outcome rather than re-executing."
+      schema:
+        type: string
+        pattern: ^[A-Za-z0-9._~-]{1,128}$
+        example: order-2026-11-22-batch-001
+  headers:
+    RateLimitLimit:
+      description: Maximum requests permitted per 60-second window.
+      schema:
+        type: integer
+        example: 1000
+    RateLimitRemaining:
+      description: Remaining request budget in the current 60-second window.
+      schema:
+        type: integer
+        minimum: 0
+        example: 995
+    RetryAfter:
+      description: Seconds the client should wait before making subsequent requests.
+      schema:
+        type: integer
+        minimum: 1
+        example: 60
+    Location:
+      description: Relative polling URI for tracking progress and outcomes of asynchronous queries or batch transactions.
+      schema:
+        type: string
+        example: /transaction/c79ef201-9a43-4c90-9c23-7fa54d9c72e1
+    CacheControlNoStore:
+      description: Disables caching for live query and transaction state lookups.
+      schema:
+        type: string
+        const: no-store
+        example: no-store
+  schemas:
+    PublicHealthResponse:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+          example: ok
+    AdminServiceResponse:
+      type: object
+      required:
+        - success
+        - service
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        service:
+          type: string
+          const: http-postgres-admin
+          example: http-postgres-admin
+    ServiceHealthStatus:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum:
+            - up
+            - down
+          example: up
+        latencyMs:
+          type: integer
+          minimum: 0
+          description: Roundtrip ping latency in milliseconds.
+          example: 2
+    MonitoringFailure:
+      type: object
+      required:
+        - reason
+        - since
+        - consecutiveFailures
+      properties:
+        reason:
+          type: string
+          enum:
+            - server_mismatch
+            - observer_error
+          description: Reason for PostgreSQL monitoring failure.
+          example: server_mismatch
+        since:
+          type: string
+          format: date-time
+          description: ISO timestamp when the failure first occurred.
+          example: 2026-11-22T05:00:00.000Z
+        consecutiveFailures:
+          type: integer
+          minimum: 1
+          description: Count of consecutive failed check attempts.
+          example: 3
+    MonitoringStatus:
+      type: object
+      required:
+        - status
+        - failure
+        - lastSuccessfulCheckAt
+      properties:
+        status:
+          type: string
+          enum:
+            - degraded
+            - checking
+            - idle
+          example: idle
+        failure:
+          oneOf:
+            - $ref: "#/components/schemas/MonitoringFailure"
+            - type: "null"
+          description: Active monitoring failure details if degraded, or null if healthy.
+        lastSuccessfulCheckAt:
+          type:
+            - string
+            - "null"
+          format: date-time
+          description: ISO timestamp of the last verified pg_stat_activity inspection.
+          example: 2026-11-22T05:45:00.000Z
+    QueryConnectionsCapacity:
+      type: object
+      required:
+        - limit
+        - reserved
+        - available
+        - idle
+        - pendingCheckouts
+        - checkoutTimeouts
+        - awaitingVerification
+        - oldestUnverifiedMs
+        - rejectionsAtLimit
+        - rejectionsAtPoolLimit
+        - monitoring
+      properties:
+        limit:
+          type: integer
+          description: Process-wide maximum query connection ceiling (`database.pool.maxGlobalQueries`).
+          example: 100
+        reserved:
+          type: integer
+          description: Currently open or in-checkout query connections.
+          example: 12
+        available:
+          type: integer
+          minimum: 0
+          description: Remaining connection budget before hitting the global query limit.
+          example: 88
+        idle:
+          type: integer
+          minimum: 0
+          description: Number of idle verified connections in pools ready for reuse.
+          example: 4
+        pendingCheckouts:
+          type: integer
+          minimum: 0
+          description: Requests actively waiting for a verified connection.
+          example: 0
+        checkoutTimeouts:
+          type: integer
+          minimum: 0
+          description: Total connection checkout timeouts since gateway startup.
+          example: 0
+        awaitingVerification:
+          type: integer
+          minimum: 0
+          description: Released backend sessions awaiting verification through `pg_stat_activity`.
+          example: 0
+        oldestUnverifiedMs:
+          type:
+            - integer
+            - "null"
+          description: Age in milliseconds of the oldest backend session awaiting verification.
+          example: null
+        rejectionsAtLimit:
+          type: integer
+          minimum: 0
+          description: Cumulative requests rejected because the process-wide connection limit was reached.
+          example: 0
+        rejectionsAtPoolLimit:
+          type: integer
+          minimum: 0
+          description: Cumulative requests rejected because an individual pool reached its maximum size.
+          example: 0
+        monitoring:
+          $ref: "#/components/schemas/MonitoringStatus"
+    AdminHealthResponse:
+      type: object
+      required:
+        - success
+        - status
+        - timestamp
+        - uptimeSeconds
+        - services
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        status:
+          type: string
+          enum:
+            - healthy
+            - degraded
+          description: Overall system status. Degraded if any service is down or monitoring is degraded.
+          example: healthy
+        timestamp:
+          type: string
+          format: date-time
+          example: 2026-11-22T05:48:00.000Z
+        uptimeSeconds:
+          type: integer
+          minimum: 0
+          description: Gateway process uptime in seconds.
+          example: 86400
+        services:
+          type: object
+          required:
+            - postgres
+            - redis
+            - jsondb
+            - queryConnections
+          properties:
+            postgres:
+              $ref: "#/components/schemas/ServiceHealthStatus"
+            redis:
+              $ref: "#/components/schemas/ServiceHealthStatus"
+            jsondb:
+              type: object
+              required:
+                - status
+              properties:
+                status:
+                  type: string
+                  enum:
+                    - up
+                    - down
+                  example: up
+            queryConnections:
+              $ref: "#/components/schemas/QueryConnectionsCapacity"
+    KeyUsageMetric:
+      type: object
+      required:
+        - keyId
+        - totalQueries
+        - failedQueries
+        - lastUsedAt
+      properties:
+        keyId:
+          type: string
+          description: Unique API key record identifier.
+          example: a1b2c3d4e5f60718293a4b5c
+        totalQueries:
+          type: integer
+          minimum: 0
+          description: Cumulative queries executed by this API key.
+          example: 15420
+        failedQueries:
+          type: integer
+          minimum: 0
+          description: Cumulative failed queries for this API key.
+          example: 12
+        lastUsedAt:
+          type: string
+          format: date-time
+          description: ISO timestamp of the most recent query execution.
+          example: 2026-11-22T05:30:12.345Z
+    FailedQueryMetric:
+      type: object
+      required:
+        - keyId
+        - database
+        - query
+        - truncated
+        - status
+        - occurredAt
+      properties:
+        keyId:
+          type: string
+          description: API key identifier that executed the failed query.
+          example: a1b2c3d4e5f60718293a4b5c
+        database:
+          type: string
+          description: Database where the failed SQL was executed.
+          example: gateway_demo
+        query:
+          type: string
+          description: SQL query text (sanitized/redacted unless `analytics.storeFullSql` is enabled, max 8,192 chars).
+          example: SELECT * FROM non_existent_table WHERE id = ?
+        truncated:
+          type: boolean
+          description: Whether the recorded SQL string was truncated due to length limits.
+          example: false
+        status:
+          type: integer
+          description: HTTP status code returned for the failure.
+          example: 400
+        code:
+          type: string
+          description: Gateway error code.
+          example: QUERY_EXECUTION_ERROR
+        pgCode:
+          type: string
+          description: PostgreSQL 5-character SQLSTATE code.
+          example: 42P01
+        occurredAt:
+          type: string
+          format: date-time
+          description: ISO timestamp when the failure occurred.
+          example: 2026-11-22T05:35:44.123Z
+    AdminAnalyticsResponse:
+      type: object
+      required:
+        - success
+        - enabled
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        enabled:
+          type: boolean
+          description: Whether query analytics recording is active.
+          example: true
+        totalQueries:
+          type: integer
+          minimum: 0
+          description: Total queries executed across all keys.
+          example: 48291
+        failedQueries:
+          type: integer
+          minimum: 0
+          description: Total failed queries recorded.
+          example: 87
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/KeyUsageMetric"
+          description: Per-API-key cumulative usage metrics.
+        recentFailures:
+          type: array
+          items:
+            $ref: "#/components/schemas/FailedQueryMetric"
+          description: Recent failed queries ordered from newest to oldest.
+    AdminLogsResponse:
+      type: object
+      required:
+        - success
+        - type
+        - count
+        - logs
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        type:
+          type: string
+          enum:
+            - audit
+            - system
+          example: audit
+        count:
+          type: integer
+          minimum: 0
+          example: 2
+        logs:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Array of parsed JSON log entries or string message objects.
+    CrudOperation:
+      type: string
+      enum:
+        - c
+        - r
+        - u
+        - d
+      description: "CRUD permission operation: `c` (INSERT), `r` (SELECT), `u` (UPDATE), `d` (DELETE)."
+    TableName:
+      type: object
+      required:
+        - schema
+        - name
+      properties:
+        schema:
+          type: string
+          description: PostgreSQL schema name.
+          example: public
+        name:
+          type: string
+          description: PostgreSQL table name.
+          example: orders
+    TableScopeObject:
+      type: object
+      required:
+        - schema
+        - name
+      properties:
+        database:
+          type: string
+          description: Database name for multi-database scopes.
+          example: sales_db
+        schema:
+          type: string
+          description: Schema name (defaults to 'public' if omitted in string form).
+          example: public
+        name:
+          type: string
+          description: Table name.
+          example: orders
+    TableScopeInputItem:
+      oneOf:
+        - type: string
+          description: "Table name format: 'schema.table' or unqualified 'table' (assumed in public)."
+          example: public.orders
+        - $ref: "#/components/schemas/TableScopeObject"
+    ApiKeyEnvironment:
+      type: string
+      enum:
+        - LIVE
+        - TEST
+      default: LIVE
+      description: Environment tier for key tracking and prefixes (`KEY_LIVE_...` or `KEY_TEST_...`).
+    ApiKeyStatus:
+      type: string
+      enum:
+        - active
+        - revoked
+      description: Status of the API key.
+    DatabaseAccess:
+      type: object
+      required:
+        - database
+        - tables
+        - table
+        - roleToken
+      properties:
+        database:
+          type: array
+          items:
+            $ref: "#/components/schemas/CrudOperation"
+          description: Database-wide CRUD operations granted across all tables in this database.
+        tables:
+          type: array
+          items:
+            $ref: "#/components/schemas/TableName"
+          description: Explicitly scoped tables.
+        table:
+          type: array
+          items:
+            $ref: "#/components/schemas/CrudOperation"
+          description: CRUD operations granted specifically on the scoped tables.
+        roleToken:
+          type: string
+          description: Unique token identifying the provisioned PostgreSQL role.
+        roleOwner:
+          type: string
+          description: Owner ID binding for the provisioned role.
+    ApiKeyRecord:
+      type: object
+      required:
+        - id
+        - keyHash
+        - keyPrefix
+        - databases
+        - environment
+        - status
+        - createdAt
+      properties:
+        id:
+          type: string
+          description: 24-character hexadecimal unique identifier of the API key record.
+          example: 4a28f73e6d1b9c0251ea78bc
+        keyHash:
+          type: string
+          description: SHA-256 hash of the API key secret.
+          example: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        keyPrefix:
+          type: string
+          description: Masked key string for auditing and display.
+          example: KEY_LIVE_a1b2...y9z0
+        databases:
+          type: array
+          items:
+            type: string
+          description: List of database names accessible by this key.
+          example:
+            - sales_db
+            - analytics_db
+        databaseOids:
+          type: object
+          additionalProperties:
+            type: string
+          description: Mapping of database names to catalog OIDs at provisioning time.
+          example:
+            sales_db: "16384"
+        databaseScopes:
+          type: object
+          additionalProperties: true
+          description: Legacy scope definitions if applicable.
+        accessScopes:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/DatabaseAccess"
+          description: Active database and table CRUD grant scopes mapped by database name.
+        environment:
+          $ref: "#/components/schemas/ApiKeyEnvironment"
+        status:
+          $ref: "#/components/schemas/ApiKeyStatus"
+        createdAt:
+          type: string
+          format: date-time
+          example: 2026-11-20T10:15:30.000Z
+        revokedAt:
+          type: string
+          format: date-time
+          description: Timestamp when the key was revoked (if status is revoked).
+          example: 2026-11-21T14:20:00.000Z
+        lastUsedAt:
+          type: string
+          format: date-time
+          description: Timestamp of most recent request using this key.
+          example: 2026-11-22T05:30:00.000Z
+    PendingRoleCleanup:
+      type: object
+      required:
+        - id
+        - keyId
+        - database
+        - createdAt
+        - attempts
+      properties:
+        id:
+          type: string
+          description: Cleanup task SHA-256 hash.
+          example: f8c5b1d92634d0b8c6e28f...
+        keyId:
+          type: string
+          description: Associated API key record ID.
+          example: 4a28f73e6d1b9c0251ea78bc
+        database:
+          type: string
+          description: Target database for role deprovisioning.
+          example: sales_db
+        createdAt:
+          type: string
+          format: date-time
+          example: 2026-11-22T04:00:00.000Z
+        attempts:
+          type: integer
+          minimum: 0
+          description: Count of deprovisioning attempts made.
+          example: 0
+        lastAttemptAt:
+          type: string
+          format: date-time
+          description: Timestamp of last deprovisioning attempt.
+          example: 2026-11-22T04:00:30.000Z
+        lastError:
+          type: string
+          description: Error message from last failed deprovisioning attempt.
+          example: Role is currently in use
+    RoleCleanupStatus:
+      type: object
+      required:
+        - pending
+        - cleanups
+      properties:
+        pending:
+          type: integer
+          minimum: 0
+          description: Count of pending role cleanup operations.
+          example: 1
+        cleanups:
+          type: array
+          items:
+            $ref: "#/components/schemas/PendingRoleCleanup"
+          description: List of pending role cleanups awaiting deprovisioning.
+    ApiKeyListResponse:
+      type: object
+      required:
+        - success
+        - count
+        - keys
+        - roleCleanup
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        count:
+          type: integer
+          minimum: 0
+          example: 5
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/ApiKeyRecord"
+        roleCleanup:
+          $ref: "#/components/schemas/RoleCleanupStatus"
+    RoleCleanupResponse:
+      type: object
+      required:
+        - success
+        - roleCleanup
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        roleCleanup:
+          $ref: "#/components/schemas/RoleCleanupStatus"
+    ApiKeyResponse:
+      type: object
+      required:
+        - success
+        - key
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        key:
+          $ref: "#/components/schemas/ApiKeyRecord"
+    CreateApiKeyRequest:
+      type: object
+      description: Specify database targets and optional table-level scopes. If `scope-database`, `tables`, and `scope-table` are omitted, full CRUD (`['c','r','u','d']`) is granted on all current tables in the target database.
+      properties:
+        database:
+          oneOf:
+            - type: string
+              example: sales_db
+            - type: array
+              items:
+                type: string
+              example:
+                - sales_db
+          description: Target database name(s). Mutually exclusive with `databases`.
+        databases:
+          oneOf:
+            - type: string
+              example: sales_db
+            - type: array
+              items:
+                type: string
+              example:
+                - sales_db
+          description: Target database name(s). Mutually exclusive with `database`.
+        scope-database:
+          type: array
+          items:
+            $ref: "#/components/schemas/CrudOperation"
+          description: Database-wide CRUD operations (`c`, `r`, `u`, `d`). Leave empty for table-only keys.
+          example:
+            - r
+        tables:
+          type: array
+          items:
+            $ref: "#/components/schemas/TableScopeInputItem"
+          description: Explicit tables to grant access to.
+          example:
+            - public.orders
+            - public.customers
+        scope-table:
+          type: array
+          items:
+            $ref: "#/components/schemas/CrudOperation"
+          description: Operations granted on the specified `tables`.
+          example:
+            - c
+            - r
+        environment:
+          $ref: "#/components/schemas/ApiKeyEnvironment"
+    CreateApiKeyResult:
+      type: object
+      required:
+        - apiKey
+        - record
+      properties:
+        apiKey:
+          type: string
+          description: Raw secret API key string. Store this securely; it is never returned again.
+          example: KEY_LIVE_9X7zA2bC3dE4fG5hI6jK7lM8nO9pQ0rS
+        record:
+          $ref: "#/components/schemas/ApiKeyRecord"
+    CreateApiKeyResponse:
+      type: object
+      required:
+        - success
+        - data
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        data:
+          $ref: "#/components/schemas/CreateApiKeyResult"
+    UpdateApiKeyScopeRequest:
+      type: object
+      description: Complete replacement CRUD scope for an existing API key.
+      properties:
+        database:
+          oneOf:
+            - type: string
+              example: sales_db
+            - type: array
+              items:
+                type: string
+              example:
+                - sales_db
+        databases:
+          oneOf:
+            - type: string
+              example: sales_db
+            - type: array
+              items:
+                type: string
+              example:
+                - sales_db
+        scope-database:
+          type: array
+          items:
+            $ref: "#/components/schemas/CrudOperation"
+          example:
+            - r
+        tables:
+          type: array
+          items:
+            $ref: "#/components/schemas/TableScopeInputItem"
+          example:
+            - public.orders
+        scope-table:
+          type: array
+          items:
+            $ref: "#/components/schemas/CrudOperation"
+          example:
+            - c
+            - r
+            - u
+    DeleteApiKeyResponse:
+      type: object
+      required:
+        - success
+        - message
+        - roleCleanup
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        message:
+          type: string
+          enum:
+            - API key permanently deleted
+            - API key revoked
+          example: API key revoked
+        roleCleanup:
+          $ref: "#/components/schemas/RoleCleanupStatus"
+    PostgresDatabaseDetails:
+      type: object
+      required:
+        - id
+        - name
+        - serverVersion
+        - collationVersion
+        - owner
+        - encoding
+        - lcCollate
+        - lcCtype
+        - connectionLimit
+        - allowConnections
+      properties:
+        id:
+          type: string
+          description: PostgreSQL database OID.
+          example: "16384"
+        name:
+          type: string
+          description: Database name (`datname`).
+          example: sales_db
+        serverVersion:
+          type: string
+          description: PostgreSQL server version string.
+          example: "16.2"
+        collationVersion:
+          type:
+            - string
+            - "null"
+          description: Collation version recorded in `pg_database.datcollversion` (PostgreSQL 15+).
+          example: "2.38"
+        owner:
+          type: string
+          description: Role name of the database owner.
+          example: postgres
+        encoding:
+          type: string
+          description: Character set encoding string (e.g. UTF8).
+          example: UTF8
+        lcCollate:
+          type: string
+          description: Database collation locale.
+          example: en_US.UTF-8
+        lcCtype:
+          type: string
+          description: Database character classification locale.
+          example: en_US.UTF-8
+        connectionLimit:
+          type: integer
+          description: Maximum concurrent connections allowed (-1 for unlimited).
+          example: -1
+        allowConnections:
+          type: boolean
+          description: Whether users can connect to this database.
+          example: true
+        sizeBytes:
+          type: integer
+          minimum: 0
+          description: Physical disk storage size in bytes.
+          example: 8388608
+        sizePretty:
+          type: string
+          description: Human-formatted database size.
+          example: 8192 kB
+    DatabaseListResponse:
+      type: object
+      required:
+        - success
+        - count
+        - databases
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        count:
+          type: integer
+          minimum: 0
+          example: 3
+        databases:
+          type: array
+          items:
+            type: string
+          example:
+            - postgres
+            - sales_db
+            - template1
+    DatabaseDetailsResponse:
+      type: object
+      required:
+        - success
+        - database
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        database:
+          $ref: "#/components/schemas/PostgresDatabaseDetails"
+    CreateDatabaseRequest:
+      type: object
+      description: Parameters for `CREATE DATABASE` in PostgreSQL.
+      properties:
+        name:
+          type: string
+          pattern: ^[a-zA-Z_][a-zA-Z0-9_-]{0,62}$
+          description: Name of the new database (or use `database`).
+          example: reporting_db
+        database:
+          type: string
+          pattern: ^[a-zA-Z_][a-zA-Z0-9_-]{0,62}$
+          description: Alias for `name`.
+          example: reporting_db
+        owner:
+          type: string
+          description: Role that will own the new database.
+          example: reporting_owner
+        template:
+          type: string
+          description: Template database to clone from (defaults to `template1`).
+          example: template1
+        encoding:
+          type: string
+          description: Character set encoding (e.g. `UTF8`).
+          example: UTF8
+        lcCollate:
+          type: string
+          description: Collation order (LC_COLLATE).
+          example: en_US.UTF-8
+        lc_collate:
+          type: string
+          description: Snake-case alias for `lcCollate`.
+          example: en_US.UTF-8
+        lcCtype:
+          type: string
+          description: Character classification (LC_CTYPE).
+          example: en_US.UTF-8
+        lc_ctype:
+          type: string
+          description: Snake-case alias for `lcCtype`.
+          example: en_US.UTF-8
+        tablespace:
+          type: string
+          description: Default tablespace name for the database.
+          example: pg_default
+        connectionLimit:
+          type: integer
+          minimum: -1
+          description: Connection limit (-1 for unlimited).
+          example: 50
+        connection_limit:
+          type: integer
+          minimum: -1
+          description: Snake-case alias for `connectionLimit`.
+          example: 50
+    DatabaseCreateResponse:
+      type: object
+      required:
+        - success
+        - message
+        - database
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        message:
+          type: string
+          example: Database 'reporting_db' created successfully
+        database:
+          type: string
+          example: reporting_db
+    RefreshCollationRequest:
+      type: object
+      description: "Collation version refresh request for PostgreSQL 15+. Requires `version: 'collation'`."
+      properties:
+        version:
+          type: string
+          enum:
+            - collation
+          description: Must be set to `'collation'`.
+          example: collation
+        database:
+          type: string
+          description: Target database name.
+          example: sales_db
+        id:
+          type: string
+          description: Target database OID.
+          example: "16384"
+        name:
+          type: string
+          description: Alias for `database`.
+          example: sales_db
+    AlterDatabaseBody:
+      type: object
+      description: Database modification options for `ALTER DATABASE`.
+      properties:
+        newName:
+          type: string
+          description: New database name for rename operation.
+          example: sales_2026_db
+        name:
+          type: string
+          description: Alias for newName (when path supplies database name).
+          example: sales_2026_db
+        owner:
+          type: string
+          description: New database owner role.
+          example: postgres
+        allowConnections:
+          type: boolean
+          description: Enable or disable new user connections.
+          example: true
+        allow_connections:
+          type: boolean
+          description: Snake-case alias for allowConnections.
+          example: true
+        connectionLimit:
+          type: integer
+          minimum: -1
+          description: New connection limit (-1 for unlimited).
+          example: 100
+        connection_limit:
+          type: integer
+          minimum: -1
+          description: Snake-case alias for connectionLimit.
+          example: 100
+        settings:
+          type: object
+          additionalProperties:
+            type: string
+          description: Database-level GUC configuration parameter key-value pairs (e.g. `ALTER DATABASE ... SET param = value`).
+          example:
+            statement_timeout: 30s
+            work_mem: 16MB
+        resetSettings:
+          type: array
+          items:
+            type: string
+          description: List of GUC parameters to reset to defaults (`ALTER DATABASE ... RESET param`).
+          example:
+            - work_mem
+        reset_settings:
+          type: array
+          items:
+            type: string
+          description: Snake-case alias for resetSettings.
+          example:
+            - work_mem
+    AlterDatabaseBodyTargeted:
+      allOf:
+        - $ref: "#/components/schemas/AlterDatabaseBody"
+        - type: object
+          properties:
+            database:
+              type: string
+              description: Target database name (if targeting via body instead of path or `x-database`).
+              example: sales_db
+            id:
+              type: string
+              description: Target database OID (if targeting by OID).
+              example: "16384"
+    DatabaseMutationResponse:
+      type: object
+      required:
+        - success
+        - message
+        - database
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        message:
+          type: string
+          example: Database 'sales_db' properties updated successfully
+        database:
+          type: string
+          example: sales_db
+        renamed:
+          type: boolean
+          description: True if the database was renamed as part of this operation.
+          example: false
+    TableRecord:
+      type: object
+      required:
+        - oid
+        - schema
+        - name
+      properties:
+        oid:
+          type: string
+          description: PostgreSQL relation OID (`pg_class.oid`).
+          example: "24589"
+        schema:
+          type: string
+          description: Schema name (`nspname`).
+          example: public
+        name:
+          type: string
+          description: Table name (`relname`).
+          example: orders
+    TableListResponse:
+      type: object
+      required:
+        - success
+        - database
+        - count
+        - tables
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        database:
+          type: string
+          example: sales_db
+        count:
+          type: integer
+          minimum: 0
+          example: 2
+        tables:
+          type: array
+          items:
+            $ref: "#/components/schemas/TableRecord"
+    ResultOptions:
+      type: object
+      description: Fine-grained result formatting and precision controls.
+      properties:
+        lossless:
+          type: boolean
+          default: true
+          description: When true (default), preserves exact text representations for JSON/JSONB, dates, timestamps, intervals, exact decimal strings for `numeric[]`, and strings for non-finite floats (`NaN`, `Infinity`). Set to false to use legacy driver type coercion.
+        arrayMode:
+          type: boolean
+          default: false
+          description: When true, returns rows as positional value arrays instead of column-keyed objects. Retains duplicate column names in the order of `fields`.
+        fullResults:
+          type: boolean
+          default: true
+          description: When true (default), includes result metadata (`command`, `rowCount`, `fields`). Set to false to return only the `rows` array inside the response envelope.
+    SqlQueryRequest:
+      type: object
+      required:
+        - query
+      properties:
+        query:
+          type: string
+          description: Parameterized SQL string. Use `$1`, `$2`, etc. for parameter placeholders.
+          example: SELECT id, name, balance FROM accounts WHERE customer_id = $1
+        parameters:
+          type: array
+          items: {}
+          description: Positional query parameter values matching `$1`, `$2`, etc.
+          example:
+            - 10042
+        params:
+          type: array
+          items: {}
+          description: Alias for `parameters`.
+          example:
+            - 10042
+        type:
+          type: string
+          enum:
+            - sync
+            - async
+          default: sync
+          description: "Execution mode: `sync` runs immediately and waits for result (up to 35s); `async` queues execution in the background and returns `202 Accepted`."
+          example: sync
+        options:
+          $ref: "#/components/schemas/ResultOptions"
+    FieldDescriptor:
+      type: object
+      required:
+        - name
+        - dataTypeID
+      properties:
+        name:
+          type: string
+          description: Result column name.
+          example: id
+        dataTypeID:
+          type: integer
+          description: PostgreSQL type OID (e.g. 23 for int4, 25 for text, 1184 for timestamptz).
+          example: 23
+    RowObject:
+      type: object
+      additionalProperties: true
+      description: Key-value mapping where keys represent column names and values represent decoded column values.
+      example:
+        id: 10042
+        name: Acme Corp
+        balance: "14250.75"
+    RowArray:
+      type: array
+      items: {}
+      description: "Positional values corresponding to `fields` order when `arrayMode: true`."
+      example:
+        - 10042
+        - Acme Corp
+        - "14250.75"
+    SingleStatementResultData:
+      type: object
+      required:
+        - rows
+      properties:
+        command:
+          type: string
+          description: "PostgreSQL command tag (e.g. `SELECT`, `INSERT`, `UPDATE`, `DELETE`). Omitted if `options.fullResults: false`."
+          example: SELECT
+        rowCount:
+          type: integer
+          minimum: 0
+          description: "Number of affected or returned rows. Omitted if `options.fullResults: false`."
+          example: 1
+        rows:
+          type: array
+          items:
+            oneOf:
+              - $ref: "#/components/schemas/RowObject"
+              - $ref: "#/components/schemas/RowArray"
+          description: Returned PostgreSQL result rows.
+        fields:
+          type: array
+          items:
+            $ref: "#/components/schemas/FieldDescriptor"
+          description: "Column metadata descriptions. Omitted if `options.fullResults: false`."
+    SingleQueryResult:
+      type: object
+      required:
+        - success
+        - database
+        - durationMs
+        - rows
+        - data
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        database:
+          type: string
+          example: gateway_demo
+        durationMs:
+          type: integer
+          minimum: 0
+          description: Execution duration in milliseconds.
+          example: 4
+        command:
+          type: string
+          example: SELECT
+        rowCount:
+          type: integer
+          minimum: 0
+          example: 1
+        rows:
+          type: array
+          items:
+            oneOf:
+              - $ref: "#/components/schemas/RowObject"
+              - $ref: "#/components/schemas/RowArray"
+        fields:
+          type: array
+          items:
+            $ref: "#/components/schemas/FieldDescriptor"
+        data:
+          $ref: "#/components/schemas/SingleStatementResultData"
+    MultiQueryResult:
+      type: object
+      required:
+        - success
+        - database
+        - durationMs
+        - results
+      description: Returned when the query string contains multiple statements (multi-statement execution).
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        database:
+          type: string
+          example: gateway_demo
+        durationMs:
+          type: integer
+          minimum: 0
+          example: 8
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/SingleStatementResultData"
+    AsyncQueryAcceptedResponse:
+      type: object
+      required:
+        - success
+        - queryId
+        - status
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        queryId:
+          type: string
+          format: uuid
+          description: Unique query identifier to poll with `GET /query/{id}`.
+          example: f47ac10b-58cc-4372-a567-0e02b2c3d479
+        status:
+          type: string
+          enum:
+            - running
+          example: running
+    ExecutionOutcome:
+      type: object
+      required:
+        - status
+        - payload
+      properties:
+        status:
+          type: integer
+          description: HTTP status code that would have been returned directly by the synchronous execution endpoint.
+          example: 200
+        payload:
+          type: object
+          description: Result payload (either `SingleQueryResult`, `MultiQueryResult`, or an error response).
+          example:
+            success: true
+            database: gateway_demo
+            command: SELECT
+            rowCount: 1
+            rows:
+              - id: 10042
+                balance: "14250.75"
+            durationMs: 12
+    AsyncQueryStatusResponse:
+      type: object
+      required:
+        - success
+        - queryId
+        - database
+        - status
+        - finalized
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        queryId:
+          type: string
+          format: uuid
+          example: f47ac10b-58cc-4372-a567-0e02b2c3d479
+        database:
+          type: string
+          example: gateway_demo
+        status:
+          type: string
+          enum:
+            - running
+            - completed
+            - failed
+            - unknown
+          description: Current asynchronous query status.
+          example: completed
+        finalized:
+          type: boolean
+          description: True when the query has reached a terminal outcome.
+          example: true
+        outcome:
+          $ref: "#/components/schemas/ExecutionOutcome"
+    IsolationLevel:
+      type: string
+      enum:
+        - read uncommitted
+        - read committed
+        - repeatable read
+        - serializable
+      description: Native PostgreSQL transaction isolation level (matched case-insensitively).
+    TransactionOptions:
+      allOf:
+        - $ref: "#/components/schemas/ResultOptions"
+        - type: object
+          properties:
+            isolationLevel:
+              $ref: "#/components/schemas/IsolationLevel"
+            readOnly:
+              type: boolean
+              description: When true, sets the transaction mode to `READ ONLY` in PostgreSQL.
+            deferrable:
+              type: boolean
+              description: When true, sets the transaction mode to `DEFERRABLE` (only valid for `serializable read only` transactions).
+    QueuedTransactionCreateRequest:
+      type: object
+      properties:
+        options:
+          $ref: "#/components/schemas/TransactionOptions"
+    QueuedTransactionCreateResponse:
+      type: object
+      required:
+        - success
+        - transactionId
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        transactionId:
+          type: string
+          format: uuid
+          description: Interactive transaction queue identifier.
+          example: b19df3e4-6a2c-47ea-9528-98e3b52a1294
+    TransactionStatementObject:
+      type: object
+      required:
+        - query
+      properties:
+        query:
+          type: string
+          description: SQL statement text. Cannot be transaction boundary commands (BEGIN, COMMIT, ROLLBACK, SAVEPOINT, etc.) or SET/RESET when modes are specified.
+          example: INSERT INTO audit_log (event) VALUES ($1)
+        parameters:
+          type: array
+          items: {}
+          description: Positional parameters matching `$1`, `$2`, etc.
+          example:
+            - user_login
+        params:
+          type: array
+          items: {}
+          description: Alias for parameters.
+          example:
+            - user_login
+    TransactionStatement:
+      oneOf:
+        - type: string
+          description: Raw SQL statement string.
+          example: UPDATE user_counters SET attempts = attempts + 1 WHERE id = 42
+        - $ref: "#/components/schemas/TransactionStatementObject"
+    AddStatementRequest:
+      oneOf:
+        - type: string
+          description: Raw SQL query string, or 'COMMIT' to execute and commit the queued transaction.
+          example: COMMIT
+        - $ref: "#/components/schemas/TransactionStatementObject"
+    AddStatementResponse:
+      type: object
+      required:
+        - success
+        - transactionId
+        - queryId
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        transactionId:
+          type: string
+          format: uuid
+          example: b19df3e4-6a2c-47ea-9528-98e3b52a1294
+        queryId:
+          type: string
+          description: Unique query identifier assigned to the queued statement.
+          example: 2a7b1c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d
+    RemoveStatementRequest:
+      type: object
+      properties:
+        queryId:
+          type: string
+          description: Identifier of statement to remove. Can also be supplied via `query-id` header.
+          example: 2a7b1c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d
+    RemoveStatementResponse:
+      type: object
+      required:
+        - success
+        - transactionId
+        - queryId
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        transactionId:
+          type: string
+          format: uuid
+          example: b19df3e4-6a2c-47ea-9528-98e3b52a1294
+        queryId:
+          type: string
+          example: 2a7b1c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d
+    QueuedQueryItem:
+      type: object
+      required:
+        - queryId
+        - query
+      properties:
+        queryId:
+          type: string
+          example: 2a7b1c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d
+        query:
+          type: string
+          example: UPDATE accounts SET balance = balance - 100 WHERE id = 1
+    QueuedTransactionStatusResponse:
+      type: object
+      required:
+        - success
+        - transactionId
+        - database
+        - status
+        - queries
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        transactionId:
+          type: string
+          format: uuid
+          example: b19df3e4-6a2c-47ea-9528-98e3b52a1294
+        database:
+          type: string
+          example: gateway_demo
+        status:
+          type: string
+          enum:
+            - pending
+            - committing
+            - committed
+            - failed
+          example: pending
+        queries:
+          type: array
+          items:
+            $ref: "#/components/schemas/QueuedQueryItem"
+    CommitResultItem:
+      allOf:
+        - $ref: "#/components/schemas/SingleStatementResultData"
+        - type: object
+          properties:
+            queryId:
+              type: string
+              description: Identifier of the queued statement that generated this result (present on interactive queued commit).
+              example: 2a7b1c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d
+            queryIndex:
+              type: integer
+              minimum: 0
+              description: Zero-based statement index in batch execution (present on batch commit).
+              example: 0
+    QueuedTransactionCommitResult:
+      type: object
+      required:
+        - success
+        - transactionId
+        - results
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        transactionId:
+          type: string
+          format: uuid
+          example: b19df3e4-6a2c-47ea-9528-98e3b52a1294
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/CommitResultItem"
+    BatchExecuteRequest:
+      type: object
+      required:
+        - queries
+      properties:
+        queries:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/TransactionStatement"
+          description: Ordered array of 1 to 100 SQL statements executed in an atomic transaction batch on a dedicated connection.
+        options:
+          $ref: "#/components/schemas/TransactionOptions"
+    BatchExecuteAcceptedResponse:
+      type: object
+      required:
+        - success
+        - transactionId
+        - status
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        transactionId:
+          type: string
+          format: uuid
+          description: Identifier for polling batch progress via `GET /transaction/{id}`.
+          example: c79ef201-9a43-4c90-9c23-7fa54d9c72e1
+        status:
+          type: string
+          enum:
+            - pending
+          example: pending
+    BatchTransactionReplayResponse:
+      type: object
+      required:
+        - success
+        - transactionId
+        - status
+        - finalized
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        transactionId:
+          type: string
+          format: uuid
+          example: c79ef201-9a43-4c90-9c23-7fa54d9c72e1
+        status:
+          type: string
+          enum:
+            - pending
+            - running
+            - committing
+            - committed
+            - rejected
+            - failed
+            - unknown
+          example: committed
+        finalized:
+          type: boolean
+          example: true
+    BatchProgress:
+      type: object
+      required:
+        - completed
+        - total
+      properties:
+        completed:
+          type: integer
+          minimum: 0
+          description: Number of statements in the batch that have finished executing.
+          example: 3
+        total:
+          type: integer
+          minimum: 1
+          description: Total statements in the batch.
+          example: 3
+    StoredStatement:
+      type: object
+      required:
+        - query
+      properties:
+        query:
+          type: string
+          description: Statement SQL text (bound values are omitted for security).
+          example: UPDATE stats SET users = users + 1
+    BatchTransactionStatusResponse:
+      type: object
+      required:
+        - success
+        - transactionId
+        - status
+        - finalized
+        - database
+        - queries
+        - options
+        - completedQueries
+        - createdAt
+        - updatedAt
+        - progress
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        transactionId:
+          type: string
+          format: uuid
+          example: c79ef201-9a43-4c90-9c23-7fa54d9c72e1
+        status:
+          type: string
+          enum:
+            - pending
+            - running
+            - committing
+            - committed
+            - rejected
+            - failed
+            - unknown
+          description: "Status of the batch transaction: `committed` (all statements committed), `rejected` (rolled back due to statement error), `failed` (system or execution error), `unknown` (commit outcome unconfirmed)."
+          example: committed
+        finalized:
+          type: boolean
+          description: True when execution has concluded.
+          example: true
+        database:
+          type: string
+          example: gateway_demo
+        queries:
+          type: array
+          items:
+            $ref: "#/components/schemas/StoredStatement"
+        options:
+          $ref: "#/components/schemas/TransactionOptions"
+        completedQueries:
+          type: integer
+          minimum: 0
+          example: 3
+        createdAt:
+          type: string
+          format: date-time
+          example: 2026-11-22T05:10:00.000Z
+        updatedAt:
+          type: string
+          format: date-time
+          example: 2026-11-22T05:10:05.000Z
+        progress:
+          $ref: "#/components/schemas/BatchProgress"
+        outcome:
+          $ref: "#/components/schemas/ExecutionOutcome"
+        error:
+          $ref: "#/components/schemas/ErrorDetail"
+    ErrorDetail:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          description: Machine-readable gateway error code.
+          example: INVALID_QUERY
+        message:
+          type: string
+          description: Human-readable description of the error.
+          example: Query string is required in 'query'
+        pgCode:
+          type: string
+          pattern: ^[0-9A-Z]{5}$
+          description: PostgreSQL 5-character SQLSTATE error code.
+          example: 42P01
+        cause:
+          type: string
+          description: Underlying error code or reason for interrupted or unconfirmed outcomes.
+          example: QUERY_RESULT_UNAVAILABLE
+        queryId:
+          type: string
+          description: Identifier of the failed statement in an interactive queued transaction.
+          example: 2a7b1c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d
+        queryIndex:
+          type: integer
+          minimum: 0
+          description: Zero-based index of the failing statement within a batch transaction.
+          example: 1
+        severity:
+          type: string
+          description: PostgreSQL error severity level (e.g. `ERROR`, `FATAL`).
+          example: ERROR
+        detail:
+          type:
+            - string
+            - "null"
+          description: PostgreSQL error detail text (null unless `database.exposeErrorDetails` is enabled).
+          example: null
+        hint:
+          type:
+            - string
+            - "null"
+          description: PostgreSQL error hint text (null unless `database.exposeErrorDetails` is enabled).
+          example: null
+        schema:
+          type:
+            - string
+            - "null"
+          description: PostgreSQL schema name associated with the error.
+          example: public
+        table:
+          type:
+            - string
+            - "null"
+          description: PostgreSQL table name associated with the error.
+          example: accounts
+        column:
+          type:
+            - string
+            - "null"
+          description: PostgreSQL column name associated with the error.
+          example: null
+        constraint:
+          type:
+            - string
+            - "null"
+          description: PostgreSQL constraint name associated with the error.
+          example: null
+        dataType:
+          type:
+            - string
+            - "null"
+          description: PostgreSQL data type name associated with the error.
+          example: null
+        position:
+          type:
+            - string
+            - "null"
+          description: Cursor position in the SQL query string where error occurred.
+          example: "15"
+    ErrorResponse:
+      type: object
+      required:
+        - success
+        - error
+      properties:
+        success:
+          type: boolean
+          const: false
+          example: false
+        error:
+          $ref: "#/components/schemas/ErrorDetail"
+    RemovedTransactionResponse:
+      type: object
+      required:
+        - success
+        - transactionId
+        - error
+      description: Returned (HTTP 410 Gone) when querying or submitting against an idempotency record whose data has been pruned/deleted but whose tombstone is retained.
+      properties:
+        success:
+          type: boolean
+          const: false
+          example: false
+        transactionId:
+          type: string
+          format: uuid
+          example: c79ef201-9a43-4c90-9c23-7fa54d9c72e1
+        lastStatus:
+          type: string
+          enum:
+            - committed
+            - rejected
+            - failed
+            - unknown
+          description: Final status of the transaction prior to removal.
+          example: committed
+        removedAt:
+          type: string
+          format: date-time
+          description: ISO timestamp when the record was deleted.
+          example: 2026-11-22T05:20:00.000Z
+        error:
+          $ref: "#/components/schemas/ErrorDetail"
+  responses:
+    BadRequestError:
+      description: Bad Request. Validation failure, invalid query syntax, invalid database/table scope, or parameter mismatch.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            success: false
+            error:
+              code: INVALID_QUERY
+              message: Query string is required in 'query'
+    UnauthorizedError:
+      description: Unauthorized. Missing, rejected, or invalid credentials (`x-admin`, `x-api-key`, or `Authorization`), or key requires scope rebinding.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            success: false
+            error:
+              code: UNAUTHORIZED
+              message: error
+    ForbiddenError:
+      description: Forbidden. Insufficient privileges, attempt to perform writes on a read-only connection, or database scope identity mismatch.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            success: false
+            error:
+              code: INSUFFICIENT_PRIVILEGE
+              message: Read-only API keys cannot perform writes
+              pgCode: "42501"
+    NotFoundError:
+      description: Not Found. The requested resource (API key, database, table, query, or transaction) does not exist.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            success: false
+            error:
+              code: NOT_FOUND
+              message: Route not found
+    ConflictError:
+      description: Conflict. Resource conflict (database in use/maintenance, active execution in progress, or idempotency key collision).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            success: false
+            error:
+              code: IDEMPOTENCY_KEY_CONFLICT
+              message: This key already belongs to a different batch
+    GoneError:
+      description: Gone. The execution record was removed, but an idempotency tombstone remains active.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/RemovedTransactionResponse"
+    PayloadTooLargeError:
+      description: Payload Too Large. Query result row budget (50,000 rows), result memory budget (8 MiB), or transaction queue memory budget (256 KiB) was exceeded.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            success: false
+            error:
+              code: RESULT_LIMIT_EXCEEDED
+              message: The query result exceeds its size limit
+    UnprocessableContentError:
+      description: Unprocessable Content. The requested database feature is unsupported on this PostgreSQL server version.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            success: false
+            error:
+              code: DATABASE_VERSION_UNSUPPORTED
+              message: Use version 'collation' to refresh the database collation version
+    RateLimitError:
+      description: Too Many Requests. Per-minute request limit exceeded (per IP or per API key), or transaction storage limit reached.
+      headers:
+        Retry-After:
+          $ref: "#/components/headers/RetryAfter"
+        X-RateLimit-Limit:
+          $ref: "#/components/headers/RateLimitLimit"
+        X-RateLimit-Remaining:
+          $ref: "#/components/headers/RateLimitRemaining"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            success: false
+            error:
+              code: RATE_LIMIT_EXCEEDED
+              message: Too many requests
+    RequestDisconnectedError:
+      description: Client Closed Request. The HTTP client disconnected before the query execution completed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            success: false
+            error:
+              code: REQUEST_DISCONNECTED
+              message: The HTTP caller disconnected
+    InternalServerError:
+      description: Internal Server Error. An unexpected server error occurred, or a metadata synchronization step failed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            success: false
+            error:
+              code: INTERNAL_SERVER_ERROR
+              message: Internal server error
+    QueryOutcomeUnknownError:
+      description: Query Outcome Unknown. SQL was dispatched to PostgreSQL and may have taken effect, but connection was lost before the outcome was confirmed. Check error.cause and verify writes before retrying.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            success: false
+            error:
+              code: QUERY_OUTCOME_UNKNOWN
+              message: The SQL may have taken effect. Verify its outcome before retrying.
+              cause: QUERY_RESULT_UNAVAILABLE
+    ServiceUnavailableError:
+      description: Service Unavailable. Connection pool exhausted, query queue full (32 concurrent async queries or 32 batch slots), or admin password verification busy.
+      headers:
+        Retry-After:
+          $ref: "#/components/headers/RetryAfter"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            success: false
+            error:
+              code: QUERY_QUEUE_FULL
+              message: Too many asynchronous queries are running
+    GatewayTimeoutError:
+      description: Gateway Timeout. The execution deadline was exceeded (35s for sync queries, 60s for batch transactions, 305s for async queries).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            success: false
+            error:
+              code: EXECUTION_DEADLINE_EXCEEDED
+              message: The execution deadline was exceeded
+paths:
+  /health:
+    get:
+      tags:
+        - Health
+      summary: Public liveness health check
+      description: Returns service operational status (`{"status":"ok"}`). This public endpoint is exempt from authentication, database checks, and IP rate limiting.
+      operationId: getHealth
+      security: []
+      responses:
+        "200":
+          description: Gateway service is live and operational.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicHealthResponse"
+              example:
+                status: ok
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+    head:
+      tags:
+        - Health
+      summary: Public liveness health check headers
+      description: Returns HTTP response headers for the health check without a body payload. Exempt from authentication and rate limiting.
+      operationId: headHealth
+      security: []
+      responses:
+        "200":
+          description: Gateway service is live and reachable.
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+  /admin:
+    get:
+      tags:
+        - Admin Diagnostics
+      summary: Get admin service identity
+      description: Returns the administrator service identifier. Requires gateway administrator credentials.
+      operationId: getAdminService
+      security:
+        - AdminAuth: []
+      responses:
+        "200":
+          description: Admin service identity confirmed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminServiceResponse"
+              example:
+                success: true
+                service: http-postgres-admin
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+  /admin/health:
+    get:
+      tags:
+        - Admin Diagnostics
+      summary: Get subsystem health and connection capacity metrics
+      description: Performs end-to-end health verification across PostgreSQL administrative pool, Redis key-value store, and JsonDB file storage. Reports query pool allocation, reserved slots, pending checkouts, verification lag, and background monitoring status.
+      operationId: getAdminHealth
+      security:
+        - AdminAuth: []
+      responses:
+        "200":
+          description: Detailed health status and capacity metrics.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminHealthResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+  /admin/analytics:
+    get:
+      tags:
+        - Admin Diagnostics
+      summary: Get query execution analytics and failure metrics
+      description: Retrieves cumulative query execution counts, failed query counts, per-API-key usage counters, and recent sanitized failed SQL statements with their SQLSTATE and gateway error codes.
+      operationId: getAdminAnalytics
+      security:
+        - AdminAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of recent failed query records to return (minimum 1, maximum 200, default 50).
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+            example: 50
+      responses:
+        "200":
+          description: Query analytics report.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAnalyticsResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+  /admin/logs:
+    get:
+      tags:
+        - Admin Diagnostics
+      summary: Tail gateway audit or system log files
+      description: Reads the most recent log lines from disk. `audit` mode reads the active API key audit log (`logs/api-keys.log`) and seamlessly spans into the previous generation (`logs/api-keys.log.1`) when needed. `system` mode reads the active gateway output log (`logs/current.log`). Scans up to 1 MiB per file.
+      operationId: getAdminLogs
+      security:
+        - AdminAuth: []
+      parameters:
+        - name: type
+          in: query
+          required: false
+          description: "Log target to tail: `audit` for API key events or `system` for gateway application logs."
+          schema:
+            type: string
+            enum:
+              - audit
+              - system
+            default: audit
+            example: audit
+        - name: limit
+          in: query
+          required: false
+          description: Maximum log entries to return (minimum 1, maximum 500, default 100).
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 100
+            example: 100
+      responses:
+        "200":
+          description: Recent log entries.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminLogsResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+  /admin/keys:
+    get:
+      tags:
+        - API Key Management
+      summary: List all API key records
+      description: Returns all registered API key records, including key prefixes, assigned database OIDs, active CRUD scopes, environment tiers, and pending role cleanup queues.
+      operationId: listApiKeys
+      security:
+        - AdminAuth: []
+      responses:
+        "200":
+          description: List of API key records.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyListResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+    post:
+      tags:
+        - API Key Management
+      summary: Create a new scoped API key
+      description: |-
+        Issues a new API key with fine-grained database and table CRUD permissions. On creation, the gateway provisions restricted PostgreSQL roles on demand for each distinct grant set.
+
+        ### Permission Scope Rules
+        - **Full Database CRUD**: If `database` or `databases` is provided without `scope-database`, `tables`, or `scope-table`, full CRUD (`c`, `r`, `u`, `d`) is granted on all current tables in the database.
+        - **Granular Database Scope**: Set `scope-database` with desired operations (e.g. `["r"]` for read-only).
+        - **Table-Level Scope**: Set `tables` (e.g. `["public.orders"]` or `[{"database":"sales","schema":"public","name":"orders"}]`) and `scope-table` (e.g. `["c","r"]`).
+        - **Table-Only Key**: Pass an empty `scope-database: []` to restrict the key strictly to the listed tables.
+        - **Environment**: Supports `LIVE` (default) or `TEST`.
+
+        > **Important**: Save `data.apiKey` immediately from the response. The plaintext secret is never returned again or stored on disk; only its SHA-256 hash is retained.
+      operationId: createApiKey
+      security:
+        - AdminAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateApiKeyRequest"
+            examples:
+              fullCrud:
+                summary: Full CRUD on a single database
+                value:
+                  database: gateway_demo
+              tableRestricted:
+                summary: Read-only database with write access to specific table
+                value:
+                  database:
+                    - gateway_demo
+                  scope-database:
+                    - r
+                  tables:
+                    - public.messages
+                  scope-table:
+                    - c
+                    - r
+                  environment: LIVE
+      responses:
+        "201":
+          description: API key created successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateApiKeyResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+  /admin/keys/cleanup:
+    get:
+      tags:
+        - API Key Management
+      summary: Get pending PostgreSQL role cleanups
+      description: Retrieves the status and queue of pending PostgreSQL role deprovisionings resulting from API key revocations or scope updates.
+      operationId: getRoleCleanupStatus
+      security:
+        - AdminAuth: []
+      responses:
+        "200":
+          description: Pending role cleanup status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoleCleanupResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+  /admin/keys/cleanup/retry:
+    post:
+      tags:
+        - API Key Management
+      summary: Retry pending PostgreSQL role cleanups
+      description: Immediately triggers a retry cycle for all pending PostgreSQL role deprovisioning cleanups.
+      operationId: retryRoleCleanups
+      security:
+        - AdminAuth: []
+      responses:
+        "200":
+          description: Role cleanup retry initiated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoleCleanupResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+  /admin/keys/{id}:
+    get:
+      tags:
+        - API Key Management
+      summary: Get API key record by ID
+      description: Retrieves metadata, scopes, and status of an API key record by its 24-character hexadecimal ID.
+      operationId: getApiKeyById
+      security:
+        - AdminAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: 24-character hex ID of the API key record.
+          schema:
+            type: string
+            example: 4a28f73e6d1b9c0251ea78bc
+      responses:
+        "200":
+          description: API key details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+    patch:
+      tags:
+        - API Key Management
+      summary: Update API key database and table scope
+      description: Replaces the entire database and table CRUD scope for an active API key. Deprovisions stale PostgreSQL roles and provisions new restricted roles as required, preserving the key's ID and secret.
+      operationId: updateApiKeyScope
+      security:
+        - AdminAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: 24-character hex ID of the API key record.
+          schema:
+            type: string
+            example: 4a28f73e6d1b9c0251ea78bc
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateApiKeyScopeRequest"
+            example:
+              database:
+                - gateway_demo
+              scope-database:
+                - r
+              tables:
+                - public.messages
+              scope-table:
+                - c
+                - r
+                - u
+      responses:
+        "200":
+          description: API key scope updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+    put:
+      tags:
+        - API Key Management
+      summary: Replace API key scope (alias)
+      description: Idempotent alias for `PATCH /admin/keys/{id}` to replace the complete CRUD scope of an API key.
+      operationId: replaceApiKeyScope
+      security:
+        - AdminAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: 24-character hex ID of the API key record.
+          schema:
+            type: string
+            example: 4a28f73e6d1b9c0251ea78bc
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateApiKeyScopeRequest"
+      responses:
+        "200":
+          description: API key scope replaced.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+    delete:
+      tags:
+        - API Key Management
+      summary: Revoke or permanently delete an API key
+      description: Revokes an API key (soft delete) by default. When query parameter `hard=true` is passed, permanently purges the API key record from JsonDB and enqueues its PostgreSQL roles for immediate deprovisioning.
+      operationId: deleteApiKey
+      security:
+        - AdminAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: 24-character hex ID of the API key record to revoke or delete.
+          schema:
+            type: string
+            example: 4a28f73e6d1b9c0251ea78bc
+        - name: hard
+          in: query
+          required: false
+          description: Set to `true` to permanently delete the API key record instead of soft-revoking.
+          schema:
+            type: boolean
+            default: false
+            example: false
+      responses:
+        "200":
+          description: API key revoked or deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteApiKeyResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+  /admin/database:
+    get:
+      tags:
+        - Database Administration
+      summary: List all PostgreSQL databases (including templates)
+      description: Returns names of all databases present in the PostgreSQL cluster, including template databases (`template0`, `template1`).
+      operationId: listDatabases
+      security:
+        - AdminAuth: []
+      responses:
+        "200":
+          description: Database list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseListResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+    post:
+      tags:
+        - Database Administration
+      summary: Create a new PostgreSQL database
+      description: Executes `CREATE DATABASE` with specified owner, encoding, collation, ctype, tablespace, template, and connection limits.
+      operationId: createDatabase
+      security:
+        - AdminAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDatabaseRequest"
+            example:
+              name: analytics_db
+              encoding: UTF8
+              connectionLimit: 100
+      responses:
+        "201":
+          description: Database created successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseCreateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+    put:
+      tags:
+        - Database Administration
+      summary: Refresh recorded database collation version
+      description: 'Refreshes the recorded database collation version in `pg_database` (supported on PostgreSQL 15+). Pass `{"version": "collation"}` in the body. Database target can be specified via body `database`, `name`, `id` or header `x-database`.'
+      operationId: refreshDatabaseVersion
+      security:
+        - AdminAuth: []
+      parameters:
+        - $ref: "#/components/parameters/DatabaseHeaderOptional"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshCollationRequest"
+            example:
+              version: collation
+              database: sales_db
+      responses:
+        "200":
+          description: Collation version refreshed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseDetailsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "422":
+          $ref: "#/components/responses/UnprocessableContentError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+    patch:
+      tags:
+        - Database Administration
+      summary: Alter database properties
+      description: Modifies database properties (rename, owner, connection limits, connection allowance, or GUC configuration settings). Database target can be identified by body `id`, `database`, `name` or header `x-database`. Renaming a database automatically synchronizes registered API key scopes.
+      operationId: alterDatabase
+      security:
+        - AdminAuth: []
+      parameters:
+        - $ref: "#/components/parameters/DatabaseHeaderOptional"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AlterDatabaseBodyTargeted"
+            example:
+              database: sales_db
+              connectionLimit: 75
+              settings:
+                statement_timeout: 30s
+      responses:
+        "200":
+          description: Database properties updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseMutationResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+  /admin/databases:
+    get:
+      tags:
+        - Database Administration
+      summary: List user databases (excluding templates)
+      description: Returns names of all non-template databases in the PostgreSQL cluster.
+      operationId: listNonTemplateDatabases
+      security:
+        - AdminAuth: []
+      responses:
+        "200":
+          description: List of user databases.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseListResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+    post:
+      tags:
+        - Database Administration
+      summary: Create a new PostgreSQL database (alias)
+      description: Plural alias for `POST /admin/database`.
+      operationId: createDatabaseAlias
+      security:
+        - AdminAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDatabaseRequest"
+      responses:
+        "201":
+          description: Database created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseCreateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+  /admin/database/{id}:
+    get:
+      tags:
+        - Database Administration
+      summary: Get database attributes (including templates)
+      description: Retrieves metadata, owner, encoding, collation, server version, connection limit, and disk storage size for a database specified by name or OID. Includes template databases in searches.
+      operationId: getDatabaseDetails
+      security:
+        - AdminAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Database name or PostgreSQL catalog OID.
+          schema:
+            type: string
+            example: sales_db
+        - name: by
+          in: query
+          required: false
+          description: "Explicit lookup mode: `name` (default) or `id` (treats path parameter as numeric OID)."
+          schema:
+            type: string
+            enum:
+              - name
+              - id
+            default: name
+            example: name
+      responses:
+        "200":
+          description: Database details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseDetailsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+  /admin/table:
+    get:
+      tags:
+        - Database Administration
+      summary: List user tables in selected database
+      description: Lists all regular and partitioned tables (`relkind IN ('r', 'p')`) in the database selected by the `x-database` header. Filters out PostgreSQL internal schemas (`information_schema`, `pg_*`) and gateway metadata schemas.
+      operationId: listTables
+      security:
+        - AdminAuth: []
+      parameters:
+        - $ref: "#/components/parameters/DatabaseHeaderRequired"
+      responses:
+        "200":
+          description: Table catalog list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TableListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+  /admin/databases/{name}:
+    get:
+      tags:
+        - Database Administration
+      summary: Get user database attributes (excluding templates)
+      description: Retrieves metadata and disk storage size for a non-template database specified by name or catalog OID.
+      operationId: getNonTemplateDatabaseDetails
+      security:
+        - AdminAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          description: Database name or PostgreSQL catalog OID.
+          schema:
+            type: string
+            example: sales_db
+        - name: by
+          in: query
+          required: false
+          description: "Explicit lookup mode:  or uid=501(harsh.) gid=20(staff) groups=20(staff),101(access_bpf),12(everyone),61(localaccounts),79(_appserverusr),80(admin),81(_appserveradm),98(_lpadmin),702(com.apple.sharepoint.group.2),701(com.apple.sharepoint.group.1),33(_appstore),100(_lpoperator),204(_developer),250(_analyticsusers),395(com.apple.access_ftp),398(com.apple.access_screensharing),399(com.apple.access_ssh),400(com.apple.access_remote_ae)."
+          schema:
+            type: string
+            enum:
+              - name
+              - id
+            example: name
+      responses:
+        "200":
+          description: Database details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseDetailsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+    patch:
+      tags:
+        - Database Administration
+      summary: Alter database properties by path name
+      description: Updates properties (rename, owner, connections, settings) for the database named in the URL path. Synchronizes stored API key scopes if renamed.
+      operationId: alterDatabaseByName
+      security:
+        - AdminAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          description: Database name to modify.
+          schema:
+            type: string
+            example: sales_db
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AlterDatabaseBody"
+            example:
+              connectionLimit: 50
+              allowConnections: true
+      responses:
+        "200":
+          description: Database altered successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseMutationResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+    put:
+      tags:
+        - Database Administration
+      summary: Alter database properties by path name (alias)
+      description: PUT alias for `PATCH /admin/databases/{name}`.
+      operationId: replaceDatabaseByName
+      security:
+        - AdminAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          description: Database name to modify.
+          schema:
+            type: string
+            example: sales_db
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AlterDatabaseBody"
+      responses:
+        "200":
+          description: Database altered successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseMutationResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+    delete:
+      tags:
+        - Database Administration
+      summary: Drop a PostgreSQL database
+      description: |-
+        Drops a database from the PostgreSQL cluster (`DROP DATABASE`).
+
+        ### Deletion Rules & Safeguards
+        - Cannot drop system databases (`postgres`, `template0`, `template1`) or the database configured as the gateway's administrative connection.
+        - Set `?force=true` to ask PostgreSQL (version 13+) to terminate existing active connections before dropping.
+        - Automatically removes the dropped database from stored API key scopes and cleans up orphaned metadata.
+      operationId: deleteDatabase
+      security:
+        - AdminAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          description: Name of the database to drop.
+          schema:
+            type: string
+            example: temp_staging_db
+        - name: force
+          in: query
+          required: false
+          description: When true, forces termination of active client connections on PostgreSQL 13+.
+          schema:
+            type: boolean
+            default: false
+            example: false
+      responses:
+        "200":
+          description: Database deleted successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - success
+                  - message
+                properties:
+                  success:
+                    type: boolean
+                    const: true
+                    example: true
+                  message:
+                    type: string
+                    example: Database 'temp_staging_db' deleted successfully
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+  /query:
+    post:
+      tags:
+        - SQL Query Execution
+      summary: Execute immediate SQL query or submit asynchronous query
+      description: |-
+        Runs parameterized SQL queries against PostgreSQL.
+
+        ### Execution Modes
+        - **Synchronous (Immediate)**: Omit `type` or set `type: "sync"`. The gateway acquires a prewarmed connection (up to 400ms checkout wait), applies a 30s `statement_timeout`, enforces a 35s HTTP response deadline, and resets the backend session with `DISCARD ALL` upon return. Returns `200 OK` with result rows and metadata.
+        - **Asynchronous**: Set `type: "async"`. Returns `202 Accepted` with a `queryId` and `Location: /query/{queryId}` header. Executes in the background with a 5-minute `statement_timeout`. Up to 32 concurrent asynchronous queries per gateway process.
+
+        ### Permissions & Security
+        - Requires `x-api-key` (or raw `Authorization`) and `x-database` (or `x-db-name`).
+        - Scoped keys permit only data statements (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `WITH`, `TABLE`, `VALUES`).
+        - Read-only keys run inside `BEGIN READ ONLY` and are blocked from invoking mutating or administrative functions.
+        - Unsupported streaming operations (`COPY FROM STDIN`, `COPY TO STDOUT`) are rejected with `COPY_STREAM_UNSUPPORTED`.
+        - Enforces hard limits: 50,000 rows and 8 MiB result payload.
+      operationId: executeQuery
+      security:
+        - ApiKeyAuth: []
+        - AuthorizationHeader: []
+      parameters:
+        - $ref: "#/components/parameters/DatabaseHeaderRequired"
+        - $ref: "#/components/parameters/DbNameHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SqlQueryRequest"
+            examples:
+              parameterizedSync:
+                summary: Synchronous parameterized query
+                value:
+                  query: SELECT id, name, balance FROM accounts WHERE customer_id = $1
+                  parameters:
+                    - 42
+                  type: sync
+                  options:
+                    lossless: true
+                    fullResults: true
+              asyncQuery:
+                summary: Asynchronous background query
+                value:
+                  query: SELECT count(*) FROM large_event_log WHERE created_at > $1
+                  params:
+                    - 2026-01-01T00:00:00Z
+                  type: async
+      responses:
+        "200":
+          description: Query executed successfully (single or multi-statement).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/SingleQueryResult"
+                  - $ref: "#/components/schemas/MultiQueryResult"
+        "202":
+          description: Asynchronous query accepted for background processing.
+          headers:
+            Location:
+              $ref: "#/components/headers/Location"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AsyncQueryAcceptedResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "413":
+          $ref: "#/components/responses/PayloadTooLargeError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "499":
+          $ref: "#/components/responses/RequestDisconnectedError"
+        "500":
+          $ref: "#/components/responses/QueryOutcomeUnknownError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+        "504":
+          $ref: "#/components/responses/GatewayTimeoutError"
+    get:
+      tags:
+        - Asynchronous Query Management
+      summary: Poll asynchronous query via header or query parameter
+      description: "Polls the status or retrieves the outcome of an asynchronous query. The query identifier can be passed in `query-id` header, `x-query-id` header, or `?queryId=...` query parameter. Precedence: `query-id` ?? `x-query-id` ?? `queryId`."
+      operationId: getAsynchronousQueryByHeaderOrParam
+      security:
+        - ApiKeyAuth: []
+        - AuthorizationHeader: []
+      parameters:
+        - $ref: "#/components/parameters/QueryIdHeader"
+        - $ref: "#/components/parameters/XQueryIdHeader"
+        - $ref: "#/components/parameters/QueryIdQueryParam"
+        - $ref: "#/components/parameters/DatabaseHeaderRequired"
+        - $ref: "#/components/parameters/DbNameHeader"
+      responses:
+        "200":
+          description: Asynchronous query status or finalized outcome.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AsyncQueryStatusResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+  /query/run:
+    post:
+      tags:
+        - SQL Query Execution
+      summary: Execute immediate SQL query (alias)
+      description: Direct alias for `POST /query`. Accepts identical inputs and returns identical outputs.
+      operationId: executeQueryRunAlias
+      security:
+        - ApiKeyAuth: []
+        - AuthorizationHeader: []
+      parameters:
+        - $ref: "#/components/parameters/DatabaseHeaderRequired"
+        - $ref: "#/components/parameters/DbNameHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SqlQueryRequest"
+      responses:
+        "200":
+          description: Query executed successfully.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/SingleQueryResult"
+                  - $ref: "#/components/schemas/MultiQueryResult"
+        "202":
+          description: Asynchronous query accepted.
+          headers:
+            Location:
+              $ref: "#/components/headers/Location"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AsyncQueryAcceptedResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "413":
+          $ref: "#/components/responses/PayloadTooLargeError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "499":
+          $ref: "#/components/responses/RequestDisconnectedError"
+        "500":
+          $ref: "#/components/responses/QueryOutcomeUnknownError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+        "504":
+          $ref: "#/components/responses/GatewayTimeoutError"
+  /query/{id}:
+    get:
+      tags:
+        - Asynchronous Query Management
+      summary: Poll status or retrieve outcome of an asynchronous query by ID
+      description: "Checks whether an asynchronous query has finalized. While running, `finalized: false`. Once finalized, `status` becomes `completed`, `failed`, or `unknown`, and `outcome` holds the HTTP status code and full result or error payload."
+      operationId: getAsynchronousQuery
+      security:
+        - ApiKeyAuth: []
+        - AuthorizationHeader: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: UUIDv4 query identifier returned at query submission.
+          schema:
+            type: string
+            format: uuid
+            example: f47ac10b-58cc-4372-a567-0e02b2c3d479
+        - $ref: "#/components/parameters/DatabaseHeaderRequired"
+        - $ref: "#/components/parameters/DbNameHeader"
+      responses:
+        "200":
+          description: Query status or finalized outcome.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AsyncQueryStatusResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+    delete:
+      tags:
+        - Asynchronous Query Management
+      summary: Delete finalized asynchronous query record
+      description: Deletes a finalized asynchronous query record from storage. Cannot delete while the query is actively running (returns `409 QUERY_IN_PROGRESS`). After deletion, subsequent lookups return `404 QUERY_NOT_FOUND`.
+      operationId: deleteAsynchronousQuery
+      security:
+        - ApiKeyAuth: []
+        - AuthorizationHeader: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: UUIDv4 query identifier.
+          schema:
+            type: string
+            format: uuid
+            example: f47ac10b-58cc-4372-a567-0e02b2c3d479
+        - $ref: "#/components/parameters/DatabaseHeaderRequired"
+        - $ref: "#/components/parameters/DbNameHeader"
+      responses:
+        "200":
+          description: Query record deleted.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - success
+                  - queryId
+                properties:
+                  success:
+                    type: boolean
+                    const: true
+                    example: true
+                  queryId:
+                    type: string
+                    format: uuid
+                    example: f47ac10b-58cc-4372-a567-0e02b2c3d479
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+  /transaction:
+    post:
+      tags:
+        - Transaction Management
+      summary: Create a queued interactive transaction
+      description: |-
+        Initializes an in-memory interactive transaction queue. Returns `201 Created` with a `transactionId`.
+
+        ### Queued Transaction Workflow
+        1. Call `POST /transaction` (or `/transaction/create`) to get a `transactionId`.
+        2. Add statements one by one with `POST /transaction/add` passing the `transaction-id` header.
+        3. Commit all queued statements atomically on a single PostgreSQL connection by sending `{"query":"COMMIT"}` to `POST /transaction/add`.
+        4. If any statement fails, PostgreSQL rolls back, returns the failing `queryId`, and restores the transaction to `pending` state for edit or retry.
+
+        Queues live in process memory, hold up to 100 statements (256 KiB), and expire 15 minutes after creation or last edit.
+      operationId: createQueuedTransaction
+      security:
+        - ApiKeyAuth: []
+        - AuthorizationHeader: []
+      parameters:
+        - $ref: "#/components/parameters/DatabaseHeaderRequired"
+        - $ref: "#/components/parameters/DbNameHeader"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueuedTransactionCreateRequest"
+            example:
+              options:
+                isolationLevel: serializable
+                readOnly: false
+      responses:
+        "201":
+          description: Transaction queue initialized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueuedTransactionCreateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+    get:
+      tags:
+        - Transaction Management
+      summary: Look up transaction by header or look up containing transaction by query ID
+      description: Looks up transaction status by `transaction-id` or `x-transaction-id` header. Alternatively, looks up the containing queued transaction by `query-id` header, `x-query-id` header, or `?queryId=...` query parameter.
+      operationId: getTransactionByHeaderOrQuery
+      security:
+        - ApiKeyAuth: []
+        - AuthorizationHeader: []
+      parameters:
+        - $ref: "#/components/parameters/TransactionIdHeader"
+        - $ref: "#/components/parameters/XTransactionIdHeader"
+        - $ref: "#/components/parameters/QueryIdHeader"
+        - $ref: "#/components/parameters/XQueryIdHeader"
+        - $ref: "#/components/parameters/QueryIdQueryParam"
+        - $ref: "#/components/parameters/DatabaseHeaderRequired"
+        - $ref: "#/components/parameters/DbNameHeader"
+      responses:
+        "200":
+          description: Transaction details (in-memory queue or stored batch).
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/QueuedTransactionStatusResponse"
+                  - $ref: "#/components/schemas/BatchTransactionStatusResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "410":
+          $ref: "#/components/responses/GoneError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+    delete:
+      tags:
+        - Transaction Management
+      summary: Delete transaction via header
+      description: Discards an in-memory queued transaction or deletes a finalized stored batch transaction identified by the `transaction-id` or `x-transaction-id` header.
+      operationId: deleteTransactionByHeader
+      security:
+        - ApiKeyAuth: []
+        - AuthorizationHeader: []
+      parameters:
+        - $ref: "#/components/parameters/TransactionIdHeader"
+        - $ref: "#/components/parameters/XTransactionIdHeader"
+        - $ref: "#/components/parameters/DatabaseHeaderRequired"
+        - $ref: "#/components/parameters/DbNameHeader"
+      responses:
+        "200":
+          description: Transaction deleted or discarded.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - success
+                  - transactionId
+                properties:
+                  success:
+                    type: boolean
+                    const: true
+                    example: true
+                  transactionId:
+                    type: string
+                    format: uuid
+                    example: c79ef201-9a43-4c90-9c23-7fa54d9c72e1
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "410":
+          $ref: "#/components/responses/GoneError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+  /transaction/create:
+    post:
+      tags:
+        - Transaction Management
+      summary: Create a queued interactive transaction (alias)
+      description: Alias for `POST /transaction`.
+      operationId: createQueuedTransactionAlias
+      security:
+        - ApiKeyAuth: []
+        - AuthorizationHeader: []
+      parameters:
+        - $ref: "#/components/parameters/DatabaseHeaderRequired"
+        - $ref: "#/components/parameters/DbNameHeader"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueuedTransactionCreateRequest"
+      responses:
+        "201":
+          description: Transaction queue initialized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueuedTransactionCreateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+  /transaction/execute:
+    post:
+      tags:
+        - Transaction Management
+      summary: Execute single-request atomic batch transaction
+      description: |-
+        Accepts 1 to 100 SQL statements executed in an atomic transaction batch on a single dedicated PostgreSQL connection.
+
+        ### Features & Guarantees
+        - **Atomic Execution**: Runs all statements in an ordered sequence within a single transaction boundary. Outer `BEGIN` and `COMMIT` statements are automatically stripped if present.
+        - **Asynchronous Acceptance**: Returns `202 Accepted` with `Location: /transaction/{transactionId}` to poll progress and final outcomes.
+        - **Idempotency Guarantees**: Pass `Idempotency-Key` (1 to 128 characters: letters, digits, or `._~-`). Retrying with the exact same canonical inputs returns `200 OK` with the original transaction ID and live status. Reusing a key with different SQL or options returns `409 IDEMPOTENCY_KEY_CONFLICT`.
+        - **Tombstones**: When a finalized keyed batch is deleted or pruned, a tombstone is retained. Subsequent replays or status checks return `410 TRANSACTION_RECORD_REMOVED`.
+        - **Concurrency & Timeouts**: Up to 32 concurrent active batches per gateway process with a strict 60-second total execution deadline.
+      operationId: executeBatchTransaction
+      security:
+        - ApiKeyAuth: []
+        - AuthorizationHeader: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
+        - $ref: "#/components/parameters/DatabaseHeaderRequired"
+        - $ref: "#/components/parameters/DbNameHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BatchExecuteRequest"
+            example:
+              queries:
+                - query: INSERT INTO users(name) VALUES ($1)
+                  parameters:
+                    - Alice
+                - query: UPDATE stats SET users = users + 1
+              options:
+                isolationLevel: serializable
+                readOnly: false
+      responses:
+        "200":
+          description: "Idempotent replay: original batch execution record matching the Idempotency-Key."
+          headers:
+            Location:
+              $ref: "#/components/headers/Location"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchTransactionReplayResponse"
+        "202":
+          description: Batch transaction accepted for asynchronous atomic execution.
+          headers:
+            Location:
+              $ref: "#/components/headers/Location"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchExecuteAcceptedResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "410":
+          $ref: "#/components/responses/GoneError"
+        "413":
+          $ref: "#/components/responses/PayloadTooLargeError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+  /transaction/add:
+    post:
+      tags:
+        - Transaction Management
+      summary: Add statement to queued transaction or commit transaction
+      description: |-
+        Appends a SQL statement to a pending queued transaction, OR executes and commits the entire queue if `{"query":"COMMIT"}` is sent.
+
+        ### Dual Behavior
+        - **Append Statement**: Send SQL query and parameters with `transaction-id` header. Returns `201 Created` with `transactionId` and unique `queryId`.
+        - **Commit Queue**: Send `{"query": "COMMIT"}` (or plain string `"COMMIT"`) with `transaction-id` header. The gateway acquires a PostgreSQL connection, issues `BEGIN` with configured modes, executes every queued statement sequentially on the same connection, and commits. Returns `200 OK` with an array of result objects containing `queryId` and row data.
+        - **Rollback on Error**: If any statement fails during commit, the transaction rolls back, returns the failing `queryId` with error diagnostics, and resets transaction status to `pending` so statements can be adjusted and retried.
+      operationId: addTransactionStatementOrCommit
+      security:
+        - ApiKeyAuth: []
+        - AuthorizationHeader: []
+      parameters:
+        - name: transaction-id
+          in: header
+          required: true
+          description: Interactive transaction queue ID.
+          schema:
+            type: string
+            format: uuid
+            example: b19df3e4-6a2c-47ea-9528-98e3b52a1294
+        - $ref: "#/components/parameters/XTransactionIdHeader"
+        - $ref: "#/components/parameters/DatabaseHeaderRequired"
+        - $ref: "#/components/parameters/DbNameHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddStatementRequest"
+            examples:
+              addStatement:
+                summary: Add parameterized statement
+                value:
+                  query: UPDATE accounts SET balance = balance - $1 WHERE id = $2
+                  parameters:
+                    - 150
+                    - 10042
+              commitTransaction:
+                summary: Commit transaction queue
+                value:
+                  query: COMMIT
+      responses:
+        "200":
+          description: Transaction successfully committed (returned when query is COMMIT).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueuedTransactionCommitResult"
+        "201":
+          description: Statement successfully queued in transaction (returned for normal SQL).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AddStatementResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "413":
+          $ref: "#/components/responses/PayloadTooLargeError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+        "504":
+          $ref: "#/components/responses/GatewayTimeoutError"
+  /transaction/remove:
+    post:
+      tags:
+        - Transaction Management
+      summary: Remove statement from queued transaction
+      description: Removes an uncommitted statement from a pending queued transaction. The statement to remove is identified by `queryId` passed in the `query-id` header, `x-query-id` header, or body `{ queryId }`.
+      operationId: removeTransactionStatement
+      security:
+        - ApiKeyAuth: []
+        - AuthorizationHeader: []
+      parameters:
+        - name: transaction-id
+          in: header
+          required: true
+          description: Interactive transaction queue ID.
+          schema:
+            type: string
+            format: uuid
+            example: b19df3e4-6a2c-47ea-9528-98e3b52a1294
+        - $ref: "#/components/parameters/XTransactionIdHeader"
+        - $ref: "#/components/parameters/QueryIdHeader"
+        - $ref: "#/components/parameters/XQueryIdHeader"
+        - $ref: "#/components/parameters/DatabaseHeaderRequired"
+        - $ref: "#/components/parameters/DbNameHeader"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RemoveStatementRequest"
+            example:
+              queryId: 2a7b1c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d
+      responses:
+        "200":
+          description: Statement removed from queue.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RemoveStatementResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+    delete:
+      tags:
+        - Transaction Management
+      summary: Remove statement from queued transaction (alias)
+      description: DELETE alias for `POST /transaction/remove`.
+      operationId: deleteTransactionStatementAlias
+      security:
+        - ApiKeyAuth: []
+        - AuthorizationHeader: []
+      parameters:
+        - name: transaction-id
+          in: header
+          required: true
+          description: Interactive transaction queue ID.
+          schema:
+            type: string
+            format: uuid
+            example: b19df3e4-6a2c-47ea-9528-98e3b52a1294
+        - $ref: "#/components/parameters/XTransactionIdHeader"
+        - $ref: "#/components/parameters/QueryIdHeader"
+        - $ref: "#/components/parameters/XQueryIdHeader"
+        - $ref: "#/components/parameters/DatabaseHeaderRequired"
+        - $ref: "#/components/parameters/DbNameHeader"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RemoveStatementRequest"
+      responses:
+        "200":
+          description: Statement removed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RemoveStatementResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+  /transaction/{id}:
+    get:
+      tags:
+        - Transaction Management
+      summary: Get queued transaction details or poll batch transaction status by path ID
+      description: Retrieves details of an in-memory queued transaction (pending statements and status) OR polls the execution progress and final outcome of an asynchronous batch transaction submitted via `/transaction/execute`.
+      operationId: getTransactionById
+      security:
+        - ApiKeyAuth: []
+        - AuthorizationHeader: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Transaction UUID.
+          schema:
+            type: string
+            format: uuid
+            example: c79ef201-9a43-4c90-9c23-7fa54d9c72e1
+        - $ref: "#/components/parameters/DatabaseHeaderRequired"
+        - $ref: "#/components/parameters/DbNameHeader"
+      responses:
+        "200":
+          description: Transaction state and progress or outcome.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/QueuedTransactionStatusResponse"
+                  - $ref: "#/components/schemas/BatchTransactionStatusResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "410":
+          $ref: "#/components/responses/GoneError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+    delete:
+      tags:
+        - Transaction Management
+      summary: Discard queued transaction or delete finalized batch transaction record
+      description: Discards an in-memory queued transaction, or permanently deletes a finalized batch transaction record from PostgreSQL storage. If the batch has an idempotency key, leaves an idempotency tombstone. Cannot delete a transaction actively committing or executing.
+      operationId: deleteTransactionById
+      security:
+        - ApiKeyAuth: []
+        - AuthorizationHeader: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Transaction UUID to delete.
+          schema:
+            type: string
+            format: uuid
+            example: c79ef201-9a43-4c90-9c23-7fa54d9c72e1
+        - $ref: "#/components/parameters/DatabaseHeaderRequired"
+        - $ref: "#/components/parameters/DbNameHeader"
+      responses:
+        "200":
+          description: Transaction deleted or discarded.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - success
+                  - transactionId
+                properties:
+                  success:
+                    type: boolean
+                    const: true
+                    example: true
+                  transactionId:
+                    type: string
+                    format: uuid
+                    example: c79ef201-9a43-4c90-9c23-7fa54d9c72e1
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "410":
+          $ref: "#/components/responses/GoneError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
