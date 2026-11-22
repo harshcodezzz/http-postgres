@@ -1,12 +1,15 @@
 # Architecture
 
-HTTP PostgreSQL Gateway is a single Node.js service that separates administrative database access from client query access. API-key scopes are translated into PostgreSQL roles, so PostgreSQL remains the final authorization boundary for SQL execution.
+HTTP PostgreSQL Gateway is a persistent bridge between HTTP-only runtimes and PostgreSQL. Serverless and edge clients make stateless HTTPS requests while the gateway maintains reusable PostgreSQL connections on a network where TCP or Unix-socket database access is available.
+
+The service also separates administrative database access from client query access. API-key scopes are translated into PostgreSQL roles, so PostgreSQL remains the final authorization boundary for SQL execution.
 
 ## Component overview
 
 ```text
-HTTP client
+Serverless / edge / HTTP-only client
     |
+    | HTTPS + JSON
     v
 Fastify server
     |-- authentication and rate limiting
@@ -14,8 +17,8 @@ Fastify server
     |-- query routes
     `-- transaction routes
           |
-          +--> PostgreSQL admin pool
-          +--> per-key query pools
+          +--> PostgreSQL admin pool -----+
+          +--> per-key query pools -------+--> PostgreSQL over TCP or Unix socket
           +--> Redis or in-memory rate-limit store
           +--> JSON metadata store + SQLite lock
           `--> SQLite analytics worker
@@ -24,6 +27,8 @@ Fastify server
 ### HTTP layer
 
 Fastify owns request parsing, compression, routing, error responses, and lifecycle hooks. Authentication runs before protected routes. Public access is limited to `GET` and `HEAD /health`.
+
+The caller does not need a PostgreSQL driver or socket API. It must be able to keep the HTTP request open for the selected execution mode, or submit asynchronous work and poll later.
 
 ### Administrative PostgreSQL pool
 

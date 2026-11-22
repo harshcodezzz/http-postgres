@@ -1,10 +1,12 @@
 # Deployment
 
-This guide covers the operational requirements for a persistent deployment. The gateway can run as a system service or container, but the repository does not prescribe a particular platform.
+This guide covers the operational requirements for the persistent side of a serverless architecture. The gateway can run as a system service or container, but the repository does not prescribe a particular platform.
 
 ## Recommended topology
 
-Place a TLS-terminating reverse proxy or load balancer in front of one or more gateway processes. Keep PostgreSQL and Redis on private networks. Restrict administrative routes to an operator network even when query routes are externally reachable.
+Place a TLS-terminating reverse proxy or load balancer in front of one or more long-running gateway processes. Serverless callers reach the public query endpoint over HTTPS; the gateway reaches PostgreSQL over private TCP or a Unix socket. Keep PostgreSQL and Redis on private networks. Restrict administrative routes to an operator network even when query routes are externally reachable.
+
+Do not run a fresh gateway inside each serverless invocation. Its value comes from maintaining connection pools and durable operational state outside short-lived functions.
 
 For the simplest reliable deployment, start with one gateway process, one persistent runtime-data volume, PostgreSQL, and Redis. Add replicas only after accounting for process-local queued transactions, local metadata locking, analytics aggregation, and rate-limit sharing.
 

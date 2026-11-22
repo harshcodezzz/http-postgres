@@ -1,14 +1,32 @@
 # HTTP PostgreSQL Gateway
 
-Expose PostgreSQL through a small, self-hosted HTTP API with database-aware API keys, table-level CRUD scopes, synchronous and asynchronous execution, and transaction workflows.
+Use PostgreSQL from serverless and edge runtimes over ordinary HTTP—without opening a TCP connection, shipping a native database driver, or relying on Unix sockets.
+
+HTTP PostgreSQL Gateway is a self-hosted bridge that runs close to PostgreSQL and exposes scoped query and transaction APIs to environments that can call `fetch()` but cannot connect to PostgreSQL directly.
 
 > [!IMPORTANT]
 > This project executes SQL supplied by authenticated clients. Treat it as privileged infrastructure: deploy it on a trusted network, use TLS at the edge, and grant every API key only the PostgreSQL privileges it needs.
 
-## Why HTTP PostgreSQL Gateway?
+## PostgreSQL for HTTP-only runtimes
 
-The gateway is useful when an application or automation client needs controlled PostgreSQL access but cannot—or should not—hold a direct database connection.
+Many serverless, edge, browser-like, workflow, and sandboxed runtimes allow outbound HTTPS but do not support PostgreSQL's long-lived TCP protocol or local Unix sockets. Even where raw sockets exist, short-lived invocations can make connection setup and pool management inefficient.
 
+Run the gateway as persistent infrastructure on the same private network as PostgreSQL. Serverless clients send authenticated HTTPS requests; the gateway owns PostgreSQL connections and reuses them safely.
+
+```text
+Serverless / edge function
+        |
+        | HTTPS + API key
+        v
+HTTP PostgreSQL Gateway
+        |
+        | pooled TCP or Unix-socket connections
+        v
+    PostgreSQL
+```
+
+- **Works with `fetch()`** — callers need only standard JSON-over-HTTP support, not `pg`, libpq, native modules, raw sockets, or a persistent process.
+- **Connection pooling outside the function** — keep PostgreSQL sessions in a long-running gateway instead of creating a new connection for every cold start or invocation.
 - **Scoped credentials** — issue revocable API keys restricted to databases, tables, and CRUD operations.
 - **PostgreSQL-enforced access** — scoped keys run through dedicated PostgreSQL login roles rather than relying only on application checks.
 - **Flexible execution** — run immediate queries, persistent asynchronous queries, atomic batches, or editable queued transactions.
@@ -16,11 +34,22 @@ The gateway is useful when an application or automation client needs controlled 
 - **Lossless results** — preserve precision-sensitive PostgreSQL values as text, with an opt-in legacy conversion mode.
 - **Self-hosted state** — use PostgreSQL for durable execution records, a local JSON store for key metadata, SQLite for analytics, and optional Redis for distributed rate limits.
 
-## Requirements
+## Good fit
+
+- Edge functions without raw TCP socket support
+- Serverless functions where a database driver or connection pool is impractical
+- Sandboxed jobs, workflow engines, low-code tools, and automation platforms that support webhooks or HTTP actions
+- Services that need centrally managed, revocable PostgreSQL access without distributing database passwords
+
+This is not an ORM, a PostgreSQL wire-protocol proxy, or a replacement for direct connections in a conventional long-running backend. If an application already runs beside PostgreSQL and can manage a native pool safely, a direct driver will usually be simpler and faster.
+
+## Gateway requirements
 
 - Node.js `22.13+` on the 22.x line, or Node.js `23.4+`, with `node:sqlite` enabled
 - PostgreSQL
 - Redis when `redis.enabled` is `true` (the default)
+
+The serverless caller only needs outbound HTTPS and support for JSON requests.
 
 ## Quick start
 
@@ -81,6 +110,33 @@ curl --fail-with-body http://localhost:8080/query \
 
 API keys can also be sent as the raw `Authorization` value. Do not add a `Bearer` prefix.
 
+### Call it from a serverless function
+
+The same API works anywhere a standards-compatible `fetch()` is available:
+
+```ts
+export async function getMessage(id: number) {
+  const response = await fetch(`${process.env.PG_GATEWAY_URL}/query`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": process.env.PG_GATEWAY_API_KEY!,
+      "x-database": "gateway_demo",
+    },
+    body: JSON.stringify({
+      query: "SELECT id, message FROM public.messages WHERE id = $1",
+      parameters: [id],
+    }),
+  });
+
+  const payload = await response.json();
+  if (!response.ok) throw new Error(`Gateway request failed: ${response.status}`);
+  return payload;
+}
+```
+
+Store the gateway URL and API key in the platform's secret manager. Never embed a gateway key in public browser code. See [Serverless integration](docs/serverless.md) for timeouts, retries, credential handling, and execution-mode guidance.
+
 ## Execution modes
 
 | Mode | Endpoint | Best for |
@@ -98,6 +154,7 @@ See [Routes and API behavior](docs/routes.md) for request formats, response sema
 | --- | --- |
 | [Documentation index](docs/README.md) | Reading paths and the complete documentation map |
 | [Getting started](docs/getting-started.md) | Local setup, PostgreSQL preparation, API-key creation, and a first query |
+| [Serverless integration](docs/serverless.md) | `fetch()` usage, credentials, timeouts, retries, and execution-mode selection |
 | [Configuration](docs/configuration.md) | Environment variables, YAML settings, connection pools, and runtime files |
 | [API routes](docs/routes.md) | Queries, transactions, administration, authentication, errors, and limits |
 | [Architecture](docs/architecture.md) | Components, request flow, state ownership, and execution lifecycle |
@@ -136,6 +193,7 @@ Review [Configuration](docs/configuration.md) before changing pool sizes or enab
 
 ## Production notes
 
+- Deploy the gateway as long-running infrastructure near PostgreSQL; do not start a gateway instance inside every serverless invocation.
 - Terminate TLS at a trusted reverse proxy or load balancer; the server does not configure HTTPS itself.
 - Do not expose administrator routes to the public internet. Apply network controls in addition to the `x-admin` credential.
 - Persist and back up `data/data.json`. Losing it loses API-key metadata and the secret used for scoped PostgreSQL roles.

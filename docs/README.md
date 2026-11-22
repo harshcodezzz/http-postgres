@@ -1,6 +1,6 @@
 # Documentation
 
-This directory contains the operator and developer documentation for HTTP PostgreSQL Gateway.
+This directory documents how to connect HTTP-only serverless and edge workloads to PostgreSQL through a persistent gateway, and how to operate that gateway safely.
 
 ## Choose a path
 
@@ -19,9 +19,10 @@ This directory contains the operator and developer documentation for HTTP Postgr
 
 ### I want to integrate a client
 
-1. Read authentication and execution behavior in [API routes](routes.md).
-2. Import [`openapi.yaml`](../openapi.yaml) or [`openapi.json`](../openapi.json) into your API tooling.
-3. Pay special attention to outcome-unknown errors before implementing automatic retries.
+1. Start with [Serverless integration](serverless.md) for a `fetch()` example and deployment-specific concerns.
+2. Read authentication and execution behavior in [API routes](routes.md).
+3. Import [`openapi.yaml`](../openapi.yaml) or [`openapi.json`](../openapi.json) into your API tooling.
+4. Pay special attention to outcome-unknown errors before implementing automatic retries.
 
 ### I want to contribute
 
@@ -34,6 +35,7 @@ This directory contains the operator and developer documentation for HTTP Postgr
 | Document | Audience | Purpose |
 | --- | --- | --- |
 | [Getting started](getting-started.md) | New users | Go from a clean checkout to the first authenticated query |
+| [Serverless integration](serverless.md) | Serverless developers | Call PostgreSQL through `fetch()` and handle secrets, timeouts, and retries |
 | [Configuration](configuration.md) | Operators | Complete environment and YAML reference, pool behavior, and runtime files |
 | [API routes](routes.md) | Client developers | Request and response contracts, transactions, administration, and errors |
 | [Architecture](architecture.md) | Operators and contributors | Component boundaries, state stores, and request lifecycles |

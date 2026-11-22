@@ -1,6 +1,8 @@
 # Getting started
 
-This guide starts a local gateway, prepares an isolated PostgreSQL database, creates a least-privilege API key, and runs a query.
+This guide starts a local gateway, prepares an isolated PostgreSQL database, creates a least-privilege API key, and runs the same HTTP request a serverless function can make with `fetch()`.
+
+The gateway process needs network access to PostgreSQL. Your serverless or edge application does not: it connects to the gateway over HTTPS.
 
 ## 1. Check prerequisites
 
@@ -129,6 +131,7 @@ It reports PostgreSQL, key-value storage, local metadata, and query-connection c
 
 ## Next steps
 
+- Integrate an HTTP-only runtime with [Serverless integration](serverless.md).
 - Explore immediate, async, batch, and queued execution in [API routes](routes.md).
 - Review every setting in [Configuration](configuration.md).
 - Read [Security](security.md) before exposing the service outside a development machine.
