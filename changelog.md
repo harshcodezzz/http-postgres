@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Preserved pre-dispatch execution-limit errors in transaction commits, including `503 RESULT_MEMORY_BUSY`, instead of converting them to `400 QUERY_EXECUTION_ERROR`. Asynchronous transaction batches now classify these capacity failures as `failed` rather than `rejected`.
+
 ## 1.6.0 - 2026-11-22
 
 ### Added

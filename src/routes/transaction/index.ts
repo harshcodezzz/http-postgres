@@ -6,7 +6,7 @@ import { DatabaseError as PostgresError, type PoolClient, type QueryResult } fro
 import { isReadOnlySqlAllowed, isScopedStatement } from "../../utils/sql-policy.js";
 import { queryConnectionError, queryExecutionError } from "../../utils/query-pool.js";
 import type { QueryAnalytics } from "../../utils/query-analytics.js";
-import { createResultBudget, hasAssignedTransactionId, losslessTypes, watchExecution, type ResultStatement } from "../query/execution.js";
+import { createResultBudget, ExecutionStopped, hasAssignedTransactionId, losslessTypes, watchExecution, type ResultStatement } from "../query/execution.js";
 import { formatQueryResult } from "../query/index.js";
 import { beginStatement, transactionOptions, type TransactionOptions } from "../query/options.js";
 
@@ -337,6 +337,9 @@ const transactionRoutes: FastifyPluginAsync<{ store: ExecutionStore; analytics?:
       if (execution.stopped) {
         const { status, code, message } = execution.stopped;
         return recordFailure(failure(status, code, message));
+      }
+      if (error instanceof ExecutionStopped) {
+        return recordFailure(failure(error.status, error.code, error.message));
       }
       if (storeFailed) {
         fastify.log.error({ err: error, transactionId: transaction.transactionId }, "Could not update transaction progress");
