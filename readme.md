@@ -112,7 +112,7 @@ API keys can also be sent as the raw `Authorization` value. Do not add a `Bearer
 
 ### Call it from a serverless function
 
-The same API works anywhere a standards-compatible `fetch()` is available:
+The same API works in serverless runtimes with a standards-compatible `fetch()`. This Node-style example uses environment variables; adapt secret access to your platform:
 
 ```ts
 export async function getMessage(id: number) {
@@ -143,7 +143,7 @@ Store the gateway URL and API key in the platform's secret manager. Never embed 
 | --- | --- | --- |
 | Immediate query | `POST /query` | Interactive reads and short operations that need an immediate response |
 | Asynchronous query | `POST /query` with `type: "async"` | Longer work that should be polled by ID |
-| Atomic batch | `POST /transaction/run` | A complete set of statements submitted together and committed atomically |
+| Atomic batch | `POST /transaction/execute` | A complete set of statements submitted together and committed atomically |
 | Queued transaction | `POST /transaction`, then `/transaction/add` | Building and editing a transaction incrementally before commit |
 
 See [Routes and API behavior](docs/routes.md) for request formats, response semantics, limits, status polling, administration endpoints, and error codes. Machine-readable contracts are available as [OpenAPI YAML](openapi.yaml) and [OpenAPI JSON](openapi.json).

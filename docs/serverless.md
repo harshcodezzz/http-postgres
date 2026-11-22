@@ -45,7 +45,7 @@ export async function queryPostgres(
   parameters: unknown[] = [],
 ): Promise<GatewayQuery> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 34_000);
+  const timeout = setTimeout(() => controller.abort(), 36_000);
 
   try {
     const response = await fetch(`${process.env.PG_GATEWAY_URL}/query`, {
@@ -70,7 +70,7 @@ export async function queryPostgres(
 }
 ```
 
-The example uses a client deadline shorter than the immediate-query response deadline. Choose a value that also fits the serverless platform's maximum invocation duration and leaves time for your function to handle the response.
+The example gives the gateway's 35-second immediate-response deadline time to return a structured outcome before the client aborts. The serverless invocation itself must allow additional time for your function to handle that response. If the platform cannot provide that window, use asynchronous execution instead of shortening the client deadline for writes.
 
 ## Credential handling
 
