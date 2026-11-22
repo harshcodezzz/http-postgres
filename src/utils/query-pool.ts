@@ -6,8 +6,9 @@ import { scopedInheritanceSafety, scopedQueryUrl, scopedRoleSafety, type QueryAc
 import { DatabaseError, getPostgresDatabaseOid } from "./pg-database.js";
 
 const connectionTimeoutMillis = 5_000;
-const checkoutTimeoutMillis = 400;
-const growthIntervalMillis = 50;
+const checkoutTimeoutMillis = 5_000;
+const growthIntervalMillis = 0;
+const maxConcurrentOpenings = 4;
 const statementTimeoutMillis = 30_000;
 const queryTimeoutMillis = 35_000;
 // Only a verified address and PostgreSQL system identifier may release a slot
@@ -47,7 +48,7 @@ interface ManagedPool {
   pool: Pool;
   waiters: Set<CheckoutWaiter>;
   nextOpeningAt: number;
-  opening: boolean;
+  openingCount: number;
   reclaiming: boolean;
   scheduled: boolean;
   retired: boolean;
@@ -311,35 +312,30 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
         if (pool.idleCount <= pool.waitingCount) break;
         void lend(waiter);
       }
-      const next = waiters.values().next().value;
-      if (!next || state.opening || pool.totalCount >= config.database.pool.max) return;
-      const wait = state.nextOpeningAt - performance.now();
-      if (wait > 0) {
-        state.growthTimer ??= setTimeout(() => {
-          state.growthTimer = undefined;
-          wake(state);
-        }, Math.ceil(wait)).unref();
-        return;
-      }
-      if (queryConnections >= config.database.pool.maxGlobalQueries) {
-        if (!state.reclaiming) {
-          state.reclaiming = true;
-          void reclaimIdleConnection(pool).then((reclaimed) => {
-            state.reclaiming = false;
-            if (reclaimed) wake(state);
-          }, (err) => {
-            state.reclaiming = false;
-            log.warn({ err }, "Could not reclaim an idle PostgreSQL query connection");
-          });
+      if (pool.totalCount + state.openingCount >= config.database.pool.max) return;
+      while (state.openingCount < maxConcurrentOpenings && (pool.totalCount + state.openingCount) < config.database.pool.max) {
+        const waiterToGrow = Array.from(state.waiters)[state.openingCount];
+        if (!waiterToGrow) break;
+        if (queryConnections + state.openingCount >= config.database.pool.maxGlobalQueries) {
+          if (!state.reclaiming) {
+            state.reclaiming = true;
+            void reclaimIdleConnection(pool).then((reclaimed) => {
+              state.reclaiming = false;
+              if (reclaimed) wake(state);
+            }, (err) => {
+              state.reclaiming = false;
+              log.warn({ err }, "Could not reclaim an idle PostgreSQL query connection");
+            });
+          }
+          break;
         }
-        return;
+        state.openingCount++;
+        state.nextOpeningAt = performance.now() + growthIntervalMillis;
+        void grow(state, waiterToGrow).finally(() => {
+          state.openingCount--;
+          wake(state);
+        });
       }
-      state.opening = true;
-      state.nextOpeningAt = performance.now() + growthIntervalMillis;
-      void grow(state, next).finally(() => {
-        state.opening = false;
-        wake(state);
-      });
     });
   }
 
@@ -375,7 +371,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
           rejectionsAtLimit++;
           code = "QUERY_CONNECTION_LIMIT";
         }
-        waiter.fail(new DatabaseError("Timed out after 400 ms waiting for a PostgreSQL query connection", code));
+        waiter.fail(new DatabaseError(`Timed out after ${checkoutTimeoutMillis} ms waiting for a PostgreSQL query connection`, code));
       }
 
       const waiter: CheckoutWaiter = {
@@ -484,7 +480,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
         Client: BudgetedClient,
         pipeline: false,
         max: config.database.pool.max,
-        min: access ? 0 : config.database.pool.queryMin,
+        min: access ? Math.min(config.database.pool.queryMin, 5) : config.database.pool.queryMin,
         idleTimeoutMillis: 30_000,
         keepAlive: true,
         connectionTimeoutMillis,
@@ -492,7 +488,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
       });
       const managed: ManagedPool = {
         pool, waiters: new Set(), nextOpeningAt: 0,
-        opening: false, reclaiming: false, scheduled: false, retired: false,
+        openingCount: 0, reclaiming: false, scheduled: false, retired: false,
       };
       const checkedOutError = (err: Error) => log.warn({ err, database }, "Checked-out query connection error");
       pool.on("acquire", (client: PoolClient) => client.on("error", checkedOutError));
