@@ -8,17 +8,31 @@ import { databaseName } from "./query-privileges.js";
 
 loadEnv({ quiet: true });
 
-const ipWhitelistEntry = z.string().refine((entry) => {
-  const separator = entry.lastIndexOf("/");
-  const address = separator < 0 ? entry : entry.slice(0, separator);
-  const version = isIP(address);
-  if (!version) return false;
-  if (separator < 0) return true;
-  const prefix = entry.slice(separator + 1);
-  if (!/^\d+$/.test(prefix)) return false;
-  const bits = Number(prefix);
-  return bits >= 0 && bits <= (version === 4 ? 32 : 128);
-}, "Use an IPv4 or IPv6 address, optionally followed by a valid CIDR prefix");
+function parseWhitelistEntry(raw: string): string {
+  let entry = String(raw).trim();
+  entry = entry.replace(/^https?:\/\//, "");
+  if (entry.toLowerCase() === "localhost") return "127.0.0.1";
+  const ipv4WithPort = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):\d+$/.exec(entry);
+  if (ipv4WithPort) return ipv4WithPort[1];
+  const ipv6WithPort = /^\[([0-9a-fA-F:]+)\]:\d+$/.exec(entry);
+  if (ipv6WithPort) return ipv6WithPort[1];
+  return entry;
+}
+
+const ipWhitelistEntry = z
+  .string()
+  .transform(parseWhitelistEntry)
+  .refine((entry) => {
+    const separator = entry.lastIndexOf("/");
+    const address = separator < 0 ? entry : entry.slice(0, separator);
+    const version = isIP(address);
+    if (!version) return false;
+    if (separator < 0) return true;
+    const prefix = entry.slice(separator + 1);
+    if (!/^\d+$/.test(prefix)) return false;
+    const bits = Number(prefix);
+    return bits >= 0 && bits <= (version === 4 ? 32 : 128);
+  }, "Use an IPv4 or IPv6 address, optionally followed by a valid CIDR prefix");
 
 const configSchema = z
   .object({
