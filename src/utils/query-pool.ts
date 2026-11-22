@@ -35,6 +35,7 @@ interface BackendSession {
   observerIdentity: string | null;
   idle: boolean;
   ownerId?: string;
+  lastObservedAt?: number;
 }
 
 interface CheckoutWaiter {
@@ -458,19 +459,23 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
   }
 
   async function observeServer(session: Omit<BackendSession, "idle" | "observerIdentity">, opening: boolean) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const { rows: [observer] } = await adminDb.query<{ verified: boolean; identity: string | null }>(`
-        SELECT EXTRACT(EPOCH FROM pg_catalog.pg_postmaster_start_time())::pg_catalog.text = $4 AND EXISTS (
-          SELECT 1 FROM pg_catalog.pg_stat_activity
-          WHERE pid = $1 AND datid = $2::pg_catalog.oid
-            AND ($3::pg_catalog.text IS NULL OR application_name = $3)
-            AND (backend_start IS NULL OR EXTRACT(EPOCH FROM backend_start)::pg_catalog.text = $5)
-        ) AS verified, CASE WHEN $3::pg_catalog.text IS NOT NULL THEN ${observerIdentitySql} END AS identity
-      `, [session.pid, session.oid, opening ? session.applicationName : null, session.serverStartedAt, session.startedAt]);
-      if (observer?.verified) {
-        return observer.identity;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const { rows: [observer] } = await adminDb.query<{ verified: boolean; identity: string | null }>(`
+          SELECT EXTRACT(EPOCH FROM pg_catalog.pg_postmaster_start_time())::pg_catalog.text = $4 AND EXISTS (
+            SELECT 1 FROM pg_catalog.pg_stat_activity
+            WHERE pid = $1 AND datid = $2::pg_catalog.oid
+              AND ($3::pg_catalog.text IS NULL OR application_name = $3)
+              AND (backend_start IS NULL OR EXTRACT(EPOCH FROM backend_start)::pg_catalog.text = $5)
+          ) AS verified, CASE WHEN $3::pg_catalog.text IS NOT NULL THEN ${observerIdentitySql} END AS identity
+        `, [session.pid, session.oid, opening ? session.applicationName : null, session.serverStartedAt, session.startedAt]);
+        if (observer?.verified) {
+          return observer.identity;
+        }
+      } catch (err) {
+        log.warn({ err }, "Observer query failed during backend verification");
       }
-      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 25));
+      if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 30 * (attempt + 1)));
     }
     throw new DatabaseError("The query backend is not on the administrative PostgreSQL server", "QUERY_DATABASE_UNAVAILABLE");
   }
@@ -557,7 +562,8 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
       const previous = backends.get(client);
       const sessionName = previous?.applicationName ?? `http-postgres-${randomUUID()}`;
       queryDispatched(client);
-      const [{ rows: [target] }] = await Promise.all([client.query<Omit<BackendSession, "idle" | "observerIdentity"> & {
+      const needObserve = !previous || (performance.now() - (previous.lastObservedAt ?? 0) > 10_000);
+      const [{ rows: [target] }] = await Promise.all([client.query<Omit<BackendSession, "idle" | "observerIdentity" | "lastObservedAt"> & {
         name: string;
         login: string;
         safe: boolean;
@@ -589,7 +595,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
         JOIN pg_catalog.pg_stat_activity activity ON activity.pid OPERATOR(pg_catalog.=) pg_catalog.pg_backend_pid()
         WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
       `, [adminRoles, sessionName, String(statementTimeoutMs)]),
-      previous && observeServer(previous, false)]);
+      previous && needObserve ? observeServer(previous, false) : undefined]);
       checkPool();
       if (target?.name !== database || !target.safe || (access && target.login !== access.login)) {
         throw new DatabaseError("Query credentials are unavailable for this database", "QUERY_DATABASE_UNAVAILABLE");
@@ -602,10 +608,16 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
             target.serverStartedAt !== previous.serverStartedAt) {
           throw new DatabaseError("The pooled query backend changed", "QUERY_DATABASE_UNAVAILABLE");
         }
+        if (needObserve) previous.lastObservedAt = performance.now();
         return previous;
       }
       const observerIdentity = await observeServer(target, true);
-      const session = { ...target, observerIdentity, idle: client.getTransactionStatus() === "I" };
+      const session = {
+        ...target,
+        observerIdentity,
+        idle: client.getTransactionStatus() === "I",
+        lastObservedAt: performance.now(),
+      };
       // ReadyForQuery distinguishes closed transactions from in-flight or open work.
       client.connection.on("readyForQuery", () => { session.idle = client.getTransactionStatus() === "I"; });
       backends.set(client, session);

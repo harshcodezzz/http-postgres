@@ -11,8 +11,8 @@ database:
   pool:
     min: 2
     queryMin: 2
-    max: 50
-    maxGlobalQueries: 100
+    max: 25
+    maxGlobalQueries: 80
 
 redis:
   enabled: true

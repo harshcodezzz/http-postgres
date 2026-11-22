@@ -14,9 +14,9 @@ const databasePlugin: FastifyPluginAsync = async (app) => {
   const pool = new Pool({
     connectionString: config.database.url,
     min: config.database.pool.min,
-    max: config.database.pool.max,
+    max: Math.min(config.database.pool.max, 10),
     idleTimeoutMillis: 30_000,
-    connectionTimeoutMillis: 5_000,
+    connectionTimeoutMillis: 10_000,
     query_timeout: 30_000,
   });
 
