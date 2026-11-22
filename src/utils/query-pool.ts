@@ -6,7 +6,7 @@ import { scopedInheritanceSafety, scopedQueryUrl, scopedRoleSafety, type QueryAc
 import { DatabaseError, getPostgresDatabaseOid } from "./pg-database.js";
 
 const connectionTimeoutMillis = 10_000;
-const checkoutTimeoutMillis = 5_000;
+const checkoutTimeoutMillis = 10_000;
 const growthIntervalMillis = 0;
 const maxConcurrentOpenings = 4;
 const statementTimeoutMillis = 30_000;
@@ -257,7 +257,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
       for (const state of group.values()) {
         const { pool } = state;
         if (pool === requested || state.retired || state.waiters.size ||
-            pool.totalCount <= (pool.options.min ?? 0) || pool.idleCount <= pool.waitingCount) continue;
+            pool.totalCount <= (pool.options.min ?? 0) || pool.idleCount === 0) continue;
         const client = await pool.connect().catch(() => undefined);
         if (client) {
           if (state.retired || state.waiters.size || pool.totalCount <= (pool.options.min ?? 0)) {
@@ -276,22 +276,35 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
     for (const group of pools.values()) for (const state of group.values()) wake(state);
   }
 
-  async function grow(state: ManagedPool, waiter: CheckoutWaiter) {
+  async function grow(state: ManagedPool) {
     let client: PoolClient | undefined;
-    let session: BackendSession;
     try {
       client = await state.pool.connect();
-      session = await waiter.verify(client);
     } catch (error) {
       client?.release(true);
-      if (state.waiters.has(waiter) && !(error instanceof DatabaseError && error.code === "QUERY_CONNECTION_LIMIT")) {
-        waiter.fail(error);
+      if (!(error instanceof DatabaseError && error.code === "QUERY_CONNECTION_LIMIT")) {
+        const waiter = state.waiters.values().next().value;
+        if (waiter) {
+          state.waiters.delete(waiter);
+          waiter.fail(error);
+        }
       }
       return;
     }
-    // Waiters can use an existing session while the new connection is opening.
-    if (state.waiters.delete(waiter)) await waiter.serve(client, session);
-    else client.release();
+
+    while (state.waiters.size) {
+      const waiter = state.waiters.values().next().value;
+      if (!waiter) break;
+      state.waiters.delete(waiter);
+      try {
+        await waiter.serve(client);
+        return;
+      } catch {
+        continue;
+      }
+    }
+
+    client.release();
   }
 
   function wake(state: ManagedPool) {
@@ -299,39 +312,53 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
     state.scheduled = true;
     queueMicrotask(() => {
       state.scheduled = false;
-      if (closing || state.retired) return;
+      if (closing || state.retired || !state.waiters.size) return;
       const { pool, waiters } = state;
+
       function lend(waiter: CheckoutWaiter) {
         waiters.delete(waiter);
-        return pool.connect().then((client) => waiter.serve(client), (error) => {
-          if (error instanceof DatabaseError && error.code === "QUERY_CONNECTION_LIMIT") waiter.retry();
-          else waiter.fail(error);
-        });
+        return pool.connect().then(
+          (client) => waiter.serve(client),
+          (error) => {
+            if (error instanceof DatabaseError && error.code === "QUERY_CONNECTION_LIMIT") waiter.retry();
+            else waiter.fail(error);
+          },
+        );
       }
-      for (const waiter of waiters) {
-        if (pool.idleCount <= pool.waitingCount) break;
-        void lend(waiter);
+
+      while (waiters.size && pool.idleCount > 0) {
+        const waiter = waiters.values().next().value;
+        if (!waiter) break;
+        lend(waiter);
       }
+
       if (pool.totalCount + state.openingCount >= config.database.pool.max) return;
-      while (state.openingCount < maxConcurrentOpenings && (pool.totalCount + state.openingCount) < config.database.pool.max) {
-        const waiterToGrow = Array.from(state.waiters)[state.openingCount];
-        if (!waiterToGrow) break;
+
+      while (
+        state.openingCount < maxConcurrentOpenings &&
+        state.openingCount < waiters.size &&
+        (pool.totalCount + state.openingCount) < config.database.pool.max
+      ) {
         if (queryConnections + state.openingCount >= config.database.pool.maxGlobalQueries) {
           if (!state.reclaiming) {
             state.reclaiming = true;
-            void reclaimIdleConnection(pool).then((reclaimed) => {
-              state.reclaiming = false;
-              if (reclaimed) wake(state);
-            }, (err) => {
-              state.reclaiming = false;
-              log.warn({ err }, "Could not reclaim an idle PostgreSQL query connection");
-            });
+            void reclaimIdleConnection(pool).then(
+              (reclaimed) => {
+                state.reclaiming = false;
+                if (reclaimed) wake(state);
+              },
+              (err) => {
+                state.reclaiming = false;
+                log.warn({ err }, "Could not reclaim an idle PostgreSQL query connection");
+              },
+            );
           }
           break;
         }
+
         state.openingCount++;
         state.nextOpeningAt = performance.now() + growthIntervalMillis;
-        void grow(state, waiterToGrow).finally(() => {
+        void grow(state).finally(() => {
           state.openingCount--;
           wake(state);
         });
