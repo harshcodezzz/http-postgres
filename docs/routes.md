@@ -113,7 +113,9 @@ If a statement fails, the gateway rolls back and returns the failing `queryId`. 
 | `GET /admin` | Returns the admin service identity. |
 | `GET /admin/health` | Checks PostgreSQL, the key-value store, JsonDB, and query-connection monitoring. Includes query capacity metrics and reports `healthy` or `degraded`. |
 | `GET /admin/logs` | Accepts `type=audit` (default) or `type=system`. `limit` defaults to 100 and is capped at 500. System logs come from the current file. Audit logs include the previous generation when needed. Reads scan up to 1 MiB per file. |
+| `DELETE /admin/logs` | Clears or deletes stored log files from disk. Accepts `type=all` (default), `type=audit`, or `type=system`. Safely truncates active files to keep file streams alive and unlinks rotated archives. Add `?analytics=true` to also clear query analytics. |
 | `GET /admin/analytics` | Returns total and failed query counts, usage by API key ID, and recent failed SQL. `limit` defaults to 50 and is capped at 200. |
+| `DELETE /admin/analytics` | Clears stored query analytics metrics and recent failed queries. |
 | `GET /admin/keys` | Lists API key records. |
 | `GET /admin/keys/:id` | Gets one API key record by its record ID. |
 | `POST /admin/keys` | Creates a key with database and table CRUD scopes. `environment` accepts `LIVE` (default) or `TEST`. Save `data.apiKey` from the creation response. |

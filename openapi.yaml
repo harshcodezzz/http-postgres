@@ -516,6 +516,52 @@ components:
             type: object
             additionalProperties: true
           description: Array of parsed JSON log entries or string message objects.
+    AdminDeleteLogsResponse:
+      type: object
+      required:
+        - success
+        - message
+        - type
+        - clearedFiles
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        message:
+          type: string
+          example: Logs deleted successfully
+        type:
+          type: string
+          enum:
+            - all
+            - audit
+            - system
+          example: all
+        clearedFiles:
+          type: array
+          items:
+            type: string
+          description: List of log files truncated or unlinked.
+          example:
+            - api-keys.log
+            - failed.1.log
+        analyticsCleared:
+          type: boolean
+          example: true
+    AdminClearAnalyticsResponse:
+      type: object
+      required:
+        - success
+        - message
+      properties:
+        success:
+          type: boolean
+          const: true
+          example: true
+        message:
+          type: string
+          example: Query analytics cleared successfully
     CrudOperation:
       type: string
       enum:
@@ -2226,6 +2272,28 @@ paths:
           $ref: "#/components/responses/UnauthorizedError"
         "503":
           $ref: "#/components/responses/ServiceUnavailableError"
+    delete:
+      tags:
+        - Admin Diagnostics
+      summary: Clear query analytics
+      description: Clears stored query execution counters, per-key usage metrics, and recent failed query history.
+      operationId: deleteAdminAnalytics
+      security:
+        - AdminAuth: []
+      responses:
+        "200":
+          description: Query analytics cleared successfully.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/CacheControlNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminClearAnalyticsResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
   /admin/logs:
     get:
       tags:
@@ -2268,6 +2336,45 @@ paths:
           $ref: "#/components/responses/UnauthorizedError"
         "503":
           $ref: "#/components/responses/ServiceUnavailableError"
+    delete:
+      tags:
+        - Admin Diagnostics
+      summary: Delete or clear log files
+      description: Clears or deletes stored log files from disk. Can target audit logs, system logs, or all logs (default). Truncates active files to keep file streams alive without restarting the gateway and deletes rotated archives.
+      operationId: deleteAdminLogs
+      security:
+        - AdminAuth: []
+      parameters:
+        - name: type
+          in: query
+          required: false
+          description: "Log target to delete: `all` (default), `audit`, or `system`."
+          schema:
+            type: string
+            enum:
+              - all
+              - audit
+              - system
+            default: all
+            example: all
+        - name: analytics
+          in: query
+          required: false
+          description: If true, also clear query analytics metrics and failure records.
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Logs successfully deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminDeleteLogsResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
   /admin/keys:
     get:
       tags:

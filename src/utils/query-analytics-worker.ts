@@ -13,6 +13,7 @@ interface StoredBatch { id: string; batch: Batch }
 type Request =
   | { type: "flush"; id: string; batch: Batch }
   | { type: "report"; id: string; limit: number }
+  | { type: "clear"; id: string }
   | { type: "close"; id: string; batch: Batch; deadlineMs: number };
 
 if (!parentPort) throw new Error("Analytics worker requires a parent port");
@@ -225,6 +226,27 @@ port.on("message", (request: Request) => {
       try {
         port.postMessage({ type: "response", id: request.id, result: report(request.limit) });
       } catch (error) {
+        port.postMessage({ type: "response", id: request.id, error: String(error) });
+      }
+      return;
+    }
+    if (request.type === "clear") {
+      pending = [];
+      pendingAcks.clear();
+      const db = openDatabase();
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        db.exec("DELETE FROM failed_queries;");
+        db.exec("DELETE FROM key_usage;");
+        db.exec("DELETE FROM analytics_batches;");
+        db.exec("COMMIT");
+        try { unlinkSync(spoolFile); } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        try { db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); } catch {}
+        port.postMessage({ type: "response", id: request.id, result: { success: true } });
+      } catch (error) {
+        try { db.exec("ROLLBACK"); } catch {}
         port.postMessage({ type: "response", id: request.id, error: String(error) });
       }
       return;

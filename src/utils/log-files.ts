@@ -1,5 +1,5 @@
-import { appendFile, mkdir, open, rename, stat } from "node:fs/promises";
-import { dirname } from "node:path";
+import { appendFile, mkdir, open, readdir, realpath, rename, stat, truncate, unlink } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 
 const auditFileBytes = 5 * 1024 * 1024;
 const tailBytes = 1024 * 1024;
@@ -42,6 +42,78 @@ export function readAuditTail(path: string, limit: number) {
     const previous = await readLogTail(`${path}.1`, limit - current.length);
     return [...previous, ...current];
   });
+}
+
+export async function clearLogFiles(
+  directory: string,
+  type: "all" | "audit" | "system" = "all",
+): Promise<string[]> {
+  const cleared: string[] = [];
+  const auditPath = resolve(directory, "api-keys.log");
+  const currentLog = resolve(directory, "current.log");
+
+  if (type === "all" || type === "audit") {
+    await withAuditFile(auditPath, async () => {
+      try {
+        await truncate(auditPath, 0);
+        cleared.push("api-keys.log");
+      } catch (error: unknown) {
+        if (!isMissing(error)) throw error;
+      }
+      try {
+        await unlink(`${auditPath}.1`);
+        cleared.push("api-keys.log.1");
+      } catch (error: unknown) {
+        if (!isMissing(error)) throw error;
+      }
+    });
+  }
+
+  if (type === "all" || type === "system") {
+    let activeTargetPath: string | null = null;
+    try {
+      activeTargetPath = await realpath(currentLog);
+    } catch (error: unknown) {
+      if (!isMissing(error)) throw error;
+    }
+
+    if (activeTargetPath) {
+      try {
+        await truncate(activeTargetPath, 0);
+        cleared.push(basename(activeTargetPath));
+      } catch (error: unknown) {
+        if (!isMissing(error)) throw error;
+      }
+    }
+
+    try {
+      const entries = await readdir(directory);
+      for (const entry of entries) {
+        if (entry.startsWith("api-keys.log")) continue;
+        if (entry === "current.log") continue;
+        const fullPath = join(directory, entry);
+        if (activeTargetPath && resolve(fullPath) === resolve(activeTargetPath)) continue;
+
+        if (
+          entry.endsWith(".log") ||
+          entry.includes(".log.") ||
+          entry.startsWith("failed.") ||
+          entry.startsWith("gateway.")
+        ) {
+          try {
+            await unlink(fullPath);
+            cleared.push(entry);
+          } catch (error: unknown) {
+            if (!isMissing(error)) throw error;
+          }
+        }
+      }
+    } catch (error: unknown) {
+      if (!isMissing(error)) throw error;
+    }
+  }
+
+  return [...new Set(cleared)];
 }
 
 export async function readLogTail(path: string, limit: number): Promise<unknown[]> {

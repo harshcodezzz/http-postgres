@@ -173,7 +173,7 @@ export function createQueryAnalytics(directory: string, log: FastifyBaseLogger, 
     ]);
   }
 
-  function send(type: "report" | "close", extra: Record<string, unknown>, batch?: Batch) {
+  function send(type: "report" | "clear" | "close", extra: Record<string, unknown>, batch?: Batch) {
     const id = randomUUID();
     return new Promise<any>((resolve, reject) => {
       if (!worker) return reject(new Error("Query analytics worker is unavailable"));
@@ -209,6 +209,17 @@ export function createQueryAnalytics(directory: string, log: FastifyBaseLogger, 
     return send("report", { limit });
   }
 
+  async function clear() {
+    if (closed) throw new Error("Query analytics is closed");
+    usage.clear();
+    failures.length = 0;
+    bufferFull = false;
+    inFlight = undefined;
+    resolveInFlight?.();
+    resolveInFlight = undefined;
+    return send("clear", {});
+  }
+
   async function close() {
     if (closed) return;
     closed = true;
@@ -230,7 +241,7 @@ export function createQueryAnalytics(directory: string, log: FastifyBaseLogger, 
     }
   }
 
-  return { record, report, close };
+  return { record, report, clear, close };
 }
 
 export type QueryAnalytics = ReturnType<typeof createQueryAnalytics>;

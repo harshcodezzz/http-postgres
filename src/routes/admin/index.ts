@@ -2,11 +2,12 @@ import type { FastifyPluginAsync, FastifyInstance } from "fastify";
 import { resolve } from "node:path";
 import adminApiRoutes from "./admin-api.js";
 import adminDatabaseRoutes from "./admin-database.js";
-import { readAuditTail, readLogTail } from "../../utils/log-files.js";
+import { clearLogFiles, readAuditTail, readLogTail } from "../../utils/log-files.js";
 import type { QueryAnalytics } from "../../utils/query-analytics.js";
 
-const AUDIT_LOG_FILE = resolve(process.cwd(), "logs", "api-keys.log");
-const GATEWAY_LOG_FILE = resolve(process.cwd(), "logs", "current.log");
+const LOGS_DIRECTORY = resolve(process.cwd(), "logs");
+const AUDIT_LOG_FILE = resolve(LOGS_DIRECTORY, "api-keys.log");
+const GATEWAY_LOG_FILE = resolve(LOGS_DIRECTORY, "current.log");
 
 async function checkHealth(fastify: FastifyInstance) {
   let postgresHealthy = false;
@@ -98,6 +99,24 @@ const adminRoutes: FastifyPluginAsync<{ analytics?: QueryAnalytics }> = async (f
     }
   });
 
+  fastify.delete("/analytics", async (request, reply) => {
+    reply.header("Cache-Control", "no-store");
+    if (!analytics) return { success: true, enabled: false };
+    try {
+      await analytics.clear();
+      return {
+        success: true,
+        message: "Query analytics cleared successfully",
+      };
+    } catch (error) {
+      request.log.error({ err: error }, "Could not clear query analytics");
+      return reply.code(503).send({
+        success: false,
+        error: { code: "ANALYTICS_UNAVAILABLE", message: "Could not clear query analytics" },
+      });
+    }
+  });
+
   fastify.get<{
     Querystring: { type?: "audit" | "system"; limit?: string };
   }>("/logs", async (request) => {
@@ -114,6 +133,41 @@ const adminRoutes: FastifyPluginAsync<{ analytics?: QueryAnalytics }> = async (f
       count: logs.length,
       logs,
     };
+  });
+
+  fastify.delete<{
+    Querystring: { type?: "all" | "audit" | "system"; analytics?: string | boolean };
+  }>("/logs", async (request, reply) => {
+    const rawType = request.query?.type;
+    const type = rawType === "audit" || rawType === "system" ? rawType : "all";
+    const includeAnalytics = request.query?.analytics === true || request.query?.analytics === "true";
+
+    try {
+      const clearedFiles = await clearLogFiles(LOGS_DIRECTORY, type);
+      let analyticsCleared = false;
+      if (includeAnalytics && analytics) {
+        try {
+          await analytics.clear();
+          analyticsCleared = true;
+        } catch (error) {
+          request.log.warn({ err: error }, "Could not clear analytics during log deletion");
+        }
+      }
+
+      return {
+        success: true,
+        message: "Logs deleted successfully",
+        type,
+        clearedFiles,
+        ...(includeAnalytics && { analyticsCleared }),
+      };
+    } catch (error) {
+      request.log.error({ err: error }, "Could not delete logs");
+      return reply.code(500).send({
+        success: false,
+        error: { code: "LOG_DELETION_FAILED", message: "Could not delete logs" },
+      });
+    }
   });
 };
 
