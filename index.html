@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="A self-hosted TypeScript gateway for querying PostgreSQL from serverless and edge runtimes over ordinary HTTP.">
+    <meta name="theme-color" content="#07110f">
+    <title>HTTP PostgreSQL Gateway</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="#top" aria-label="HTTP PostgreSQL Gateway home">
+        <span class="brand-mark" aria-hidden="true">HP</span>
+        <span>HTTP PostgreSQL</span>
+      </a>
+      <nav aria-label="Primary navigation">
+        <a href="#how-it-works">How it works</a>
+        <a href="#security">Security</a>
+        <a href="#quick-start">Quick start</a>
+        <a class="nav-cta" href="https://github.com/http-postgres/http-postgres">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow"><span></span> Open-source TypeScript infrastructure</p>
+          <h1>PostgreSQL,<br><em>available over HTTP.</em></h1>
+          <p class="lede">A self-hosted bridge for serverless, edge, workflow, and sandboxed runtimes that can call <code>fetch()</code> but cannot open a PostgreSQL connection.</p>
+          <div class="hero-actions">
+            <a class="button primary" href="https://github.com/http-postgres/http-postgres#quick-start">Get started</a>
+            <a class="button secondary" href="https://github.com/http-postgres/http-postgres/blob/main/docs/routes.md">Explore the API</a>
+          </div>
+          <ul class="hero-proof" aria-label="Project highlights">
+            <li>Scoped API keys</li>
+            <li>External connection pooling</li>
+            <li>PostgreSQL-enforced access</li>
+          </ul>
+        </div>
+
+        <div class="terminal" aria-label="Example TypeScript request">
+          <div class="terminal-bar">
+            <span class="lights" aria-hidden="true"><i></i><i></i><i></i></span>
+            <span>edge-function.ts</span>
+            <button class="copy-button" type="button" data-copy-target="example-code">Copy</button>
+          </div>
+          <pre id="example-code"><code><span class="purple">const</span> response = <span class="purple">await</span> <span class="blue">fetch</span>(
+  <span class="green">`${PG_GATEWAY_URL}/query`</span>,
+  {
+    method: <span class="green">"POST"</span>,
+    headers: {
+      <span class="green">"content-type"</span>: <span class="green">"application/json"</span>,
+      <span class="green">"x-api-key"</span>: PG_API_KEY,
+      <span class="green">"x-database"</span>: <span class="green">"app"</span>
+    },
+    body: JSON.<span class="blue">stringify</span>({
+      query: <span class="green">"SELECT * FROM messages WHERE id = $1"</span>,
+      parameters: [<span class="orange">42</span>]
+    })
+  }
+);</code></pre>
+          <div class="terminal-result"><span>200 OK</span><code>{ "rows": [{ "id": "42", "message": "hello" }] }</code></div>
+        </div>
+      </section>
+
+      <section class="problem" id="how-it-works">
+        <div>
+          <p class="section-label">The missing connection layer</p>
+          <h2>Keep the database driver where it belongs.</h2>
+        </div>
+        <p>Short-lived runtimes are excellent at HTTP and awkward at long-lived database connections. Run the gateway beside PostgreSQL, then give remote functions a small JSON API instead of database credentials and socket management.</p>
+      </section>
+
+      <section class="flow" aria-label="Request architecture">
+        <article>
+          <span class="flow-index">01</span>
+          <div class="flow-icon">{ }</div>
+          <h3>Call with <code>fetch()</code></h3>
+          <p>Send parameterized SQL from any runtime with standards-compatible HTTP support.</p>
+        </article>
+        <div class="flow-line" aria-hidden="true"></div>
+        <article class="featured">
+          <span class="flow-index">02</span>
+          <div class="flow-icon">HTTP</div>
+          <h3>Authenticate and pool</h3>
+          <p>The gateway verifies scoped keys, applies limits, and safely reuses PostgreSQL sessions.</p>
+        </article>
+        <div class="flow-line" aria-hidden="true"></div>
+        <article>
+          <span class="flow-index">03</span>
+          <div class="flow-icon database-icon">DB</div>
+          <h3>Let PostgreSQL decide</h3>
+          <p>Dedicated login roles make PostgreSQL the final authorization boundary for every query.</p>
+        </article>
+      </section>
+
+      <section class="capabilities">
+        <div class="capabilities-intro">
+          <p class="section-label">Built for real workloads</p>
+          <h2>One gateway.<br>Several execution modes.</h2>
+          <p>Choose the smallest execution model that fits the job, from an immediate query to a durable asynchronous workflow.</p>
+          <a href="https://github.com/http-postgres/http-postgres/blob/main/docs/routes.md">Read the route reference</a>
+        </div>
+        <div class="capability-grid">
+          <article><strong>Immediate</strong><h3>Query and respond</h3><p>Interactive reads and short operations with a direct JSON response.</p><code>POST /query</code></article>
+          <article><strong>Asynchronous</strong><h3>Submit and poll</h3><p>Durable execution records for work that should outlive the request.</p><code>type: "async"</code></article>
+          <article><strong>Atomic batch</strong><h3>Commit together</h3><p>Send a complete set of statements and commit them as one transaction.</p><code>POST /transaction/execute</code></article>
+          <article><strong>Queued</strong><h3>Build incrementally</h3><p>Add, inspect, and remove statements before making the final commit decision.</p><code>POST /transaction</code></article>
+        </div>
+      </section>
+
+      <section class="security" id="security">
+        <div class="security-copy">
+          <p class="section-label">Defense in depth</p>
+          <h2>Access is scoped twice.</h2>
+          <p>API keys define the requested scope. Dedicated PostgreSQL roles enforce it again at the database boundary. Operational safeguards cover the rest of the path.</p>
+          <ul>
+            <li><span>01</span> Revocable keys restricted by database, table, and CRUD operation</li>
+            <li><span>02</span> PostgreSQL roles created for scoped access</li>
+            <li><span>03</span> Query deadlines, bounded results, rate limits, and audit logs</li>
+            <li><span>04</span> Global connection budgets with cross-pool reclamation</li>
+          </ul>
+        </div>
+        <aside class="security-note">
+          <span>Important</span>
+          <p>This gateway executes SQL supplied by authenticated clients. Deploy it on a trusted network, terminate TLS at the edge, and grant every key only the privileges it needs.</p>
+          <a href="https://github.com/http-postgres/http-postgres/blob/main/docs/security.md">Security guide</a>
+        </aside>
+      </section>
+
+      <section class="quick-start" id="quick-start">
+        <div>
+          <p class="section-label">Run it yourself</p>
+          <h2>From clone to health check.</h2>
+          <p>Requires Node.js 22.13+ or 23.4+, PostgreSQL, and optionally Redis.</p>
+        </div>
+        <div class="command-card">
+          <button class="copy-button" type="button" data-copy-target="install-code">Copy</button>
+          <pre id="install-code"><code><span>git clone https://github.com/http-postgres/http-postgres</span>
+<span>cd http-postgres</span>
+<span>npm ci</span>
+<span>cp .env.example .env</span>
+<span>npm run dev</span>
+<span>curl http://localhost:8080/health</span></code></pre>
+        </div>
+      </section>
+
+      <section class="final-cta">
+        <p class="section-label">HTTP in. PostgreSQL out.</p>
+        <h2>Bring PostgreSQL to the runtimes that cannot reach it.</h2>
+        <div>
+          <a class="button primary" href="https://github.com/http-postgres/http-postgres">View on GitHub</a>
+          <a class="button secondary" href="https://github.com/http-postgres/http-postgres/tree/main/docs">Read the docs</a>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <a class="brand" href="#top"><span class="brand-mark">HP</span><span>HTTP PostgreSQL</span></a>
+      <p>Self-hosted TypeScript infrastructure for HTTP-only runtimes.</p>
+      <p>MIT licensed · <a href="https://github.com/http-postgres/http-postgres">Source</a></p>
+    </footer>
+    <script src="script.js"></script>
+  </body>
+</html>
