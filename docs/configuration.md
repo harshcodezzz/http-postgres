@@ -34,6 +34,12 @@ database:
     queryMin: 2
     max: 50
     maxGlobalQueries: 100
+    connectionTimeoutMillis: 10000
+    checkoutTimeoutMillis: 10000
+    growthIntervalMillis: 0
+    maxConcurrentOpenings: 4
+    statementTimeoutMillis: 30000
+    queryTimeoutMillis: 35000
 
 redis:
   enabled: true
@@ -82,6 +88,12 @@ The table lists loader defaults. Explicit values in [gateway.yaml](../gateway.ya
 | `database.pool.queryMin` | `1` | Number of connections the gateway prewarms and replenishes per configured default query login. Set to `0` to open them on demand. The minimum cannot exceed the per-pool maximum and prewarming shares the global budget. |
 | `database.pool.max` | `20` | Maximum size of the administrative pool and of each query pool. A database has a separate pool for its default login and each scoped login. The minimum cannot exceed the maximum. |
 | `database.pool.maxGlobalQueries` | `40` | Process-wide budget across all databases and logins. Includes opening, idle, busy, and unverified closing query connections. Excludes the administrative pool. Reusing an idle session consumes its existing slot. The gateway can reclaim idle connections above another pool's minimum. |
+| `database.pool.connectionTimeoutMillis` | `10000` | Maximum time in milliseconds for opening a physical PostgreSQL query connection. |
+| `database.pool.checkoutTimeoutMillis` | `10000` | Maximum time in milliseconds a request waits to acquire and verify a pooled query connection before receiving a `503` connection error. |
+| `database.pool.growthIntervalMillis` | `0` | Minimum delay in milliseconds before a query pool schedules another connection opening. Set to `0` to allow immediate growth. |
+| `database.pool.maxConcurrentOpenings` | `4` | Maximum number of physical connections a single query pool may open concurrently while requests are waiting. |
+| `database.pool.statementTimeoutMillis` | `30000` | Default PostgreSQL `statement_timeout` applied to query sessions. |
+| `database.pool.queryTimeoutMillis` | `35000` | Client-side timeout in milliseconds for PostgreSQL query operations on pooled connections. |
 | `redis.enabled` | `true` | Connect to Redis on startup. Set to `false` to use an in-memory store local to the gateway process. |
 | `redis.mode` | `external` | Accepts `external` or `managed`. Both currently connect to the configured Redis URL when enabled. |
 | `redis.url` | Required when enabled | Redis connection string. |
@@ -102,7 +114,7 @@ The gateway validates the complete file before opening network connections:
 
 - `server.port` must be an integer from `1` through `65535`.
 - `database.pool.min` and `database.pool.queryMin` must be zero or greater and cannot exceed `database.pool.max`.
-- `database.pool.max` and `database.pool.maxGlobalQueries` must be positive integers.
+- `database.pool.max`, `database.pool.maxGlobalQueries`, `database.pool.maxConcurrentOpenings`, and all pool timeout values must be positive integers. `database.pool.growthIntervalMillis` may be zero.
 - `redis.mode` accepts only `external` or `managed`; `redis.url` is required whenever Redis is enabled.
 - Both rate-limit counts must be positive integers. Whitelist entries must be valid IPv4 or IPv6 addresses with an optional valid CIDR prefix.
 - `analytics.maxStorageBytes` must be at least `1048576` bytes (1 MiB).
@@ -112,7 +124,7 @@ All paths are resolved by the component that consumes them. Start the process fr
 
 When Redis rate limiting is enabled, the Redis user needs permission to run `EVAL`, `INCR`, `TTL`, and `EXPIRE` on the rate-limit keys.
 
-When a query pool has waiting requests and no reusable session, it opens one extra connection at a time, with at least 50 ms between attempts. Requests have up to 400 ms to acquire a verified PostgreSQL session before the gateway returns a `503` connection error. SQL execution has a separate deadline.
+When a query pool has waiting requests and no reusable session, it may open up to `maxConcurrentOpenings` connections concurrently. `growthIntervalMillis` controls the delay between scheduled openings. Requests have up to `checkoutTimeoutMillis` to acquire a verified PostgreSQL session before the gateway returns a `503` connection error. Physical connection attempts, PostgreSQL statements, and client-side query operations use their separately configured deadlines.
 
 For a loopback-only development instance without Redis, set these fields in the existing YAML file.
 

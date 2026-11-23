@@ -55,6 +55,12 @@ const configSchema = z
           queryMin: z.number().int().min(0).default(1),
           max: z.number().int().positive().default(20),
           maxGlobalQueries: z.number().int().positive().default(40),
+          connectionTimeoutMillis: z.number().int().positive().default(10_000),
+          checkoutTimeoutMillis: z.number().int().positive().default(10_000),
+          growthIntervalMillis: z.number().int().min(0).default(0),
+          maxConcurrentOpenings: z.number().int().positive().default(4),
+          statementTimeoutMillis: z.number().int().positive().default(30_000),
+          queryTimeoutMillis: z.number().int().positive().default(35_000),
         })
         .prefault({}),
     }),

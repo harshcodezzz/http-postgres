@@ -5,12 +5,6 @@ import config from "../config/index.js";
 import { scopedInheritanceSafety, scopedQueryUrl, scopedRoleSafety, type QueryAccess } from "./query-access.js";
 import { DatabaseError, getPostgresDatabaseOid } from "./pg-database.js";
 
-const connectionTimeoutMillis = 10_000;
-const checkoutTimeoutMillis = 10_000;
-const growthIntervalMillis = 0;
-const maxConcurrentOpenings = 4;
-const statementTimeoutMillis = 30_000;
-const queryTimeoutMillis = 35_000;
 // Only a verified address and PostgreSQL system identifier may release a slot
 // from a previous postmaster. An unrelated observer still fails closed.
 const observerIdentitySql = `CASE
@@ -77,6 +71,14 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
   let warming: Promise<void> | undefined;
   let closing = false;
   let closed = false;
+  const {
+    connectionTimeoutMillis,
+    checkoutTimeoutMillis,
+    growthIntervalMillis,
+    maxConcurrentOpenings,
+    statementTimeoutMillis,
+    queryTimeoutMillis,
+  } = config.database.pool;
 
   // pg-pool calls connect only when it opens a physical connection. Returning an
   // existing connection to a borrower does not take another global slot.
@@ -335,6 +337,14 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
       }
 
       if (pool.totalCount + state.openingCount >= config.database.pool.max) return;
+      const growthDelay = state.nextOpeningAt - performance.now();
+      if (growthDelay > 0) {
+        state.growthTimer ??= setTimeout(() => {
+          state.growthTimer = undefined;
+          wake(state);
+        }, growthDelay).unref();
+        return;
+      }
 
       while (
         state.openingCount < maxConcurrentOpenings &&
@@ -364,6 +374,13 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
           state.openingCount--;
           wake(state);
         });
+        if (growthIntervalMillis > 0) {
+          state.growthTimer ??= setTimeout(() => {
+            state.growthTimer = undefined;
+            wake(state);
+          }, growthIntervalMillis).unref();
+          break;
+        }
       }
     });
   }

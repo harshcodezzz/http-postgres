@@ -182,6 +182,12 @@ database:
     queryMin: 1
     max: 20
     maxGlobalQueries: 40
+    connectionTimeoutMillis: 10000
+    checkoutTimeoutMillis: 10000
+    growthIntervalMillis: 0
+    maxConcurrentOpenings: 4
+    statementTimeoutMillis: 30000
+    queryTimeoutMillis: 35000
 
 redis:
   enabled: true
@@ -223,4 +229,4 @@ Do not open a public issue for suspected vulnerabilities. Follow the [security p
 
 ## License
 
-The npm package metadata currently declares the ISC license. Add a repository-level `LICENSE` file with the appropriate copyright holder before publishing or accepting external contributions.
+This project is available under the [MIT License](LICENSE).

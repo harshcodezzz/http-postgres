@@ -87,4 +87,4 @@ Security-sensitive changes deserve particular attention when they touch:
 
 Keep changes narrowly scoped and explain the operational effect. Include manual verification steps and call out any migration, compatibility, security, or rollback consideration. Do not commit local `.env` files, runtime data, logs, compiled output, or credentials.
 
-A repository-level license file with the appropriate copyright holder should be established by the maintainer before accepting public contributions. Suspected vulnerabilities should follow the repository [security policy](../SECURITY.md) instead of the normal public contribution workflow.
+Contributions are accepted under the repository's [MIT License](../LICENSE). Suspected vulnerabilities should follow the repository [security policy](../SECURITY.md) instead of the normal public contribution workflow.

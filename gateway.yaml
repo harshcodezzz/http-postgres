@@ -13,6 +13,12 @@ database:
     queryMin: 2
     max: 25
     maxGlobalQueries: 80
+    connectionTimeoutMillis: 10000
+    checkoutTimeoutMillis: 10000
+    growthIntervalMillis: 0
+    maxConcurrentOpenings: 4
+    statementTimeoutMillis: 30000
+    queryTimeoutMillis: 35000
 
 redis:
   enabled: true
