@@ -37,7 +37,7 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
   border-bottom: 1px solid var(--line);
 }
 .brand { display: inline-flex; align-items: center; gap: 12px; text-decoration: none; font-weight: 750; letter-spacing: -.02em; }
-.brand-mark { width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid var(--mint); color: var(--mint); font: 700 .72rem/1 monospace; }
+.brand-mark { width: 42px; height: 42px; display: block; border-radius: 10px; object-fit: cover; box-shadow: 0 0 20px rgba(36, 144, 255, .18); }
 nav { display: flex; align-items: center; gap: 30px; }
 nav a { color: var(--muted); text-decoration: none; font-size: .9rem; }
 nav a:hover, nav a:focus-visible { color: var(--text); }
