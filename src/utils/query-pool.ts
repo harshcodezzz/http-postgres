@@ -253,15 +253,16 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
     });
   }
 
-  async function reclaimIdleConnection(requested: Pool | undefined) {
+  async function reclaimIdleConnection(requested: Pool | undefined, belowMinimum = false) {
     for (const group of pools.values()) {
       for (const state of group.values()) {
         const { pool } = state;
         if (pool === requested || state.retired || state.waiters.size ||
-            pool.totalCount <= (pool.options.min ?? 0) || pool.idleCount === 0) continue;
+            (!belowMinimum && pool.totalCount <= (pool.options.min ?? 0)) || pool.idleCount === 0) continue;
         const client = await pool.connect().catch(() => undefined);
         if (client) {
-          if (state.retired || state.waiters.size || pool.totalCount <= (pool.options.min ?? 0)) {
+          if (state.retired || state.waiters.size ||
+              (!belowMinimum && pool.totalCount <= (pool.options.min ?? 0))) {
             client.release();
             continue;
           }
@@ -343,7 +344,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
         if (queryConnections + state.openingCount >= config.database.pool.maxGlobalQueries) {
           if (!state.reclaiming) {
             state.reclaiming = true;
-            void reclaimIdleConnection(pool).then(
+            void reclaimIdleConnection(pool, true).then(
               (reclaimed) => {
                 state.reclaiming = false;
                 if (reclaimed) wake(state);
@@ -529,8 +530,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
       pool.on("acquire", (client: PoolClient) => client.on("error", checkedOutError));
       pool.on("release", (_err: Error | undefined, client: PoolClient) => {
         client.removeListener("error", checkedOutError);
-        if (pendingCheckouts && queryConnections >= config.database.pool.maxGlobalQueries &&
-            pool.totalCount > (pool.options.min ?? 0)) wakePools();
+        if (pendingCheckouts && queryConnections >= config.database.pool.maxGlobalQueries) wakePools();
         else wake(managed);
       });
       pool.on("error", (err) => log.error({ err, database }, "Query connection pool error"));
@@ -668,14 +668,16 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
 
   async function warmPools() {
     for (const database of targets) {
-      if (closing) break;
+      if (closing || pendingCheckouts) break;
       const pool = pools.get(database)?.get("")?.pool;
       const count = pool?.totalCount ?? 0;
       if (count >= config.database.pool.queryMin || maintenance.has(database)) continue;
       try {
-        if (queryConnections >= config.database.pool.maxGlobalQueries && !await reclaimIdleConnection(pool)) continue;
+        if (queryConnections >= config.database.pool.maxGlobalQueries &&
+            (pendingCheckouts || !await reclaimIdleConnection(pool))) continue;
+        if (pendingCheckouts) continue;
         const oid = await getPostgresDatabaseOid(database, adminDb);
-        if (!oid) continue;
+        if (!oid || pendingCheckouts) continue;
         const targetSize = Math.min(config.database.pool.queryMin,
           count + config.database.pool.maxGlobalQueries - queryConnections);
         const alreadyInUse = count - (pool?.idleCount ?? 0);
