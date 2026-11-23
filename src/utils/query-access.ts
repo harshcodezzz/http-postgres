@@ -202,6 +202,7 @@ export async function provisionQueryAccess(
   secret: string,
   adminPool: Pool,
   owner: string,
+  beforeProvision?: (roleToken: string) => Promise<void>,
 ): Promise<DatabaseAccess> {
   return withRoleProvisioning(database, oid, adminPool, async (client) => {
     const tables = await listPostgresTables(client);
@@ -222,6 +223,7 @@ export async function provisionQueryAccess(
     })).filter(({ operations }) => operations.length);
     const sequences = await listInsertSequences(client, grants);
     const roleToken = createHash("sha256").update(JSON.stringify([owner, oid, grants, sequences])).digest("hex");
+    await beforeProvision?.(roleToken);
     await provisionLogin(client, database, roleToken, secret, grants, sequences);
     return { ...policy, roleToken, roleOwner: owner };
   });
@@ -229,6 +231,7 @@ export async function provisionQueryAccess(
 
 export async function isolateQueryAccess(
   database: string, oid: string, scope: DatabaseAccess, secret: string, adminPool: Pool, owner: string,
+  beforeProvision?: (roleToken: string) => Promise<void>,
 ): Promise<DatabaseAccess> {
   return withRoleProvisioning(database, oid, adminPool, async (client) => {
     const original = queryAccess(secret, scope.roleToken).login;
@@ -258,6 +261,7 @@ export async function isolateQueryAccess(
     })).filter((table) => table.operations.length > 0);
     const sequences = rows.filter(({ kind, granted }) => kind === "S" && granted.includes("USAGE"));
     const roleToken = createHash("sha256").update(JSON.stringify([owner, oid, scope.roleToken])).digest("hex");
+    await beforeProvision?.(roleToken);
     await provisionLogin(client, database, roleToken, secret, grants, sequences);
     return { ...scope, roleToken, roleOwner: owner };
   });

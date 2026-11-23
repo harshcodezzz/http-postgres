@@ -47,6 +47,7 @@ export interface PendingRoleCleanup {
   attempts: number;
   lastAttemptAt?: string;
   lastError?: string;
+  cleanupAfter?: string;
 }
 
 export interface DataStore {
@@ -102,26 +103,31 @@ export class JsonDB {
     }
   }
 
-  private async exists(): Promise<boolean> {
+  async ensureExists(initialData: DataStore = {}): Promise<void> {
     try {
-      await readFile(this.filePath);
-      return true;
+      await lstat(this.filePath);
+      return;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      return false;
     }
-  }
-
-  async ensureExists(initialData: DataStore = {}): Promise<void> {
-    if (await this.exists()) return;
     await this.withLock(async () => {
-      if (!(await this.exists())) await this.replace(initialData);
+      try {
+        await lstat(this.filePath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        await this.replace(initialData);
+      }
     });
   }
 
   async read<T = DataStore>(): Promise<T> {
-    await this.ensureExists();
-    return this.readExisting<T>();
+    try {
+      return await this.readExisting<T>();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      await this.ensureExists();
+      return this.readExisting<T>();
+    }
   }
 
   private async readExisting<T>(): Promise<T> {
@@ -177,9 +183,14 @@ export class JsonDB {
   async update<T = DataStore>(
     updater: (current: T) => T | Promise<T>,
   ): Promise<T> {
-    await this.ensureExists();
     return this.withLock(async () => {
-      const current = await this.readExisting<T>();
+      let current: T;
+      try {
+        current = await this.readExisting<T>();
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        current = {} as T;
+      }
       const updated = await updater(current);
       await this.replace(updated);
       return updated;

@@ -1,6 +1,7 @@
 import { Client, escapeLiteral, Pool, type PoolClient } from "pg";
 import config from "../config/index.js";
 import type { JsonDB } from "../plugins/jsondb.js";
+import type { FastifyBaseLogger } from "fastify";
 
 export class DatabaseError extends Error {
   readonly code: string;
@@ -15,6 +16,12 @@ export class DatabaseError extends Error {
 export const SYSTEM_DATABASES = new Set(["postgres", "template0", "template1"]);
 
 let defaultPgPool: Pool | null = null;
+let databaseLogger: FastifyBaseLogger | undefined;
+let lastPoolErrorAt = 0;
+
+export function setDatabaseLogger(log: FastifyBaseLogger) {
+  databaseLogger = log;
+}
 
 function withoutDatabases<T>(entries: Record<string, T>, ...names: string[]): Record<string, T> {
   return Object.fromEntries(Object.entries(entries).filter(([name]) => !names.includes(name)));
@@ -115,7 +122,14 @@ export function getDatabasePool(): Pool {
       idleTimeoutMillis: 10_000,
     });
     defaultPgPool.on("error", (err) => {
-      console.error("Unexpected error on idle PostgreSQL client in pool", err);
+      const now = Date.now();
+      if (now - lastPoolErrorAt < 30_000) return;
+      lastPoolErrorAt = now;
+      databaseLogger?.error({ err: {
+        name: err.name,
+        message: "Unexpected PostgreSQL pool error",
+        ...("code" in err && typeof err.code === "string" && { code: err.code }),
+      } }, "Database maintenance PostgreSQL pool error");
     });
   }
   return defaultPgPool;

@@ -71,6 +71,17 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
   let warming: Promise<void> | undefined;
   let closing = false;
   let closed = false;
+  const poolErrorTimes = new Map<string, number>();
+  function logPoolError(key: string, error: Error, database: string, message: string) {
+    const now = Date.now();
+    if (now - (poolErrorTimes.get(key) ?? 0) < 30_000) return;
+    poolErrorTimes.set(key, now);
+    log.error({ err: {
+      name: error.name,
+      message: "Unexpected PostgreSQL pool error",
+      ...("code" in error && typeof error.code === "string" && { code: error.code }),
+    }, database }, message);
+  }
   const {
     connectionTimeoutMillis,
     checkoutTimeoutMillis,
@@ -550,7 +561,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
         if (pendingCheckouts && queryConnections >= config.database.pool.maxGlobalQueries) wakePools();
         else wake(managed);
       });
-      pool.on("error", (err) => log.error({ err, database }, "Query connection pool error"));
+      pool.on("error", (err) => logPoolError(`${database}:${poolKey}`, err, database, "Query connection pool error"));
       pool.on("remove", (client: PoolClient) => {
         if (!reservedClients.delete(client)) return;
         const session = backends.get(client);

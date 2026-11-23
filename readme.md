@@ -68,7 +68,7 @@ Comprehensive guides and references are organized in the [`docs/`](docs/) direct
 
 4. **Verify health:**
    ```sh
-   curl http://localhost:8080/health
+   curl http://localhost:8080/health/ready
    ```
 
 Follow the complete step-by-step walkthrough in **[Getting started](docs/getting-started.md)** to provision your first database, generate scoped API keys, and execute queries.

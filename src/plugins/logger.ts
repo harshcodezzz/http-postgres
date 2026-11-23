@@ -22,6 +22,7 @@ export function createGatewayLogger() {
           file: resolve(logDirectory, "failed.log"),
           frequency: "daily",
           size: "20m",
+          limit: { count: 30 },
           mkdir: true,
           symlink: true,
         },

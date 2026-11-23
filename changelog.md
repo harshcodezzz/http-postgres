@@ -2,8 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- Added public `GET /health/live` and dependency-aware `GET /health/ready` probes. Readiness checks PostgreSQL and configured Redis with bounded, briefly cached, concurrent-deduplicated checks and returns `503` when required dependencies are unavailable.
+
 ### Fixed
 
+- Made JSON metadata reads use one full-file read while preserving locked atomic writes and explicit corrupted-file failures.
+- Persisted scoped-role cleanup intent before PostgreSQL role creation so interrupted API-key creation, scope updates, and legacy-scope migrations can recover without orphaning roles. Cleanup is idempotent and rechecks active key ownership before dropping a role.
+- Added throttled, credential-safe logging for every PostgreSQL pool error path and bounded rotated failure-log retention to 30 files.
 - Preserved pre-dispatch execution-limit errors in transaction commits, including `503 RESULT_MEMORY_BUSY`, instead of converting them to `400 QUERY_EXECUTION_ERROR`. Asynchronous transaction batches now classify these capacity failures as `failed` rather than `rejected`.
 
 ### Changed
