@@ -29,6 +29,7 @@ export async function registerRoutes(app: FastifyInstance) {
   const queryPools = createQueryPools(app.db, app.databaseAdminRoles, app.log);
   app.decorate("queryPools", queryPools);
   app.addHook("onReady", async () => { await queryPools.warm(); });
+  app.addHook("onReady", async () => { app.metrics.setReady(true); });
   app.addHook("onClose", () => queryPools.close());
 
   const healthRoute = { config: { publicHealth: true } };
@@ -63,6 +64,7 @@ export async function registerRoutes(app: FastifyInstance) {
         },
       };
       readiness = { expiresAt: Date.now() + readinessCacheMs, result };
+      app.metrics.setReady(result.status === "ready");
       return result;
     })().finally(() => { checking = undefined; });
     return checking;

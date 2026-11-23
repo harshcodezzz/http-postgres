@@ -43,6 +43,7 @@ async function checkHealth(fastify: FastifyInstance) {
   const queryConnections = fastify.queryPools.capacity();
   const isHealthy = postgresHealthy && redisHealthy && jsondbHealthy &&
     queryConnections.monitoring.status !== "degraded";
+  fastify.metrics.setReady(isHealthy);
 
   return {
     success: true,
@@ -83,6 +84,43 @@ const adminRoutes: FastifyPluginAsync<{ analytics?: QueryAnalytics }> = async (f
   await fastify.register(adminDatabaseRoutes);
 
   fastify.get("/health", async () => checkHealth(fastify));
+
+  fastify.get("/metrics", async (_request, reply) => {
+    reply.header("Cache-Control", "no-store");
+    const [metadata, gateway] = await Promise.all([
+      fastify.jsondb.metrics(),
+      Promise.resolve(fastify.metrics.snapshot()),
+    ]);
+    const query = fastify.queryPools.capacity();
+    gateway.requests.overloadRejected += query.rejectionsAtLimit + query.rejectionsAtPoolLimit;
+    const adminConnections = {
+      total: fastify.db.totalCount,
+      active: Math.max(0, fastify.db.totalCount - fastify.db.idleCount),
+      idle: fastify.db.idleCount,
+      waitingForAcquisition: fastify.db.waitingCount,
+    };
+    return {
+      success: true,
+      gateway,
+      postgres: {
+        scope: "gateway_managed_only",
+        managedPools: query.managedPools + 1,
+        administrativePool: adminConnections,
+        queryPools: query,
+        globalConnectionUsage: query.reserved,
+        globalConnectionCapacity: query.limit,
+        availableConcurrencySlots: query.available,
+        connectionAcquisitionTimeouts: query.checkoutTimeouts,
+        queryExecutionTimeouts: query.executionTimeouts,
+        transactionFailures: gateway.transactionFailures,
+        overloadRejections: query.rejectionsAtLimit + query.rejectionsAtPoolLimit,
+        poolEvictions: query.evictions,
+      },
+      metadata: { ...metadata, cleanupWorker: gateway.cleanupWorker },
+      analytics: analytics?.metrics() ?? { enabled: false, queueSize: 0, droppedEvents: 0 },
+      redis: fastify.redis.metrics(),
+    };
+  });
 
   fastify.get<{ Querystring: { limit?: string } }>("/analytics", async (request, reply) => {
     reply.header("Cache-Control", "no-store");

@@ -10,7 +10,8 @@ export class ExecutionStopped extends Error {
 }
 
 export function watchExecution(
-  reply: FastifyReply | undefined, deadlineMs: number, pools: Pick<QueryPools, "queryDispatched" | "release">,
+  reply: FastifyReply | undefined, deadlineMs: number,
+  pools: Pick<QueryPools, "queryDispatched" | "recordExecutionTimeout" | "release">,
 ) {
   let client: PoolClient | undefined;
   let stopped: ExecutionStopped | undefined;
@@ -38,9 +39,10 @@ export function watchExecution(
     }
   };
   reply?.raw.once("close", disconnected);
-  const timeOut = () => stop(new ExecutionStopped(
-    504, "EXECUTION_DEADLINE_EXCEEDED", "The execution deadline was exceeded",
-  ));
+  const timeOut = () => {
+    pools.recordExecutionTimeout();
+    stop(new ExecutionStopped(504, "EXECUTION_DEADLINE_EXCEEDED", "The execution deadline was exceeded"));
+  };
   const timer = setTimeout(timeOut, deadlineMs).unref();
   function check() {
     if (reply?.raw.destroyed) disconnected();

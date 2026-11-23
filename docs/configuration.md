@@ -24,6 +24,7 @@ version: 1
 server:
   host: "0.0.0.0"
   port: 8080
+  shutdownDeadlineMillis: 30000
 
 database:
   url: "${DATABASE_URL:-postgresql://postgres:postgres@127.0.0.1:5432/postgres}"
@@ -81,6 +82,7 @@ The table lists loader defaults. Explicit values in [gateway.yaml](../gateway.ya
 | `version` | Required | Positive integer identifying the configuration format. The supplied file uses `1`. |
 | `server.host` | `0.0.0.0` | Listen address. Use `127.0.0.1` for loopback-only access. |
 | `server.port` | `8080` | Listen port from 1 to 65535. |
+| `server.shutdownDeadlineMillis` | `30000` | Maximum graceful-shutdown time before forced exit, from 1000 through 300000 milliseconds. A second termination signal still exits immediately. |
 | `database.url` | Required | Administrative PostgreSQL connection string. The gateway checks it at startup. |
 | `database.exposeErrorDetails` | `false` | Exposes PostgreSQL detail and hint text to authenticated query callers when enabled. |
 | `database.queryUrls` | `{}` | Map of database names to default query-login URLs used by name-only keys. Keys must match `^[a-zA-Z_][a-zA-Z0-9_-]{0,62}$`; every value must be a non-empty connection string. |
@@ -113,6 +115,7 @@ The table lists loader defaults. Explicit values in [gateway.yaml](../gateway.ya
 The gateway validates the complete file before opening network connections:
 
 - `server.port` must be an integer from `1` through `65535`.
+- `server.shutdownDeadlineMillis` must be an integer from `1000` through `300000`.
 - `database.pool.min` and `database.pool.queryMin` must be zero or greater and cannot exceed `database.pool.max`.
 - `database.pool.max`, `database.pool.maxGlobalQueries`, `database.pool.maxConcurrentOpenings`, and all pool timeout values must be positive integers. `database.pool.growthIntervalMillis` may be zero.
 - `redis.mode` accepts only `external` or `managed`; `redis.url` is required whenever Redis is enabled.
@@ -266,7 +269,7 @@ curl --fail-with-body \
 }
 ```
 
-Analytics does not currently report latency percentiles, rows processed, connection-pool utilization, client IPs, HTTP request counts, or per-database success totals. Use gateway logs, `/admin/health`, and external metrics for those signals.
+Query analytics remains focused on usage and failures. Bounded HTTP latency buckets, request counts, process health, and gateway-managed pool utilization are available from authenticated `GET /admin/metrics`. Metrics intentionally omit client IPs, raw API keys, SQL labels, and unrestricted per-database labels.
 
 ### Multiple gateway processes
 

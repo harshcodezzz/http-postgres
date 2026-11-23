@@ -66,6 +66,8 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
   let rejectionsAtLimit = 0;
   let rejectionsAtPoolLimit = 0;
   let checkoutTimeouts = 0;
+  let executionTimeouts = 0;
+  let evictions = 0;
   let pendingCheckouts = 0;
   let warmTimer: NodeJS.Timeout | undefined;
   let warming: Promise<void> | undefined;
@@ -125,6 +127,10 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
   function capacity() {
     const limit = config.database.pool.maxGlobalQueries;
     const oldest = closingBackends.values().next().value;
+    const managed = [...pools.values()].flatMap((group) => [...group.values()]);
+    const totalConnections = managed.reduce((count, state) => count + state.pool.totalCount, 0);
+    const idleConnections = managed.reduce((count, state) => count + state.pool.idleCount, 0);
+    const waitingForAcquisition = managed.reduce((count, state) => count + state.pool.waitingCount, 0);
     return {
       limit,
       reserved: queryConnections,
@@ -133,6 +139,17 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
         .reduce((count, state) => count + state.pool.idleCount, 0),
       pendingCheckouts,
       checkoutTimeouts,
+      executionTimeouts,
+      evictions,
+      managedPools: managed.length,
+      connections: {
+        total: totalConnections,
+        active: Math.max(0, totalConnections - idleConnections),
+        idle: idleConnections,
+        waitingForAcquisition,
+      },
+      activeQueries: Math.max(0, totalConnections - idleConnections),
+      queuedQueries: pendingCheckouts,
       awaitingVerification: closingBackends.size,
       oldestUnverifiedMs: oldest === undefined ? null : Math.floor(performance.now() - oldest),
       rejectionsAtLimit,
@@ -225,6 +242,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
   async function evict(database: string) {
     const databasePools = pools.get(database);
     if (databasePools) {
+      evictions += databasePools.size;
       pools.delete(database);
       await Promise.all([...databasePools.values()].map((state) => {
         state.retired = true;
@@ -669,6 +687,10 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
     if (session) session.idle = false;
   }
 
+  function recordExecutionTimeout() {
+    executionTimeouts++;
+  }
+
   function release(client: PoolClient, destroy: boolean) {
     if (destroy || closing) {
       client.release(true);
@@ -750,7 +772,7 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
     }
   }
 
-  return { connect, queryDispatched, release, warm, withMaintenance, capacity, close };
+  return { connect, queryDispatched, recordExecutionTimeout, release, warm, withMaintenance, capacity, close };
 }
 
 export type QueryPools = ReturnType<typeof createQueryPools>;

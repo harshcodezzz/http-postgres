@@ -10,6 +10,7 @@ export interface KeyValueStore {
   exists(key: string): Promise<boolean>;
   increment(key: string, ttlSeconds?: number): Promise<number>;
   close(): Promise<void>;
+  metrics(): { enabled: boolean; status: string; failures: number; timeouts: number; fallback: boolean };
 }
 
 class MemoryStore implements KeyValueStore {
@@ -77,47 +78,72 @@ class MemoryStore implements KeyValueStore {
     clearInterval(this.cleanupTimer);
     this.store.clear();
   }
+
+  metrics() { return { enabled: false, status: "up", failures: 0, timeouts: 0, fallback: true }; }
 }
 
 class RedisStore implements KeyValueStore {
+  private failures = 0;
+  private timeouts = 0;
   constructor(private readonly client: Redis) {}
 
+  private async run<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      this.failures++;
+      const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+      if (code === "ETIMEDOUT" || (error instanceof Error && /timed?\s*out/i.test(error.message))) this.timeouts++;
+      throw error;
+    }
+  }
+
   async get(key: string) {
-    return this.client.get(key);
+    return this.run(() => this.client.get(key));
   }
 
   async set(key: string, value: string, ttlSeconds?: number) {
     if (ttlSeconds !== undefined) {
-      await this.client.set(key, value, "EX", ttlSeconds);
+      await this.run(() => this.client.set(key, value, "EX", ttlSeconds));
       return;
     }
 
-    await this.client.set(key, value);
+    await this.run(() => this.client.set(key, value));
   }
 
   async del(key: string) {
-    await this.client.del(key);
+    await this.run(() => this.client.del(key));
   }
 
   async exists(key: string) {
-    return (await this.client.exists(key)) > 0;
+    return (await this.run(() => this.client.exists(key))) > 0;
   }
 
   async increment(key: string, ttlSeconds?: number): Promise<number> {
-    if (ttlSeconds === undefined) return this.client.incr(key);
-    const count = await this.client.eval(`
+    if (ttlSeconds === undefined) return this.run(() => this.client.incr(key));
+    const count = await this.run(() => this.client.eval(`
       local count = redis.call("INCR", KEYS[1])
       if count == 1 or redis.call("TTL", KEYS[1]) == -1 then
         redis.call("EXPIRE", KEYS[1], ARGV[1])
       end
       return count
-    `, 1, key, ttlSeconds);
+    `, 1, key, ttlSeconds));
     if (typeof count !== "number") throw new Error("Redis returned an invalid rate-limit count");
     return count;
   }
 
   async close() {
     await this.client.quit();
+  }
+
+  metrics() {
+    return {
+      enabled: true,
+      status: this.client.status === "ready" ? "up" : "down",
+      failures: this.failures,
+      timeouts: this.timeouts,
+      fallback: false,
+    };
   }
 }
 

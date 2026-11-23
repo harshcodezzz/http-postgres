@@ -2238,6 +2238,27 @@ paths:
           $ref: "#/components/responses/UnauthorizedError"
         "503":
           $ref: "#/components/responses/ServiceUnavailableError"
+  /admin/metrics:
+    get:
+      tags:
+        - Admin Diagnostics
+      summary: Get bounded operational metrics
+      description: Returns gateway, process, gateway-managed PostgreSQL pool, metadata maintenance, analytics queue, Redis, and readiness metrics. Values contain no API keys, SQL, credentials, client IPs, or unrestricted database labels.
+      operationId: getAdminMetrics
+      security:
+        - AdminAuth: []
+      responses:
+        "200":
+          description: Current process-local operational metrics.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
   /admin/analytics:
     get:
       tags:

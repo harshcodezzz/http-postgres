@@ -41,6 +41,7 @@ const configSchema = z
     server: z.object({
       host: z.string().default("0.0.0.0"),
       port: z.number().int().min(1).max(65535).default(8080),
+      shutdownDeadlineMillis: z.number().int().min(1_000).max(300_000).default(30_000),
     }),
 
     database: z.object({

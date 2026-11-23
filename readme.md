@@ -36,24 +36,25 @@ HTTP PostgreSQL Gateway (persistent service)
 
 Comprehensive guides and references are organized in the [`docs/`](docs/) directory:
 
-| Guide | Description |
-| --- | --- |
-| **[Getting Started](docs/getting-started.md)** | Prerequisites, local setup, PostgreSQL preparation, creating an API key, and running your first query. |
-| **[Serverless Integration](docs/serverless.md)** | How to use `fetch()`, manage secrets, handle timeouts, configure retries, and integrate with edge platforms. |
-| **[API Routes & Specifications](docs/routes.md)** | Complete reference for query, transaction, and admin endpoints, response contracts, errors, and [OpenAPI specs](openapi.yaml) ([JSON](openapi.json)). |
-| **[Configuration Guide](docs/configuration.md)** | Environment variables, complete `gateway.yaml` settings, connection pool tuning, and runtime storage. |
-| **[Architecture](docs/architecture.md)** | Internal system architecture, connection pool lifecycle, state isolation, and background workers. |
-| **[Security Guide](docs/security.md)** | Threat model, PostgreSQL role generation, network controls, and security hardening. |
-| **[Deployment Guide](docs/deployment.md)** | Production topology, scaling, health probes, backup strategies, and operational checklists. |
-| **[Development & Contributing](docs/development.md)** | Project layout, development workflow, TypeScript compilation, and coding guidelines. |
-| **[Documentation Index](docs/README.md)** | Guided reading paths tailored for evaluators, client developers, operators, and contributors. |
-| **[Changelog](changelog.md)** | Release notes, breaking changes, and migration details. |
+| Guide                                                 | Description                                                                                                                                           |
+| ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **[Getting Started](docs/getting-started.md)**        | Prerequisites, local setup, PostgreSQL preparation, creating an API key, and running your first query.                                                |
+| **[Serverless Integration](docs/serverless.md)**      | How to use `fetch()`, manage secrets, handle timeouts, configure retries, and integrate with edge platforms.                                          |
+| **[API Routes & Specifications](docs/routes.md)**     | Complete reference for query, transaction, and admin endpoints, response contracts, errors, and [OpenAPI specs](openapi.yaml) ([JSON](openapi.json)). |
+| **[Configuration Guide](docs/configuration.md)**      | Environment variables, complete `gateway.yaml` settings, connection pool tuning, and runtime storage.                                                 |
+| **[Architecture](docs/architecture.md)**              | Internal system architecture, connection pool lifecycle, state isolation, and background workers.                                                     |
+| **[Security Guide](docs/security.md)**                | Threat model, PostgreSQL role generation, network controls, and security hardening.                                                                   |
+| **[Deployment Guide](docs/deployment.md)**            | Production topology, scaling, health probes, backup strategies, and operational checklists.                                                           |
+| **[Development & Contributing](docs/development.md)** | Project layout, development workflow, TypeScript compilation, and coding guidelines.                                                                  |
+| **[Documentation Index](docs/README.md)**             | Guided reading paths tailored for evaluators, client developers, operators, and contributors.                                                         |
+| **[Changelog](changelog.md)**                         | Release notes, breaking changes, and migration details.                                                                                               |
 
 ---
 
 ## Quick Start
 
 1. **Clone and install dependencies:**
+
    ```sh
    npm ci
    cp .env.example .env
@@ -62,10 +63,12 @@ Comprehensive guides and references are organized in the [`docs/`](docs/) direct
 2. **Configure your database URL** in `.env` (and optionally configure Redis in `gateway.yaml` or `.env`).
 
 3. **Start the gateway:**
+
    ```sh
    npm run dev
    ```
-   *The initial startup prints an auto-generated administrator password. Save this password to manage keys and databases.*
+
+   _The initial startup prints an auto-generated administrator password. Save this password to manage keys and databases._
 
 4. **Verify health:**
    ```sh

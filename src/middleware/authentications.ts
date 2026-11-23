@@ -77,6 +77,7 @@ const authPlugin: FastifyPluginAsync = async (fastify) => {
           matches = await verifyAdminPassword(admin, fastify.jsondb);
         } catch (error) {
           if (!(error instanceof AdminVerificationBusyError)) throw error;
+          fastify.metrics.recordOverloadRejection();
           reply.header("Retry-After", "1");
           return reply.code(503).send({
             success: false,

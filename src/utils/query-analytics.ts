@@ -93,6 +93,7 @@ export function createQueryAnalytics(directory: string, log: FastifyBaseLogger, 
   let restartDelay = 100;
   let closed = false;
   let bufferFull = false;
+  let droppedEvents = 0;
 
   function spawnWorker() {
     if (closed || worker) return;
@@ -194,6 +195,7 @@ export function createQueryAnalytics(directory: string, log: FastifyBaseLogger, 
     usage.set(keyId, counts);
     if (!failed) return;
     if (failures.length >= maxBufferedFailures) {
+      droppedEvents++;
       if (!bufferFull) log.warn("Query analytics failure buffer is full");
       bufferFull = true;
       return;
@@ -241,7 +243,16 @@ export function createQueryAnalytics(directory: string, log: FastifyBaseLogger, 
     }
   }
 
-  return { record, report, clear, close };
+  function metrics() {
+    return {
+      queueSize: usage.size + failures.length + (inFlight ? inFlight.batch.usage.length + inFlight.batch.failures.length : 0),
+      droppedEvents,
+      workerStatus: workerOnline ? "up" : closed ? "closed" : "down",
+      workerRequests: requests.size,
+    };
+  }
+
+  return { record, report, clear, close, metrics };
 }
 
 export type QueryAnalytics = ReturnType<typeof createQueryAnalytics>;

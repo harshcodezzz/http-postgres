@@ -98,7 +98,7 @@ Compression is enabled by the application for responses above its threshold. Avo
 
 The first `SIGINT` or `SIGTERM` stops new HTTP work, gives role cleanup a bounded drain period, closes application resources, and then closes query pools. A second signal forces exit. Configure the service manager's termination grace period to cover in-flight transactions and persistence writes; the route reference documents the current execution deadlines.
 
-During a rolling deployment, remove a process from readiness before signaling it. Remember that uncommitted queued transactions on that process will be lost.
+During a rolling deployment, remove a process from readiness before signaling it. The gateway marks itself not ready as soon as it handles `SIGINT` or `SIGTERM`, stops role-cleanup scheduling, and lets Fastify stop admission and drain active work before closing query pools, analytics, metadata, Redis, and logger transports. `server.shutdownDeadlineMillis` bounds the sequence; a second termination signal forces immediate exit. Remember that uncommitted queued transactions on that process will be lost. `SIGKILL` cannot run cleanup, so the next process relies on SQLite transactions, WAL recovery, persistent cleanup leases, and PostgreSQL connection termination.
 
 ## Backup and restore
 

@@ -12,9 +12,12 @@ async function start() {
     await bootstrap(app.jsondb);
 
     const stopRoleCleanup = startRoleCleanupWorker(app.jsondb, app.db, app.log);
+    app.metrics.setCleanupWorker("running");
 
     app.addHook("preClose", async () => {
+      app.metrics.setCleanupWorker("stopping");
       await stopRoleCleanup();
+      app.metrics.setCleanupWorker("stopped");
     });
 
     const shutdown = async (signal: string) => {
@@ -24,13 +27,14 @@ async function start() {
       }
 
       isShuttingDown = true;
+      app.metrics.setReady(false);
 
       app.log.info({ signal }, "Starting graceful shutdown");
 
       const timeout = setTimeout(() => {
         console.error("Graceful shutdown timed out");
         process.exit(1);
-      }, 30_000);
+      }, config.server.shutdownDeadlineMillis);
 
       timeout.unref();
 

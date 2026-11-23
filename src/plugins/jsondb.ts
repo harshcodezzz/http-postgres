@@ -101,10 +101,12 @@ export class JsonDB {
   readonly dirPath: string;
   private database?: DatabaseSync;
   private opening?: Promise<DatabaseSync>;
+  private operationErrors = 0;
 
   private withWrite<T>(operation: () => Promise<T>): Promise<T> {
     const previous = writeQueues.get(this.filePath) ?? Promise.resolve();
     const result = previous.then(operation);
+    void result.catch(() => { this.operationErrors++; });
     const settled = result.then(() => {}, () => {});
     writeQueues.set(this.filePath, settled);
     void settled.then(() => {
@@ -344,6 +346,21 @@ export class JsonDB {
         const cleanup = cleanupFromRow(row);
         return cleanup ? [cleanup] : [];
       });
+  }
+
+  async metrics() {
+    const now = new Date().toISOString();
+    const row = (await this.open()).prepare(`SELECT
+      COUNT(*) AS pending,
+      SUM(CASE WHEN cleanup_after > ? THEN 1 ELSE 0 END) AS provisioning,
+      SUM(attempts) AS failed
+      FROM pending_role_cleanups`).get(now);
+    return {
+      pendingRoleProvisioning: isObject(row) && typeof row.provisioning === "number" ? row.provisioning : 0,
+      pendingRoleCleanup: isObject(row) && typeof row.pending === "number" ? row.pending : 0,
+      failedCleanupAttempts: isObject(row) && typeof row.failed === "number" ? row.failed : 0,
+      operationErrors: this.operationErrors,
+    };
   }
 
   async isRoleActive(database: string, roleToken: string): Promise<boolean> {
