@@ -9,18 +9,28 @@ import { createGatewayLogger } from "./plugins/logger.js";
 export async function buildApp() {
   const { logger, close } = createGatewayLogger();
   const loggerInstance: FastifyBaseLogger = logger;
+
   const app = Fastify({ loggerInstance });
+
   app.addHook("onClose", close);
   app.log.info("Logger initialized");
 
   try {
     await registerPlugins(app);
-    await app.register(compress, { threshold: 1024 });
+
+    await app.register(compress, {
+      threshold: 4096,
+      encodings: ["gzip", "deflate"],
+      zlibOptions: {
+        level: 1,
+      },
+      global: true,
+    });
+
     await registerMiddlewares(app);
     await registerRoutes(app);
   } catch (error) {
     await app.close().catch(() => {});
-    await close().catch(() => {});
     throw error;
   }
 
