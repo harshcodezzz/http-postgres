@@ -54,11 +54,18 @@ export async function verifyPassword(
 export default async function bootstrap(
   db: JsonDB = new JsonDB(),
 ): Promise<DataStore> {
+  if ((await db.get<DataStore["admin"]>("admin"))?.hash) {
+    console.log("[Bootstrap] Existing admin configuration loaded");
+    return db.read<DataStore>();
+  }
+
+  const candidatePassword = randomBytes(32).toString("base64url");
+  const candidateHash = await hashPassword(candidatePassword);
   let password: string | undefined;
-  const updatedData = await db.update<DataStore>(async (data) => {
+  const updatedData = await db.update<DataStore>((data) => {
     if (data.admin?.hash) return data;
-    password = randomBytes(32).toString("base64url");
-    return { ...data, admin: { hash: await hashPassword(password) } };
+    password = candidatePassword;
+    return { ...data, admin: { hash: candidateHash } };
   });
 
   if (!password) {

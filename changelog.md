@@ -4,17 +4,21 @@
 
 ### Added
 
+- Migrated gateway metadata to a versioned SQLite database with WAL, indexed API-key and role lookups, normalized database bindings, transactional mutations, and automatic crash-safe migration from `data/data.json` with a retained backup.
+- Added a persistent bounded role-cleanup scheduler with cross-process leases, exponential backoff, jitter, one-hour delay caps, and indexed due-work metadata.
 - Added public `GET /health/live` and dependency-aware `GET /health/ready` probes. Readiness checks PostgreSQL and configured Redis with bounded, briefly cached, concurrent-deduplicated checks and returns `503` when required dependencies are unavailable.
 
 ### Fixed
 
-- Made JSON metadata reads use one full-file read while preserving locked atomic writes and explicit corrupted-file failures.
+- Preserved explicit corruption failures during legacy JSON migration instead of replacing malformed metadata with an empty SQLite database.
 - Persisted scoped-role cleanup intent before PostgreSQL role creation so interrupted API-key creation, scope updates, and legacy-scope migrations can recover without orphaning roles. Cleanup is idempotent and rechecks active key ownership before dropping a role.
 - Added throttled, credential-safe logging for every PostgreSQL pool error path and bounded rotated failure-log retention to 30 files.
 - Preserved pre-dispatch execution-limit errors in transaction commits, including `503 RESULT_MEMORY_BUSY`, instead of converting them to `400 QUERY_EXECUTION_ERROR`. Asynchronous transaction batches now classify these capacity failures as `failed` rather than `rejected`.
 
 ### Changed
 
+- API-key verification now performs an indexed SQLite lookup instead of loading every API-key record. PostgreSQL administrative operations and role maintenance use the application-owned administrative pool; the previous module-owned maintenance pools were removed.
+- Moved API-key parsing, hashing, and masking into a focused crypto service while retaining the existing exports for compatibility.
 - Persist only error-level gateway failures in rotating `logs/failed.*.log` files. Routine informational logs remain available on stdout, and API-key audit logs remain separate.
 
 ## 1.6.0 - 2026-11-22

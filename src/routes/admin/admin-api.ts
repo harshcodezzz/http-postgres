@@ -50,7 +50,7 @@ const adminApiRoutes: FastifyPluginAsync = async (fastify) => {
 
   fastify.post("/keys/cleanup/retry", async () => ({
     success: true,
-    roleCleanup: await retryPendingRoleCleanups(fastify.jsondb, fastify.db),
+    roleCleanup: await retryPendingRoleCleanups(fastify.jsondb, fastify.db, true),
   }));
 
   fastify.get<{ Params: { id: string } }>("/keys/:id", async (request, reply) => {
@@ -159,6 +159,7 @@ const adminApiRoutes: FastifyPluginAsync = async (fastify) => {
 
     const success = await deleteApiKey(request.params.id, fastify.jsondb, {
       hardDelete: isHard,
+      pgPool: fastify.db,
     });
 
     if (!success) {

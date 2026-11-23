@@ -1,11 +1,16 @@
-import { randomBytes, createHash } from "node:crypto";
+import { randomBytes, randomUUID, createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { Pool } from "pg";
 import type { FastifyBaseLogger } from "fastify";
-import config from "../config/index.js";
 import { crudList, type DatabaseAccess, type TableName } from "../config/query-privileges.js";
 import { deprovisionQueryAccess, isolateQueryAccess, provisionQueryAccess, queryAccess, type QueryAccess } from "./query-access.js";
 import { appendAuditLine } from "./log-files.js";
+import {
+  hashApiKeySecret,
+  maskApiKey,
+  parseApiKey,
+  type ApiKeyEnvironment,
+} from "../services/api-key/crypto.js";
 import {
   JsonDB,
   type ApiKeyRecord,
@@ -21,10 +26,8 @@ import {
   createPostgresDatabase,
   alterPostgresDatabase,
   deletePostgresDatabase,
-  closeDatabasePool,
   SYSTEM_DATABASES,
   DatabaseError,
-  setDatabaseLogger,
   type CreatePostgresDatabaseOptions,
   type PostgresDatabaseDetails,
   type AlterPostgresDatabaseOptions,
@@ -47,7 +50,7 @@ export {
 
 export { ApiKeyRecord };
 
-export type ApiKeyEnvironment = "LIVE" | "TEST";
+export type { ApiKeyEnvironment } from "../services/api-key/crypto.js";
 export type ApiKeyStatus = "active" | "revoked";
 
 export type VerifyApiKeyError =
@@ -75,8 +78,9 @@ const pendingLastUsedWrites = new Set<string>();
 const pendingScopeMigrations = new Map<string, Promise<DatabaseAccess | undefined>>();
 const activeCleanupRuns = new Map<string, Promise<RoleCleanupStatus>>();
 const provisioningCleanupDelayMs = 5 * 60_000;
-let apiKeyPoolLogger: FastifyBaseLogger | undefined;
-let lastApiKeyPoolErrorAt = 0;
+const cleanupBatchSize = 10;
+const cleanupLeaseMs = 60_000;
+const cleanupRetryCapMs = 60 * 60_000;
 
 export interface RoleCleanupStatus {
   pending: number;
@@ -123,21 +127,27 @@ function removeRoleCleanups(
 
 async function persistProvisioningIntent(db: JsonDB, keyId: string, database: string, roleToken: string) {
   const id = cleanupId(database, roleToken);
-  await db.update<DataStore>((current) => ({
-    ...current,
-    pendingRoleCleanups: {
-      ...current.pendingRoleCleanups,
-      [id]: current.pendingRoleCleanups?.[id] ?? {
-        id,
-        keyId,
-        database,
-        roleToken,
-        createdAt: new Date().toISOString(),
-        cleanupAfter: new Date(Date.now() + provisioningCleanupDelayMs).toISOString(),
-        attempts: 0,
+  await db.update<DataStore>((current) => {
+    const existing = current.pendingRoleCleanups?.[id];
+    if (existing?.leaseExpiresAt && Date.parse(existing.leaseExpiresAt) > Date.now()) {
+      throw new Error("PostgreSQL role cleanup is already in progress; retry provisioning");
+    }
+    return {
+      ...current,
+      pendingRoleCleanups: {
+        ...current.pendingRoleCleanups,
+        [id]: {
+          id,
+          keyId,
+          database,
+          roleToken,
+          createdAt: existing?.createdAt ?? new Date().toISOString(),
+          cleanupAfter: new Date(Date.now() + provisioningCleanupDelayMs).toISOString(),
+          attempts: existing?.attempts ?? 0,
+        },
       },
-    },
-  }));
+    };
+  });
 }
 
 function cleanupError(error: unknown) {
@@ -146,60 +156,45 @@ function cleanupError(error: unknown) {
 }
 
 export async function getRoleCleanupStatus(db: JsonDB = new JsonDB()): Promise<RoleCleanupStatus> {
-  const data = await db.read<DataStore>();
-  const cleanups = Object.values(data.pendingRoleCleanups ?? {}).map(({ roleToken: _roleToken, ...cleanup }) => cleanup);
-  cleanups.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+  const cleanups = (await db.listRoleCleanups()).map(({ roleToken: _roleToken, ...cleanup }) => cleanup);
   return { pending: cleanups.length, cleanups };
 }
 
-export function retryPendingRoleCleanups(db: JsonDB = new JsonDB(), pool: Pool = getApiKeyPool()) {
+export function retryPendingRoleCleanups(
+  db: JsonDB = new JsonDB(),
+  pool?: Pool,
+  force = false,
+) {
   const runKey = db.filePath;
   const running = activeCleanupRuns.get(runKey);
   if (running) return running;
   const operation = (async () => {
-    const snapshot = await db.read<DataStore>();
-    const secret = snapshot.queryRoleSecret;
+    const secret = await db.get<string>("queryRoleSecret");
     if (!secret) return getRoleCleanupStatus(db);
-    for (const cleanup of Object.values(snapshot.pendingRoleCleanups ?? {})) {
-      if (cleanup.cleanupAfter && Date.parse(cleanup.cleanupAfter) > Date.now()) continue;
+    const leaseOwner = randomUUID();
+    const now = Date.now();
+    const claimed = await db.claimRoleCleanups(
+      leaseOwner,
+      new Date(now).toISOString(),
+      new Date(now + cleanupLeaseMs).toISOString(),
+      cleanupBatchSize,
+      force,
+    );
+    for (const cleanup of claimed) {
       const attemptedAt = new Date().toISOString();
       try {
-        const latest = await db.read<DataStore>();
-        const activeOwner = Object.values(latest.apiKeys ?? {}).some((record) =>
-          record.status === "active" && record.accessScopes?.[cleanup.database]?.roleToken === cleanup.roleToken
-        );
-        if (activeOwner) {
-          await db.update<DataStore>((current) => {
-            const pendingRoleCleanups = { ...current.pendingRoleCleanups };
-            if (pendingRoleCleanups[cleanup.id]?.roleToken === cleanup.roleToken) delete pendingRoleCleanups[cleanup.id];
-            return { ...current, pendingRoleCleanups };
-          });
+        if (await db.isRoleActive(cleanup.database, cleanup.roleToken)) {
+          await db.completeRoleCleanup(cleanup.id, leaseOwner);
           continue;
         }
-        await deprovisionQueryAccess(cleanup.database, cleanup.roleToken, secret, pool);
-        await db.update<DataStore>((current) => {
-          if (current.pendingRoleCleanups?.[cleanup.id]?.roleToken !== cleanup.roleToken) return current;
-          const pendingRoleCleanups = { ...current.pendingRoleCleanups };
-          delete pendingRoleCleanups[cleanup.id];
-          return { ...current, pendingRoleCleanups };
-        });
+        await deprovisionQueryAccess(cleanup.database, cleanup.roleToken, secret, requirePool(pool));
+        await db.completeRoleCleanup(cleanup.id, leaseOwner);
       } catch (error) {
-        await db.update<DataStore>((current) => {
-          const latest = current.pendingRoleCleanups?.[cleanup.id];
-          if (!latest || latest.roleToken !== cleanup.roleToken) return current;
-          return {
-            ...current,
-            pendingRoleCleanups: {
-              ...current.pendingRoleCleanups,
-              [cleanup.id]: {
-                ...latest,
-                attempts: latest.attempts + 1,
-                lastAttemptAt: attemptedAt,
-                lastError: cleanupError(error),
-              },
-            },
-          };
-        });
+        const attempts = cleanup.attempts + 1;
+        const baseDelay = Math.min(cleanupRetryCapMs, 1_000 * 2 ** Math.min(attempts, 12));
+        const delay = Math.floor(baseDelay * (0.75 + Math.random() * 0.5));
+        await db.failRoleCleanup(cleanup.id, leaseOwner, attemptedAt,
+          new Date(Date.now() + delay).toISOString(), cleanupError(error));
       }
     }
     return getRoleCleanupStatus(db);
@@ -209,14 +204,11 @@ export function retryPendingRoleCleanups(db: JsonDB = new JsonDB(), pool: Pool =
 }
 
 export function startRoleCleanupWorker(db: JsonDB, pool: Pool, log: FastifyBaseLogger) {
-  apiKeyPoolLogger = log;
-  setDatabaseLogger(log);
   let stopped = false;
-  const retry = () => void retryPendingRoleCleanups(db, pool).then((status) => {
-    if (status.pending) log.warn({ roleCleanup: status }, "PostgreSQL role cleanup remains pending");
-  }).catch((error) => log.error({ err: error }, "Could not retry PostgreSQL role cleanup"));
+  const retry = () => void retryPendingRoleCleanups(db, pool)
+    .catch((error) => log.error({ err: error }, "Could not run PostgreSQL role cleanup scheduler"));
   retry();
-  const timer = setInterval(retry, 30_000).unref();
+  const timer = setInterval(retry, 5_000).unref();
   return async () => {
     if (stopped) return;
     stopped = true;
@@ -225,37 +217,9 @@ export function startRoleCleanupWorker(db: JsonDB, pool: Pool, log: FastifyBaseL
   };
 }
 
-let sharedPgPool: Pool | null = null;
-
-export function getApiKeyPool(): Pool {
-  if (!sharedPgPool) {
-    sharedPgPool = new Pool({
-      connectionString: config.database.url,
-      min: 1,
-      max: 5,
-      idleTimeoutMillis: 10_000,
-    });
-    sharedPgPool.on("error", (error) => {
-      const now = Date.now();
-      if (now - lastApiKeyPoolErrorAt < 30_000) return;
-      lastApiKeyPoolErrorAt = now;
-      apiKeyPoolLogger?.error({ err: {
-        name: error.name,
-        message: "Unexpected PostgreSQL pool error",
-        ...("code" in error && typeof error.code === "string" && { code: error.code }),
-      } }, "API-key PostgreSQL pool error");
-    });
-  }
-  return sharedPgPool;
-}
-
-export async function closeApiKeyPool(): Promise<void> {
-  if (sharedPgPool) {
-    const pool = sharedPgPool;
-    sharedPgPool = null;
-    await pool.end();
-  }
-  await closeDatabasePool();
+function requirePool(pool: Pool | undefined): Pool {
+  if (!pool) throw new Error("An application-owned PostgreSQL pool is required");
+  return pool;
 }
 
 export interface ApiKeyAuditLog {
@@ -306,6 +270,7 @@ export interface VerifyApiKeyOptions {
 export interface DeleteApiKeyOptions {
   hardDelete?: boolean;
   auditLogPath?: string;
+  pgPool?: Pool;
 }
 
 export interface UpdateApiKeyScopeOptions extends ApiKeyScopeInput {
@@ -314,31 +279,7 @@ export interface UpdateApiKeyScopeOptions extends ApiKeyScopeInput {
   auditLogPath?: string;
 }
 
-export function parseApiKey(apiKey: string): {
-  environment: ApiKeyEnvironment;
-  secret: string;
-} | null {
-  if (typeof apiKey !== "string") return null;
-  const match = /^KEY_(LIVE|TEST)_([A-Za-z0-9_-]{16,})$/.exec(apiKey);
-  if (!match) return null;
-
-  return {
-    environment: match[1] as ApiKeyEnvironment,
-    secret: match[2],
-  };
-}
-
-export function hashApiKeySecret(secret: string): string {
-  return createHash("sha256").update(secret).digest("hex");
-}
-
-export function maskApiKey(apiKey: string): string {
-  const parsed = parseApiKey(apiKey);
-  if (!parsed) return "INVALID_KEY";
-
-  const { environment, secret } = parsed;
-  return `KEY_${environment}_${secret.slice(0, 4)}...${secret.slice(-4)}`;
-}
+export { hashApiKeySecret, maskApiKey, parseApiKey } from "../services/api-key/crypto.js";
 
 export async function writeAuditLog(
   entry: ApiKeyAuditLog,
@@ -439,7 +380,7 @@ async function provisionScopes(
       oid,
       policy,
       secret,
-      pgPool ?? getApiKeyPool(),
+      requirePool(pgPool),
       owner,
       (roleToken) => persistProvisioningIntent(db, owner, database, roleToken),
     );
@@ -570,7 +511,7 @@ function migrateSharedScope(
       oid,
       scope,
       secret,
-      pool ?? getApiKeyPool(),
+      requirePool(pool),
       record.id,
       (roleToken) => persistProvisioningIntent(db, record.id, database, roleToken),
     );
@@ -646,8 +587,10 @@ export async function verifyApiKey(
   }
 
   const keyHash = hashApiKeySecret(parsed.secret);
-  const data = await db.read<DataStore>();
-  const record = data.apiKeys?.[keyHash];
+  const [record, queryRoleSecret] = await Promise.all([
+    db.findApiKey(keyHash),
+    db.get<string>("queryRoleSecret"),
+  ]);
 
   if (!record) {
     await writeAuditLog(
@@ -725,11 +668,11 @@ export async function verifyApiKey(
   let access: QueryAccess | undefined;
   if (record.accessScopes !== undefined) {
     let scope = Object.hasOwn(record.accessScopes, databaseName) ? record.accessScopes[databaseName] : undefined;
-    if (!scope?.roleToken || !data.queryRoleSecret) return { valid: false, error: "DATABASE_SCOPE_UNBOUND" };
+    if (!scope?.roleToken || !queryRoleSecret) return { valid: false, error: "DATABASE_SCOPE_UNBOUND" };
     if (scope.roleOwner !== record.id) {
       try {
         const pool = dbOrOptions instanceof JsonDB ? undefined : dbOrOptions?.pgPool;
-        scope = await migrateSharedScope(db, keyHash, record, databaseName, databaseOid, scope, data.queryRoleSecret, pool);
+        scope = await migrateSharedScope(db, keyHash, record, databaseName, databaseOid, scope, queryRoleSecret, pool);
       } catch (error) {
         if (error instanceof DatabaseError && error.code === "DATABASE_SCOPE_UNBOUND") {
           return { valid: false, error: "DATABASE_SCOPE_UNBOUND" };
@@ -739,7 +682,7 @@ export async function verifyApiKey(
       if (!scope) return { valid: false, error: "DATABASE_SCOPE_UNBOUND" };
     }
     access = {
-      ...queryAccess(data.queryRoleSecret, scope.roleToken),
+      ...queryAccess(queryRoleSecret, scope.roleToken),
       readOnly: scope.database.every((operation) => operation === "r") &&
         (!scope.tables.length || scope.table.every((operation) => operation === "r")),
     };
@@ -775,6 +718,7 @@ export async function revokeApiKey(
   apiKeyOrId: string,
   db: JsonDB = new JsonDB(),
   auditLogPath = API_KEY_LOG_FILE,
+  pgPool?: Pool,
 ): Promise<boolean> {
   const parsed = parseApiKey(apiKeyOrId);
   const keyHash = parsed ? hashApiKeySecret(parsed.secret) : null;
@@ -819,7 +763,7 @@ export async function revokeApiKey(
 
   if (revokedRecord) {
     const rec = revokedRecord as ApiKeyRecord;
-    await retryPendingRoleCleanups(db, getApiKeyPool());
+    await retryPendingRoleCleanups(db, requirePool(pgPool), true);
     await writeAuditLog(
       {
         timestamp: new Date().toISOString(),
@@ -942,7 +886,7 @@ export async function updateApiKeyScope(
     );
   }
 
-  if (previousScopes) await retryPendingRoleCleanups(db, options.pgPool ?? getApiKeyPool());
+  if (previousScopes) await retryPendingRoleCleanups(db, requirePool(options.pgPool), true);
 
   const rec = updatedRecord as ApiKeyRecord;
   await writeAuditLog(
@@ -973,7 +917,7 @@ export async function deleteApiKey(
   const auditPath = options?.auditLogPath ?? API_KEY_LOG_FILE;
 
   if (!options?.hardDelete) {
-    return revokeApiKey(apiKeyOrId, db, auditPath);
+    return revokeApiKey(apiKeyOrId, db, auditPath, options?.pgPool);
   }
 
   const parsed = parseApiKey(apiKeyOrId);
@@ -1011,7 +955,7 @@ export async function deleteApiKey(
 
   if (deletedRecord) {
     const rec = deletedRecord as ApiKeyRecord;
-    await retryPendingRoleCleanups(db, getApiKeyPool());
+    await retryPendingRoleCleanups(db, requirePool(options?.pgPool), true);
     await writeAuditLog(
       {
         timestamp: new Date().toISOString(),
@@ -1035,8 +979,7 @@ export async function deleteApiKey(
 export async function listApiKeys(
   db: JsonDB = new JsonDB(),
 ): Promise<ApiKeyRecord[]> {
-  const data = await db.read<DataStore>();
-  return Object.values(data.apiKeys ?? {});
+  return db.listApiKeys();
 }
 
 /**
@@ -1046,7 +989,5 @@ export async function getApiKeyById(
   id: string,
   db: JsonDB = new JsonDB(),
 ): Promise<ApiKeyRecord | null> {
-  const data = await db.read<DataStore>();
-  const record = Object.values(data.apiKeys ?? {}).find((r) => r.id === id);
-  return record ?? null;
+  return await db.findApiKeyById(id) ?? null;
 }

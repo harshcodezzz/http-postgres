@@ -1,7 +1,6 @@
 import { Client, escapeLiteral, Pool, type PoolClient } from "pg";
 import config from "../config/index.js";
 import type { JsonDB } from "../plugins/jsondb.js";
-import type { FastifyBaseLogger } from "fastify";
 
 export class DatabaseError extends Error {
   readonly code: string;
@@ -15,13 +14,6 @@ export class DatabaseError extends Error {
 
 export const SYSTEM_DATABASES = new Set(["postgres", "template0", "template1"]);
 
-let defaultPgPool: Pool | null = null;
-let databaseLogger: FastifyBaseLogger | undefined;
-let lastPoolErrorAt = 0;
-
-export function setDatabaseLogger(log: FastifyBaseLogger) {
-  databaseLogger = log;
-}
 
 function withoutDatabases<T>(entries: Record<string, T>, ...names: string[]): Record<string, T> {
   return Object.fromEntries(Object.entries(entries).filter(([name]) => !names.includes(name)));
@@ -113,34 +105,11 @@ async function inDatabaseTransaction(pool: Pool, operation: (client: PoolClient)
   }
 }
 
-export function getDatabasePool(): Pool {
-  if (!defaultPgPool) {
-    defaultPgPool = new Pool({
-      connectionString: config.database.url,
-      min: 1,
-      max: 5,
-      idleTimeoutMillis: 10_000,
-    });
-    defaultPgPool.on("error", (err) => {
-      const now = Date.now();
-      if (now - lastPoolErrorAt < 30_000) return;
-      lastPoolErrorAt = now;
-      databaseLogger?.error({ err: {
-        name: err.name,
-        message: "Unexpected PostgreSQL pool error",
-        ...("code" in err && typeof err.code === "string" && { code: err.code }),
-      } }, "Database maintenance PostgreSQL pool error");
-    });
+function requireDatabasePool<T extends Pick<Pool, "query">>(pool: T | undefined): T {
+  if (!pool) {
+    throw new Error("An application-owned PostgreSQL pool is required");
   }
-  return defaultPgPool;
-}
-
-export async function closeDatabasePool(): Promise<void> {
-  if (defaultPgPool) {
-    const pool = defaultPgPool;
-    defaultPgPool = null;
-    await pool.end();
-  }
+  return pool;
 }
 
 /**
@@ -174,7 +143,7 @@ export async function getPostgresDatabaseOid(
     return undefined;
   }
 
-  const pg = pool ?? getDatabasePool();
+  const pg = requireDatabasePool(pool);
 
   try {
     const { rows } = await pg.query<{ oid: string }>(
@@ -196,7 +165,7 @@ export async function getPostgresDatabaseOid(
  * Lists databases from the PostgreSQL catalog.
  */
 export async function listPostgresDatabases(pool?: Pool, includeTemplates = false): Promise<string[]> {
-  const pg = pool ?? getDatabasePool();
+  const pg = requireDatabasePool(pool);
   try {
     const res = await pg.query<{ datname: string }>(
       "SELECT datname FROM pg_catalog.pg_database WHERE $1 OR NOT datistemplate ORDER BY datname",
@@ -284,7 +253,7 @@ export async function getPostgresDatabaseDetails(
     if (!isPostgresIdentifier(databaseName)) return null;
   }
 
-  const pg = pool ?? getDatabasePool();
+  const pg = requireDatabasePool(pool);
 
   try {
     const res = await pg.query<{
@@ -421,7 +390,7 @@ export async function createPostgresDatabase(
     );
   }
 
-  const pg = pool ?? getDatabasePool();
+  const pg = requireDatabasePool(pool);
 
   const exists = await checkDatabaseExists(name, pg);
   if (exists) {
@@ -555,7 +524,7 @@ export async function alterPostgresDatabase(
     );
   }
 
-  const pg = pool ?? getDatabasePool();
+  const pg = requireDatabasePool(pool);
 
   const databaseOid = await getPostgresDatabaseOid(databaseName, pg);
   if (!databaseOid) {
@@ -795,7 +764,7 @@ export async function deletePostgresDatabase(
     );
   }
 
-  const pg = pool ?? getDatabasePool();
+  const pg = requireDatabasePool(pool);
 
   const databaseOid = await getPostgresDatabaseOid(databaseName, pg);
   if (!databaseOid) {

@@ -43,14 +43,16 @@ The runtime artifact needs `dist/`, production dependencies, `package.json`, and
 
 | State | Location | Backup expectation |
 | --- | --- | --- |
-| Admin hash, API-key records, scoped-role secret | `data/data.json` | Required; encrypt and back up consistently |
+| Admin hash, API-key records, scoped-role secret, role maintenance | `data/data.sqlite` | Required; encrypt and back up consistently |
 | Async and batch execution records | PostgreSQL `http_postgres_gateway` schema | Include in normal PostgreSQL backups |
 | Analytics | `data/analytics/analytics.sqlite` by default | Optional, according to observability retention requirements |
 | Failure logs and API-key audit trail | `logs/` | Ship or retain according to audit policy; routine informational logs are emitted only to stdout |
 | Queued transactions before commit | Process memory | Not recoverable; clients must recreate them |
 | Rate-limit counters | Redis or process memory | Normally ephemeral |
 
-Do not restore `data/data.json` from a different logical environment without also verifying its API-key database identity bindings and provisioned PostgreSQL roles.
+On first startup after upgrading, the gateway migrates `data/data.json` into `data/data.sqlite` under an exclusive SQLite transaction and retains the original as `data/data.json.backup`. Migration validates records before committing and startup fails on malformed metadata. Keep the backup until the migrated gateway and scoped roles have been verified. Subsequent startups use SQLite and do not overwrite the backup.
+
+Do not restore metadata from a different logical environment without also verifying its API-key database identity bindings and provisioned PostgreSQL roles. For a rollback to a release that predates SQLite metadata, stop every gateway process, preserve the SQLite files, and restore `data/data.json.backup` as `data/data.json` before starting the older release.
 
 ## Health checks
 
@@ -71,7 +73,7 @@ Start conservatively. Watch checkout timeouts and database utilization before in
 ## Multiple processes and replicas
 
 - Use Redis so rate-limit counters are shared.
-- Ensure every replica sees consistent API-key metadata. A shared path must support SQLite locking and atomic rename; a local copy that drifts is unsafe.
+- Ensure every replica sees the same local-host SQLite metadata files. WAL and SQLite locking coordinate gateway processes on one machine; a local copy that drifts or a network filesystem with unverified locking is unsafe.
 - Use session affinity for editable queued-transaction workflows because their state is held in one process.
 - Give each process a separate audit-log directory, or ship stdout and audit events to a centralized collector.
 - Decide whether analytics should be per-process or share a supported local filesystem on the same host.
@@ -100,7 +102,7 @@ During a rolling deployment, remove a process from readiness before signaling it
 
 ## Backup and restore
 
-Back up `data/data.json` together with PostgreSQL on a schedule appropriate for key changes. Encrypt backups and test restoration in an isolated environment. Logs and analytics have different retention and privacy characteristics and may use separate policies.
+Back up `data/data.sqlite` together with its WAL state using a SQLite-aware snapshot while gateway processes are stopped or checkpointed, and coordinate it with PostgreSQL on a schedule appropriate for key changes. Encrypt backups and test restoration in an isolated environment. Retain `data/data.json.backup` for rollback. Logs and analytics have different retention and privacy characteristics and may use separate policies.
 
 After restoring:
 

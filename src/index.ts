@@ -1,16 +1,12 @@
 import config from "./config/index.js";
 import bootstrap from "./utils/bootstrap.js";
 import { buildApp } from "./app.js";
-import { closeApiKeyPool, startRoleCleanupWorker } from "./utils/api-key.js";
+import { startRoleCleanupWorker } from "./utils/api-key.js";
 
 async function start() {
   const app = await buildApp();
 
   let isShuttingDown = false;
-
-  app.addHook("onClose", async () => {
-    await closeApiKeyPool();
-  });
 
   try {
     await bootstrap(app.jsondb);

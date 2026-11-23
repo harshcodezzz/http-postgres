@@ -28,6 +28,7 @@ HTTP PostgreSQL Gateway (persistent service)
 - **PostgreSQL-enforced security** — Scoped API keys map to dedicated PostgreSQL roles with granular database- and table-level CRUD permissions.
 - **Flexible execution modes** — Supports immediate queries, background asynchronous queries, atomic multi-statement batches, and staged queued transactions.
 - **Operational safeguards** — Adaptive connection growth, rate limiting, execution timeouts, bounded result buffers, query analytics, and graceful shutdown.
+- **Transactional metadata** — Versioned SQLite metadata with indexed key verification, WAL concurrency, automatic legacy JSON migration, and persistent role-maintenance recovery.
 
 ---
 

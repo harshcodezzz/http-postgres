@@ -20,13 +20,13 @@ Fastify server
           +--> PostgreSQL admin pool -----+
           +--> per-key query pools -------+--> PostgreSQL over TCP or Unix socket
           +--> Redis or in-memory rate-limit store
-          +--> JSON metadata store + SQLite lock
+          +--> SQLite metadata store
           `--> SQLite analytics worker
 ```
 
 ### HTTP layer
 
-Fastify owns request parsing, compression, routing, error responses, and lifecycle hooks. Authentication runs before protected routes. Public access is limited to `GET` and `HEAD /health`.
+Fastify owns request parsing, compression, routing, error responses, and lifecycle hooks. Authentication runs before protected routes. Public access is limited to the liveness and readiness routes.
 
 The caller does not need a PostgreSQL driver or socket API. It must be able to keep the HTTP request open for the selected execution mode, or submit asynchronous work and poll later.
 
@@ -40,7 +40,7 @@ Client SQL runs through pools selected by database and access identity. The gate
 
 ### API-key metadata
 
-`data/data.json` stores the administrator password hash, API-key records, database identity bindings, and the secret material needed to derive credentials for scoped PostgreSQL roles. A SQLite lock file coordinates writers. This file is security-sensitive and operationally essential.
+`data/data.sqlite` stores the administrator password hash, indexed API-key records, normalized database identity bindings and scopes, role-cleanup scheduling state, and the secret material needed to derive credentials for scoped PostgreSQL roles. WAL and short transactions coordinate readers and writers. A first startup automatically validates and migrates legacy `data/data.json`, retaining `data/data.json.backup`. These files are security-sensitive and operationally essential.
 
 ### Rate-limit store
 
@@ -86,7 +86,7 @@ Queued transactions have a different purpose: clients create an in-memory queue,
 ## Scaling boundaries
 
 - PostgreSQL-backed execution records can be read by any process with the same administrative database and key metadata.
-- `data/data.json` may be shared only through storage that supports the locking and atomic-rename semantics described in [Configuration](configuration.md#runtime-files).
+- `data/data.sqlite` may be shared by gateway processes on one host when the local filesystem provides correct SQLite WAL and locking semantics.
 - Redis is required for rate-limit counters shared across processes.
 - Queued transactions and the in-memory fallback store are process-local, so routing a workflow across replicas is unsafe without session affinity.
 - Analytics can share a local directory among processes on one host when the filesystem provides SQLite locking. Separate directories produce separate counters.

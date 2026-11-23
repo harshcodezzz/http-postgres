@@ -39,7 +39,7 @@ PostgreSQL privileges are additive. A narrow grant created by the gateway cannot
 
 - Store `DATABASE_URL`, `REDIS_URL`, and deployment-specific query URLs in a secret manager rather than source control.
 - Protect the first-start administrator password and rotate access if it is exposed.
-- Restrict `data/data.json` to the service account. It contains key metadata and secret material for scoped database roles.
+- Restrict `data/data.sqlite`, its WAL/SHM files, and `data/data.json.backup` to the service account. They contain key metadata and secret material for scoped database roles.
 - Protect logs and analytics. Failed SQL can contain identifiers and literals; full SQL storage increases that exposure.
 - Never send secrets as SQL literals. Use bound parameters.
 - Do not include `.env`, `data/`, `logs/`, or generated backups in container images or repository commits.

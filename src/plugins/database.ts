@@ -2,7 +2,6 @@ import fp from "fastify-plugin";
 import { Pool } from "pg";
 import type { FastifyPluginAsync } from "fastify";
 import config from "../config/index.js";
-import { setDatabaseLogger } from "../utils/pg-database.js";
 
 declare module "fastify" {
   interface FastifyInstance {
@@ -12,7 +11,6 @@ declare module "fastify" {
 }
 
 const databasePlugin: FastifyPluginAsync = async (app) => {
-  setDatabaseLogger(app.log);
   let lastPoolErrorAt = 0;
   const pool = new Pool({
     connectionString: config.database.url,

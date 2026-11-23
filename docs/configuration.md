@@ -285,15 +285,16 @@ The update refreshes the PostgreSQL identity bindings and preserves the key's re
 
 | Path | Contents |
 | --- | --- |
-| `data/data.json` | Local JsonDB file with the admin password hash, API key records, and the credential seed for scoped PostgreSQL roles. Keep this file to retain credentials across restarts. |
-| `data/data.json.lock` | SQLite lock file used to serialize JsonDB writers. The operating system releases the lock on process exit. |
+| `data/data.sqlite` | Versioned SQLite metadata containing the admin hash, API keys, database bindings and scopes, role mappings, and persistent cleanup schedule. |
+| `data/data.sqlite-wal`, `data/data.sqlite-shm` | SQLite WAL coordination files while gateway processes are running. Include them in SQLite-aware snapshots. |
+| `data/data.json.backup` | Retained pre-migration metadata backup for rollback. It is not rewritten after migration. |
 | `data/analytics/analytics.sqlite` | Cumulative query counts by API key and failed SQL records. |
 | `logs/failed.*.log` | Error-level gateway failures, rotated daily or at the configured `20m` size threshold. Routine informational logs are written only to stdout. |
 | `logs/current.log` | Symlink to the active failure log. |
 | `logs/api-keys.log` | Active API key audit events. Rotates at 5 MiB. |
 | `logs/api-keys.log.1` | Previous audit log generation. |
 
-Fastify's request completion logs print `responseTime` in milliseconds as a JSON string with three decimal places. Processes sharing JsonDB must use the same data path on a filesystem that supports SQLite locking and atomic rename. Writers wait up to five seconds for the lock. Keep the regular lock file in place while the gateway is running. When upgrading from the directory-based lock, stop older gateway processes that share the file. If an earlier crash left an empty `data.json.lock` directory, remove that directory before starting the upgrade. Use a separate audit-log directory per process. Transaction queues are held in process memory and have no runtime file.
+Fastify's request completion logs print `responseTime` in milliseconds as a JSON string with three decimal places. Processes sharing metadata must use the same local-host SQLite database on a filesystem with correct WAL locking. Writers wait up to five seconds for a transaction. Do not place metadata on a network filesystem unless its SQLite semantics have been verified. Use a separate audit-log directory per process. Transaction queues are held in process memory and have no runtime file.
 
 The gateway stores batch SQL, progress, and outcomes in `http_postgres_gateway.transactions`. It stores async query outcomes in `http_postgres_gateway.async_queries`. Both tables live in the administrative database. The administrative role must own the storage schema and its tables. A DBA can provision the schema with `CREATE SCHEMA http_postgres_gateway AUTHORIZATION gateway_admin`. If the schema is missing, the gateway needs database-level `CREATE` to provision it. Keep the schema private to the administrative role. Query and transaction records can be read repeatedly. Clients can delete finalized records explicitly, and age-based cleanup prunes them after the configured retention period. For executions that exceed their deadline without a stored outcome, the retention period starts at that deadline. Removing a keyed transaction record starts a separate retention window for its idempotency tombstone. For receipts whose records were removed before tombstones included the removal timestamp, cleanup uses the original submission time. Inputs and outcomes use base64-encoded JSON strings in JSONB columns, with older JSONB objects still readable. Deferred transaction queues remain process-local. New batch inputs omit bound values. Older receipts can contain original inputs until they are deleted or pruned. Async results still contain any values returned by the SQL itself.
 

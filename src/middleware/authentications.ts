@@ -2,8 +2,8 @@ import fp from "fastify-plugin";
 import type { FastifyPluginAsync } from "fastify";
 import {
   verifyApiKey,
-  isValidDatabaseName,
 } from "../utils/api-key.js";
+import { isValidDatabaseName } from "../utils/pg-database.js";
 import { verifyPassword, hashPassword } from "../utils/bootstrap.js";
 import type { DataStore, JsonDB } from "../plugins/jsondb.js";
 
@@ -45,8 +45,7 @@ export async function verifyAdminPassword(
   adminPassword: string,
   jsondb: JsonDB,
 ): Promise<boolean> {
-  const data = await jsondb.read<DataStore>();
-  const storedHash = data.admin?.hash;
+  const storedHash = (await jsondb.get<DataStore["admin"]>("admin"))?.hash;
   if (!storedHash) return false;
   const release = await acquireAdminVerification();
   if (!release) throw new AdminVerificationBusyError();

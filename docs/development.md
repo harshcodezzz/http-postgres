@@ -81,7 +81,7 @@ Security-sensitive changes deserve particular attention when they touch:
 - SQL policy, read-only enforcement, session reset, or connection reuse;
 - transaction commit confirmation and unknown outcomes;
 - secret-bearing errors and logs;
-- JsonDB locking, atomic writes, analytics worker recovery, or retention.
+- SQLite metadata migrations, transactions, role scheduling, analytics worker recovery, or retention.
 
 ## Pull request expectations
 
