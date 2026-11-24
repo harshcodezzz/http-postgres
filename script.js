@@ -15,11 +15,3 @@ for (const button of document.querySelectorAll("[data-copy-target]")) {
     }
   });
 }
-
-const themeToggle = document.querySelector("[data-theme-toggle]");
-themeToggle?.addEventListener("click", () => {
-  const dark = document.documentElement.classList.toggle("dark");
-  themeToggle.setAttribute("aria-pressed", String(dark));
-  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", dark ? "#000000" : "#ffffff");
-  try { localStorage.setItem("theme", dark ? "dark" : "light"); } catch {}
-});
