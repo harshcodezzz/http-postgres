@@ -5,6 +5,17 @@ import type { QueryPools } from "../utils/query-pool.js";
 import type { QueryAccess } from "../utils/query-access.js";
 import type { OperationalMetrics } from "../services/operational-metrics.js";
 
+export interface ReadinessResult {
+  status: "ready" | "not_ready";
+  checks: {
+    postgres: "up" | "down";
+    redis: "up" | "down" | "disabled";
+    metadata: "up" | "down";
+    queryMonitoring: "up" | "down";
+  };
+  latencyMs: { postgres: number; redis: number; metadata: number };
+}
+
 declare module "fastify" {
   interface FastifyInstance {
     db: Pool;
@@ -12,6 +23,8 @@ declare module "fastify" {
     jsondb: JsonDB;
     queryPools: QueryPools;
     metrics: OperationalMetrics;
+    checkReadiness(): Promise<ReadinessResult>;
+    beginShutdown(): void;
   }
 
   interface FastifyRequest {

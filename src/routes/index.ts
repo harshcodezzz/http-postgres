@@ -6,6 +6,7 @@ import adminRoutes from "./admin/index.js";
 import queryRoutes from "./query/index.js";
 import transactionRoutes from "./transaction/index.js";
 import { createQueryPools } from "../utils/query-pool.js";
+import type { ReadinessResult } from "../types/fastify.js";
 
 const readinessTimeoutMs = 2_000;
 const readinessCacheMs = 1_000;
@@ -37,38 +38,70 @@ export async function registerRoutes(app: FastifyInstance) {
   app.get("/health", healthRoute, live);
   app.get("/health/live", healthRoute, live);
 
-  type Readiness = {
-    status: "ready" | "not_ready";
-    checks: { postgres: "up" | "down"; redis: "up" | "down" | "disabled" };
-  };
-  let readiness: { expiresAt: number; result: Readiness } | undefined;
-  let checking: Promise<Readiness> | undefined;
+  let shuttingDown = false;
+  let readiness: { expiresAt: number; result: ReadinessResult } | undefined;
+  let checking: Promise<ReadinessResult> | undefined;
   let postgresChecking: Promise<unknown> | undefined;
+  let redisChecking: Promise<unknown> | undefined;
   const checkReadiness = () => {
+    if (shuttingDown) return Promise.resolve<ReadinessResult>({
+      status: "not_ready",
+      checks: { postgres: "up", redis: config.redis.enabled ? "up" : "disabled", metadata: "up", queryMonitoring: "up" },
+      latencyMs: { postgres: 0, redis: 0, metadata: 0 },
+    });
     if (readiness && readiness.expiresAt > Date.now()) return Promise.resolve(readiness.result);
     if (checking) return checking;
     checking = (async () => {
       postgresChecking ??= Promise.resolve(app.db.query("SELECT 1"))
         .finally(() => { postgresChecking = undefined; });
-      const [postgres, redis] = await Promise.all([
-        bounded(postgresChecking).then(() => true, () => false),
+      if (config.redis.enabled) {
+        redisChecking ??= app.redis.set("health:readiness", "1", 5)
+          .finally(() => { redisChecking = undefined; });
+      }
+      const check = async (operation: Promise<unknown>) => {
+        const startedAt = performance.now();
+        const healthy = await bounded(operation).then(() => true, () => false);
+        return { healthy, latencyMs: Math.max(0, Math.round(performance.now() - startedAt)) };
+      };
+      const [postgresResult, redisResult, metadataResult] = await Promise.all([
+        check(postgresChecking),
         config.redis.enabled
-          ? bounded(app.redis.set("health:readiness", "1", 5)).then(() => true, () => false)
-          : Promise.resolve(true),
+          ? check(redisChecking ?? Promise.reject(new Error("Redis check unavailable")))
+          : Promise.resolve({ healthy: true, latencyMs: 0 }),
+        check(app.jsondb.metrics()),
       ]);
-      const result: Readiness = {
-        status: postgres && redis ? "ready" : "not_ready",
+      const postgres = postgresResult.healthy;
+      const redis = redisResult.healthy;
+      const metadata = metadataResult.healthy;
+      const queryMonitoring = app.queryPools.capacity().monitoring.status !== "degraded";
+      const healthy = !shuttingDown && postgres && redis && metadata && queryMonitoring;
+      const result: ReadinessResult = {
+        status: healthy ? "ready" : "not_ready",
         checks: {
           postgres: postgres ? "up" : "down",
           redis: config.redis.enabled ? (redis ? "up" : "down") : "disabled",
+          metadata: metadata ? "up" : "down",
+          queryMonitoring: queryMonitoring ? "up" : "down",
+        },
+        latencyMs: {
+          postgres: postgresResult.latencyMs,
+          redis: redisResult.latencyMs,
+          metadata: metadataResult.latencyMs,
         },
       };
       readiness = { expiresAt: Date.now() + readinessCacheMs, result };
-      app.metrics.setReady(result.status === "ready");
+      app.metrics.setReady(healthy);
       return result;
     })().finally(() => { checking = undefined; });
     return checking;
   };
+  app.decorate("checkReadiness", checkReadiness);
+  app.decorate("beginShutdown", () => {
+    shuttingDown = true;
+    readiness = undefined;
+    app.metrics.setReady(false);
+  });
+  app.addHook("preClose", () => app.beginShutdown());
   app.get("/health/ready", healthRoute, async (_request, reply) => {
     reply.header("Cache-Control", "no-store");
     const result = await checkReadiness();

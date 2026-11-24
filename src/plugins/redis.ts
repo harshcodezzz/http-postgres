@@ -133,7 +133,11 @@ class RedisStore implements KeyValueStore {
   }
 
   async close() {
-    await this.client.quit();
+    try {
+      await this.client.quit();
+    } catch {
+      this.client.disconnect(false);
+    }
   }
 
   metrics() {

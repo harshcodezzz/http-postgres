@@ -125,7 +125,7 @@ const queryRoutes: FastifyPluginAsync<{ store: ExecutionStore; analytics?: Query
         const { status, code, message } = interruption;
         return failure(status, code, message);
       }
-      const { status, error } = queryExecutionError(err, queryAccess?.readOnly);
+      const { status, error } = queryExecutionError(err, queryAccess?.readOnly, fastify.queryPools);
       return { status, payload: { success: false, error } };
     } finally {
       execution.close();

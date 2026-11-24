@@ -10,40 +10,9 @@ const AUDIT_LOG_FILE = resolve(LOGS_DIRECTORY, "api-keys.log");
 const GATEWAY_LOG_FILE = resolve(LOGS_DIRECTORY, "current.log");
 
 async function checkHealth(fastify: FastifyInstance) {
-  let postgresHealthy = false;
-  let postgresLatency = 0;
-  try {
-    const start = Date.now();
-    await fastify.db.query("SELECT 1");
-    postgresLatency = Date.now() - start;
-    postgresHealthy = true;
-  } catch {
-    postgresHealthy = false;
-  }
-
-  let redisHealthy = false;
-  let redisLatency = 0;
-  try {
-    const start = Date.now();
-    await fastify.redis.set("health:check", "1", 5);
-    redisLatency = Date.now() - start;
-    redisHealthy = true;
-  } catch {
-    redisHealthy = false;
-  }
-
-  let jsondbHealthy = false;
-  try {
-    await fastify.jsondb.read();
-    jsondbHealthy = true;
-  } catch {
-    jsondbHealthy = false;
-  }
-
+  const readiness = await fastify.checkReadiness();
   const queryConnections = fastify.queryPools.capacity();
-  const isHealthy = postgresHealthy && redisHealthy && jsondbHealthy &&
-    queryConnections.monitoring.status !== "degraded";
-  fastify.metrics.setReady(isHealthy);
+  const isHealthy = readiness.status === "ready";
 
   return {
     success: true,
@@ -52,15 +21,16 @@ async function checkHealth(fastify: FastifyInstance) {
     uptimeSeconds: Math.floor(process.uptime()),
     services: {
       postgres: {
-        status: postgresHealthy ? "up" : "down",
-        latencyMs: postgresLatency,
+        status: readiness.checks.postgres,
+        latencyMs: readiness.latencyMs.postgres,
       },
       redis: {
-        status: redisHealthy ? "up" : "down",
-        latencyMs: redisLatency,
+        status: readiness.checks.redis,
+        latencyMs: readiness.latencyMs.redis,
       },
       jsondb: {
-        status: jsondbHealthy ? "up" : "down",
+        status: readiness.checks.metadata,
+        latencyMs: readiness.latencyMs.metadata,
       },
       queryConnections,
     },

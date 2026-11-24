@@ -316,7 +316,7 @@ const transactionRoutes: FastifyPluginAsync<{ store: ExecutionStore; analytics?:
           return respond(400, {
             success: false,
             error: {
-              ...queryExecutionError(error).error,
+              ...queryExecutionError(error, false, fastify.queryPools).error,
               code: "TRANSACTION_ROLLED_BACK",
             },
           });
@@ -352,13 +352,13 @@ const transactionRoutes: FastifyPluginAsync<{ store: ExecutionStore; analytics?:
       }
       if (activeQuery) {
         const { queryId } = activeQuery;
-        const result = queryExecutionError(error, readOnly);
+        const result = queryExecutionError(error, readOnly, fastify.queryPools);
         return recordFailure(respond(result.status, {
           success: false, error: { ...result.error, ...(immediate ? { queryIndex: Number(queryId) } : { queryId }) },
         }));
       }
       if (error instanceof PostgresError) {
-        const result = queryExecutionError(error);
+        const result = queryExecutionError(error, false, fastify.queryPools);
         return respond(error.code === "57014" ? 504 : 503, {
           success: false, error: { ...result.error, code: "TRANSACTION_UNAVAILABLE" },
         });

@@ -92,6 +92,8 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
     statementTimeoutMillis,
     queryTimeoutMillis,
   } = config.database.pool;
+  const maxPendingCheckouts = Math.max(8, config.database.pool.maxGlobalQueries * 2);
+  const maxPendingPerPool = Math.max(4, config.database.pool.max * 2);
 
   // pg-pool calls connect only when it opens a physical connection. Returning an
   // existing connection to a borrower does not take another global slot.
@@ -138,6 +140,8 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
       idle: [...pools.values()].flatMap((group) => [...group.values()])
         .reduce((count, state) => count + state.pool.idleCount, 0),
       pendingCheckouts,
+      maxPendingCheckouts,
+      maxPendingPerPool,
       checkoutTimeouts,
       executionTimeouts,
       evictions,
@@ -420,6 +424,14 @@ export function createQueryPools(adminDb: Pool, adminRoles: string[], log: Fasti
     verify: (client: PoolClient) => Promise<BackendSession>,
     signal?: AbortSignal,
   ): Promise<PoolClient> {
+    if (pendingCheckouts >= maxPendingCheckouts) {
+      rejectionsAtLimit++;
+      return Promise.reject(new DatabaseError("The gateway query queue is full", "QUERY_POOL_BUSY"));
+    }
+    if (state.waiters.size >= maxPendingPerPool) {
+      rejectionsAtPoolLimit++;
+      return Promise.reject(new DatabaseError("The query pool queue is full", "QUERY_POOL_BUSY"));
+    }
     return new Promise((resolve, reject) => {
       const deadline = performance.now() + checkoutTimeoutMillis;
       let settled = false;
@@ -790,11 +802,16 @@ export function queryConnectionError(error: unknown) {
   };
 }
 
-export function queryExecutionError(error: unknown, readOnlyRestricted = false) {
+export function queryExecutionError(
+  error: unknown,
+  readOnlyRestricted = false,
+  metrics?: Pick<QueryPools, "recordExecutionTimeout">,
+) {
   const pgCode = error instanceof Error && "code" in error && typeof error.code === "string"
     ? error.code
     : undefined;
   const forbidden = pgCode === "42501" || (readOnlyRestricted && pgCode === "25006");
+  if (pgCode === "57014") metrics?.recordExecutionTimeout();
   return {
     status: forbidden ? 403 : 400,
     error: {

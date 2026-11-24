@@ -27,7 +27,7 @@ async function start() {
       }
 
       isShuttingDown = true;
-      app.metrics.setReady(false);
+      app.beginShutdown();
 
       app.log.info({ signal }, "Starting graceful shutdown");
 

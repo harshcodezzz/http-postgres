@@ -6,6 +6,9 @@
 
 - Added authenticated `GET /admin/metrics` with bounded gateway request/latency counters, process CPU/memory/event-loop data, readiness, gateway-managed PostgreSQL pool capacity, metadata maintenance, analytics buffer, and Redis operation metrics.
 - Added `server.shutdownDeadlineMillis` to bound graceful shutdown, defaulting to 30 seconds.
+- Unified public, administrative, and metrics readiness checks across PostgreSQL, Redis, SQLite metadata, and query-pool monitoring; shutdown readiness now takes precedence over cached dependency results.
+- Bounded PostgreSQL checkout waiters per pool and process, and classified queue-cap rejections consistently as overload rather than successful SQL work.
+- Corrected benchmark success and latency accounting so accepted asynchronous work and intentional overload rejections are not reported as completed SQL executions.
 - Migrated gateway metadata to a versioned SQLite database with WAL, indexed API-key and role lookups, normalized database bindings, transactional mutations, and automatic crash-safe migration from `data/data.json` with a retained backup.
 - Added a persistent bounded role-cleanup scheduler with cross-process leases, exponential backoff, jitter, one-hour delay caps, and indexed due-work metadata.
 - Added public `GET /health/live` and dependency-aware `GET /health/ready` probes. Readiness checks PostgreSQL and configured Redis with bounded, briefly cached, concurrent-deduplicated checks and returns `503` when required dependencies are unavailable.

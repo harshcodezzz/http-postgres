@@ -58,7 +58,9 @@ Do not restore metadata from a different logical environment without also verify
 
 Use `GET /health/live` as the process liveness check. `GET /health` remains an equivalent lightweight liveness endpoint for backward compatibility. Neither endpoint validates dependencies.
 
-Use public `GET /health/ready` for load-balancer readiness. It checks the administrative PostgreSQL pool and, when enabled, Redis. Checks time out after two seconds, concurrent requests share a check, and results are cached for one second. The endpoint returns `503` with only dependency status names when the gateway cannot safely serve requests; Redis is reported as `disabled` when the configured in-memory fallback is in use.
+Use public `GET /health/ready` for load-balancer readiness. It uses the same PostgreSQL, Redis, SQLite metadata, and query-pool monitoring checks as authenticated administrative health and metrics readiness. Checks time out after two seconds, concurrent requests share a check, and results are cached for one second. Shutdown state always takes precedence over a successful dependency result. The endpoint returns `503` with only dependency status names when the gateway cannot safely serve requests; Redis is reported as `disabled` when the configured in-memory fallback is in use.
+
+Query-pool acquisition queues are bounded per pool and across the process. When either bound is reached, new requests fail immediately with `QUERY_POOL_BUSY`; these requests count as overload rejections, not successful SQL executions. The authenticated metrics response exposes the current and maximum pending checkout counts so sustained overload can be distinguished from PostgreSQL execution latency.
 
 Use authenticated `GET /admin/health` for detailed operator monitoring. It reports PostgreSQL, key-value storage, JsonDB, query-session monitoring, and capacity counters. Alert on a degraded status, checkout timeouts, sustained pending checkouts, or growing unverified-session age.
 
