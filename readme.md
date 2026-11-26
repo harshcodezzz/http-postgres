@@ -83,6 +83,8 @@ Follow the complete step-by-step walkthrough in **[Getting started](docs/getting
 
 Query PostgreSQL from any runtime supporting `fetch()`:
 
+For a ready-to-use TypeScript client, install the [`@http-postgres/sdk`](https://www.npmjs.com/package/@http-postgres/sdk) package.
+
 ```ts
 const response = await fetch(`${process.env.PG_GATEWAY_URL}/query`, {
   method: "POST",
